@@ -51,6 +51,24 @@ extract() {
 
   ui_print "- Verified $file"
 }
+
+# Extract a file only when this build contains the requested ABI.  arm64-only local builds are
+# valid on 64-bit devices even though the installer reports both the 32-bit and 64-bit ABIs.
+extract_if_present() {
+  local zip="$1"
+  local file="$2"
+  local dir="$3"
+  local junk_paths="${4:-false}"
+
+  # BusyBox unzip may return success for `-p` even when no member matched.
+  # Check the archive directory explicitly so an arm64-only package does not
+  # fall through to extract() and abort on its intentionally missing 32-bit file.
+  if unzip -l "$zip" "$file" 2>/dev/null | grep -Fv 'caution:' | grep -Fq "$file"; then
+    extract "$zip" "$file" "$dir" "$junk_paths"
+  else
+    ui_print "- Skipped unavailable $file"
+  fi
+}
 # =========================================================
 
 VERSION=$(grep_prop version "${TMPDIR}/module.prop")
@@ -89,9 +107,13 @@ done
 ui_print "- Extracting Zygisk libraries"
 mkdir -p "$MODPATH/zygisk"
 
-# Extract 32-bit lib
-extract "$ZIPFILE" "lib/$ABI32/libzygisk.so" "$MODPATH/zygisk" true
-mv "$MODPATH/zygisk/libzygisk.so" "$MODPATH/zygisk/${ABI32}.so"
+# Extract 32-bit lib when present. A 64-bit-only package is valid on a 64-bit device.
+if [ "$IS64BIT" = true ]; then
+    extract_if_present "$ZIPFILE" "lib/$ABI32/libzygisk.so" "$MODPATH/zygisk" true
+else
+    extract "$ZIPFILE" "lib/$ABI32/libzygisk.so" "$MODPATH/zygisk" true
+fi
+[ -f "$MODPATH/zygisk/libzygisk.so" ] && mv "$MODPATH/zygisk/libzygisk.so" "$MODPATH/zygisk/${ABI32}.so"
 
 # Extract 64-bit lib if supported
 if [ "$IS64BIT" = true ]; then
@@ -103,11 +125,16 @@ if [ "$API" -ge 29 ]; then
     ui_print "- Extracting dex2oat binaries"
     mkdir -p "$MODPATH/bin"
 
-    # Extract 32-bit binaries
-    extract "$ZIPFILE" "bin/$ABI32/dex2oat" "$MODPATH/bin" true
-    extract "$ZIPFILE" "bin/$ABI32/liboat_hook.so" "$MODPATH/bin" true
-    mv "$MODPATH/bin/dex2oat" "$MODPATH/bin/dex2oat32"
-    mv "$MODPATH/bin/liboat_hook.so" "$MODPATH/bin/liboat_hook32.so"
+    # Extract 32-bit binaries when present
+    if [ "$IS64BIT" = true ]; then
+        extract_if_present "$ZIPFILE" "bin/$ABI32/dex2oat" "$MODPATH/bin" true
+        extract_if_present "$ZIPFILE" "bin/$ABI32/liboat_hook.so" "$MODPATH/bin" true
+    else
+        extract "$ZIPFILE" "bin/$ABI32/dex2oat" "$MODPATH/bin" true
+        extract "$ZIPFILE" "bin/$ABI32/liboat_hook.so" "$MODPATH/bin" true
+    fi
+    [ -f "$MODPATH/bin/dex2oat" ] && mv "$MODPATH/bin/dex2oat" "$MODPATH/bin/dex2oat32"
+    [ -f "$MODPATH/bin/liboat_hook.so" ] && mv "$MODPATH/bin/liboat_hook.so" "$MODPATH/bin/liboat_hook32.so"
 
     # Extract 64-bit binaries
     if [ "$IS64BIT" = true ]; then

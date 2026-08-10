@@ -34,8 +34,12 @@ constexpr int PER_USER_RANGE = 100000;
 
 // Defined via CMake generated marcos
 constexpr uid_t kHostPackageUid = INJECTED_PACKAGE_UID;
-const char *const kHostPackageName = INJECTED_PACKAGE_NAME;
-const char *const kManagerPackageName = MANAGER_PACKAGE_NAME;
+#define VECTOR_STRINGIFY_IMPL(value) #value
+#define VECTOR_STRINGIFY(value) VECTOR_STRINGIFY_IMPL(value)
+const char *const kHostPackageName = VECTOR_STRINGIFY(INJECTED_PACKAGE_NAME);
+const char *const kManagerPackageName = VECTOR_STRINGIFY(MANAGER_PACKAGE_NAME);
+#undef VECTOR_STRINGIFY
+#undef VECTOR_STRINGIFY_IMPL
 constexpr uid_t GID_INET = 3003;  // Android's Internet group ID.
 
 enum RuntimeFlags : uint32_t {
@@ -274,7 +278,7 @@ void VectorModule::preAppSpecialize(zygisk::AppSpecializeArgs *args) {
                 env_->SetIntArrayRegion(args->gids, 0, 1, &inet_gid);
             }
 
-            args->nice_name = env_->NewStringUTF(INJECTED_PACKAGE_NAME);
+            args->nice_name = env_->NewStringUTF(kHostPackageName);
             args->gids = new_gids;
         }
     }

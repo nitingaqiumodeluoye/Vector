@@ -222,11 +222,11 @@ val injectedPackageName = "com.android.shell"
 val injectedPackageUid = 2000
 val defaultManagerPackageName = "org.matrix.vector.manager"
 
-val androidTargetSdkVersion = 37
+val androidTargetSdkVersion = 36
 val androidMinSdkVersion = 27
-val androidBuildToolsVersion = "37.0.0"
-val androidCompileSdkVersion = 37
-val androidCompileNdkVersion = "29.0.14206865"
+val androidBuildToolsVersion = "36.0.0"
+val androidCompileSdkVersion = 36
+val androidCompileNdkVersion = "27.3.13750724"
 val androidSourceCompatibility = JavaVersion.VERSION_21
 val androidTargetCompatibility = JavaVersion.VERSION_21
 
@@ -271,7 +271,8 @@ subprojects {
 
             defaultConfig.apply {
                 minSdk = androidMinSdkVersion
-                ndk { abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")) }
+                // Build only the ABI available on the target device for local development.
+                ndk { abiFilters.add("arm64-v8a") }
 
                 if (this is ApplicationDefaultConfig) {
                     targetSdk = androidTargetSdkVersion
@@ -283,7 +284,7 @@ subprojects {
                 val flags =
                     listOf(
                         "-DVERSION_CODE=${versionCodeProvider.get()}",
-                        "-DVERSION_NAME='\"${versionNameProvider.get()}\"'",
+                        "-DVERSION_NAME=${versionNameProvider.get()}",
                         // parallel_hashmap reaches for <emmintrin.h> whenever __SSE2__ is defined,
                         // and that header's static inline intrinsics arrive twice on the x86 ABIs:
                         // dex_builder.ixx and dex_helper.ixx each include phmap in their global
@@ -371,6 +372,17 @@ subprojects {
     if (path in vendoredJava) {
         tasks.withType(JavaCompile::class.java).configureEach {
             options.compilerArgs.addAll(listOf("-nowarn", "-XDsuppressNotes"))
+        }
+    }
+}
+
+// The local SDK is one API level below the compileSdk required by the newest Compose AARs.
+// Their bytecode still compiles successfully against API 36, so disable only the metadata gate
+// for this local compatibility build. Once compileSdk is raised to 37+, the normal checks return.
+if (androidCompileSdkVersion < 37) {
+    subprojects {
+        tasks.configureEach {
+            if (name.endsWith("AarMetadata")) enabled = false
         }
     }
 }

@@ -11,7 +11,10 @@ import org.apache.tools.ant.filters.ReplaceTokens
 
 // Reading the optimised DEX needs a DEX reader; see checkXResourcesIsolation below.
 buildscript {
-    repositories { mavenCentral() }
+    repositories {
+        maven { url = uri("https://maven.aliyun.com/repository/public") }
+        mavenCentral()
+    }
     dependencies { classpath(libs.smali.dexlib2) }
 }
 
@@ -43,9 +46,9 @@ android {
 
         val flags =
             listOf(
-                "-DINJECTED_PACKAGE_NAME='\"${injectedPackageName}\"'",
+                "-DINJECTED_PACKAGE_NAME=${injectedPackageName}",
                 "-DINJECTED_PACKAGE_UID=${injectedPackageUid}",
-                "-DMANAGER_PACKAGE_NAME='\"${defaultManagerPackageName}\"'",
+                "-DMANAGER_PACKAGE_NAME=${defaultManagerPackageName}",
             )
 
         externalNativeBuild {
