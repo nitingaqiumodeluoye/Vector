@@ -3,7 +3,7 @@ package org.matrix.vector.impl.hookers
 import android.content.pm.ApplicationInfo
 import android.os.Build
 import androidx.annotation.RequiresApi
-import io.github.libxposed.api.XposedInterface
+import de.wwb.android.wbosed.api.WbInterface
 import java.util.Collections
 import java.util.WeakHashMap
 import org.matrix.vector.util.Utils
@@ -87,8 +87,8 @@ private object LoadedApkTracker {
 }
 
 /** Tracks and prepares Application instances when their LoadedApk is instantiated. */
-object LoadedApkCtorHooker : XposedInterface.Hooker {
-    override fun intercept(chain: XposedInterface.Chain): Any? {
+object LoadedApkCtorHooker : WbInterface.Hooker {
+    override fun intercept(chain: WbInterface.Chain): Any? {
         val result = chain.proceed()
         val loadedApk = chain.thisObject ?: return result
 
@@ -117,8 +117,8 @@ object LoadedApkCtorHooker : XposedInterface.Hooker {
 
 /** Modern API Phase: onPackageLoaded */
 @RequiresApi(Build.VERSION_CODES.P)
-object LoadedApkCreateAppFactoryHooker : XposedInterface.Hooker {
-    override fun intercept(chain: XposedInterface.Chain): Any? {
+object LoadedApkCreateAppFactoryHooker : WbInterface.Hooker {
+    override fun intercept(chain: WbInterface.Chain): Any? {
         val loadedApk = chain.thisObject ?: return chain.proceed()
 
         // Ensure we only dispatch for instances we are tracking
@@ -148,9 +148,9 @@ object LoadedApkCreateAppFactoryHooker : XposedInterface.Hooker {
 }
 
 /** Modern API Phase: onPackageReady and Legacy Phase: handleLoadPackage */
-object LoadedApkCreateCLHooker : XposedInterface.Hooker {
+object LoadedApkCreateCLHooker : WbInterface.Hooker {
     // intercepting createOrUpdateClassLoaderLocked(List<String> addedPaths)
-    override fun intercept(chain: XposedInterface.Chain): Any? {
+    override fun intercept(chain: WbInterface.Chain): Any? {
         val loadedApk = chain.thisObject ?: return chain.proceed()
 
         // Proceed: Modern modules need onPackageReady even for Split APKs (args[0] != null)

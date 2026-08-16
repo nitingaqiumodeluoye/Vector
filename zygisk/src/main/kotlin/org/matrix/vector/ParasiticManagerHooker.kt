@@ -13,10 +13,10 @@ import android.util.AndroidRuntimeException
 import android.util.ArrayMap
 import android.webkit.WebViewDelegate
 import android.webkit.WebViewFactory
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XC_MethodReplacement
-import de.robv.android.xposed.XposedBridge
-import de.robv.android.xposed.XposedHelpers
+import de.wwb.android.wbosed.XC_MethodHook
+import de.wwb.android.wbosed.XC_MethodReplacement
+import de.wwb.android.wbosed.XposedBridge
+import de.wwb.android.wbosed.XposedHelpers
 import hidden.HiddenApiBridge
 import java.io.File
 import java.io.FileInputStream

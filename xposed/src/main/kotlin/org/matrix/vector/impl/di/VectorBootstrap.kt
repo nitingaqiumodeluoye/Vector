@@ -22,6 +22,9 @@ fun interface OriginalInvoker {
  * methods at the appropriate lifecycle moments.
  */
 interface LegacyFrameworkDelegate {
+    /** Loads legacy Xposed modules and registers their callbacks. */
+    fun loadLegacyModules()
+
     /** Instructs the legacy bridge to load modern modules. */
     fun loadModules(activityThread: Any)
 

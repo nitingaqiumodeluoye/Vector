@@ -1,14 +1,14 @@
 package org.matrix.vector.impl.hookers
 
-import io.github.libxposed.api.XposedInterface
+import de.wwb.android.wbosed.api.WbInterface
 import org.matrix.vector.impl.di.VectorBootstrap
 
 /**
  * Intercepts the early ApplicationThread attachment phase. Triggers the legacy compatibility layer
  * to load modern modules into the process.
  */
-object AppAttachHooker : XposedInterface.Hooker {
-    override fun intercept(chain: XposedInterface.Chain): Any? {
+object AppAttachHooker : WbInterface.Hooker {
+    override fun intercept(chain: WbInterface.Chain): Any? {
         // Execute the actual attach() method first
         val result = chain.proceed()
 

@@ -14,6 +14,7 @@ object HookBridge {
         hooker: Class<*>,
         priority: Int,
         callback: Any?,
+        allowArtBackend: Boolean,
     ): Boolean
 
     @JvmStatic
@@ -74,6 +75,14 @@ object HookBridge {
     @JvmStatic @FastNative external fun instanceOf(obj: Any?, clazz: Class<*>): Boolean
 
     @JvmStatic @FastNative external fun setTrusted(cookie: Any?): Boolean
+
+    /**
+     * Exempts only BaseDexClassLoader from hidden-API enforcement so the in-memory module loader
+     * can link its ByteBuffer super constructor. This is the narrow Vector adaptation of
+     * rustFrida's VMRuntime.setHiddenApiExemptions path; it intentionally does not exempt the
+     * empty prefix, which would expose every hidden API in the target process.
+     */
+    @JvmStatic external fun exemptModuleClassLoaderHiddenApi(): Boolean
 
     /**
      * Clears the final flag ART reads, so that reflection will write [field] again.

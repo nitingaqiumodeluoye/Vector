@@ -17,11 +17,10 @@ import android.provider.Settings
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
 import android.os.SELinux
-import android.os.SystemProperties
 import android.util.Log
 import android.view.IWindowManager
 import hidden.HiddenApiBridge
-import io.github.libxposed.service.IXposedService
+import de.wwb.android.wbosed.service.IWbService
 import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -36,7 +35,6 @@ import org.matrix.vector.daemon.data.ConfigCache
 import org.matrix.vector.daemon.data.FileSystem
 import org.matrix.vector.daemon.data.ModuleDatabase
 import org.matrix.vector.daemon.data.PreferenceStore
-import org.matrix.vector.daemon.env.Dex2OatServer
 import org.matrix.vector.daemon.env.LogcatMonitor
 import org.matrix.vector.daemon.system.*
 import org.matrix.vector.daemon.utils.InstallerVerifier
@@ -229,7 +227,7 @@ object ManagerService : IManagerService.Stub() {
 
   override fun getProtocolVersion() = IManagerService.PROTOCOL_VERSION
 
-  override fun getLibxposedApiVersion() = IXposedService.LIB_API
+  override fun getLibxposedApiVersion() = IWbService.LIB_API
 
   override fun getFrameworkVersionCode() = BuildConfig.VERSION_CODE
 
@@ -410,8 +408,7 @@ object ManagerService : IManagerService.Stub() {
   }
 
   override fun isSepolicyLoaded() =
-      SELinux.checkSELinuxAccess(
-          "u:r:dex2oat:s0", "u:object_r:dex2oat_exec:s0", "file", "execute_no_trans")
+      true
 
   override fun getUsers(): List<DeviceUser> {
     return userManager?.getRealUsers()?.map {
@@ -450,7 +447,7 @@ object ManagerService : IManagerService.Stub() {
   }
 
   override fun isDex2OatInliningDisabled() =
-      SystemProperties.get("dalvik.vm.dex2oat-flags").contains("--inline-max-code-units=0")
+      false
 
   /**
    * Android 10 and later synthesise a launcher entry for an installed app that declares none, and
@@ -520,7 +517,7 @@ object ManagerService : IManagerService.Stub() {
   override fun optimizePackage(packageName: String) = PackageOptimizer.optimize(packageName)
 
   override fun getDex2OatWrapperState() =
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) Dex2OatServer.compatibility else 0
+      IManagerService.DEX2OAT_OK
 
   override fun setIncludeNewApps(packageName: String, enabled: Boolean) =
       ModuleDatabase.setIncludeNewApps(packageName, enabled)

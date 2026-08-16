@@ -154,10 +154,11 @@ VECTOR_DEF_NATIVE_METHOD(jboolean, ResourcesHook, initXResourcesNative) {
  * This allows the framework to create subclasses of what are normally final classes.
  */
 VECTOR_DEF_NATIVE_METHOD(jboolean, ResourcesHook, makeInheritable, jclass target_class) {
-    if (lsplant::MakeClassInheritable(env, target_class)) {
-        return JNI_TRUE;
+    if (!IsLsplantInitialized()) {
+        LOGW("ResourcesHook.makeInheritable skipped: LSPlant is not initialized.");
+        return JNI_FALSE;
     }
-    return JNI_FALSE;
+    return lsplant::MakeClassInheritable(env, target_class) ? JNI_TRUE : JNI_FALSE;
 }
 
 /**
@@ -183,14 +184,14 @@ VECTOR_DEF_NATIVE_METHOD(jobject, ResourcesHook, buildDummyClassLoader, jobject 
 
     DexBuilder dex_file;
 
-    // Create a class named "xposed.dummy.XResourcesSuperClass".
-    ClassBuilder xresource_builder{dex_file.MakeClass("xposed/dummy/XResourcesSuperClass")};
+    // Create a class named "wbosed.dummy.XResourcesSuperClass".
+    ClassBuilder xresource_builder{dex_file.MakeClass("wbosed/dummy/XResourcesSuperClass")};
     // Set its superclass to the one specified by the Java caller.
     xresource_builder.setSuperClass(
         TypeDescriptor::FromClassname(lsplant::JUTFString(env, resource_super_class).get()));
 
-    // Create a class named "xposed.dummy.XTypedArraySuperClass".
-    ClassBuilder xtypearray_builder{dex_file.MakeClass("xposed/dummy/XTypedArraySuperClass")};
+    // Create a class named "wbosed.dummy.XTypedArraySuperClass".
+    ClassBuilder xtypearray_builder{dex_file.MakeClass("wbosed/dummy/XTypedArraySuperClass")};
     // Set its superclass.
     xtypearray_builder.setSuperClass(
         TypeDescriptor::FromClassname(lsplant::JUTFString(env, typed_array_super_class).get()));

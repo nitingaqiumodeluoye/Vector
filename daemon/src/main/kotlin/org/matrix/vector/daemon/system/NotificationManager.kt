@@ -17,7 +17,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
 import android.util.Log
-import io.github.libxposed.service.IXposedScopeCallback
+import de.wwb.android.wbosed.service.IWbScopeCallback
 import java.util.UUID
 import org.matrix.vector.daemon.BuildConfig
 import org.matrix.vector.daemon.R
@@ -43,7 +43,7 @@ private const val SCOPE_REQUEST_TIMEOUT_MS = 60L * 60 * 1000
  *
  * Nothing else bounds them: these are enqueued as "android", which NotificationManagerService
  * exempts from its per-package limit, and they are IMPORTANCE_HIGH, so a module calling
- * `IXposedService.requestScope` in a loop would get a heads-up prompt per call, each sitting for
+ * `IWbService.requestScope` in a loop would get a heads-up prompt per call, each sitting for
  * [SCOPE_REQUEST_TIMEOUT_MS]. It is a *call* that costs a place, not a package: one request is one
  * prompt however many packages it names, which is what makes a single Approve able to answer for
  * all of them.
@@ -243,12 +243,12 @@ object NotificationManager {
     private const val MAX_ENTRIES = 512
 
     /** One live question, and when it was asked; see [countOf] for what the time is for. */
-    private class Open(val callback: IXposedScopeCallback, val postedAt: Long)
+    private class Open(val callback: IWbScopeCallback, val postedAt: Long)
 
     private val open = LinkedHashMap<String, Open>()
 
     /** A prompt that left [open] unanswered: it has to come off the screen and be told so. */
-    class Abandoned(val tag: String, val callback: IXposedScopeCallback)
+    class Abandoned(val tag: String, val callback: IWbScopeCallback)
 
     /**
      * How many prompts [modulePkg] still has open, under any user. The ':' matters here for the
@@ -277,7 +277,7 @@ object NotificationManager {
      *   is already holding [MAX_OPEN_SCOPE_REQUESTS_PER_MODULE] unanswered prompts.
      */
     @Synchronized
-    fun post(tag: String, callback: IXposedScopeCallback): List<Abandoned>? {
+    fun post(tag: String, callback: IWbScopeCallback): List<Abandoned>? {
       // Re-posting under a tag replaces what was there: a prompt going up is unanswered by
       // definition, whatever became of the last one that asked the same thing. The one it replaces
       // is dropped without an answer on purpose — it is the same question, of the same module,
@@ -300,11 +300,11 @@ object NotificationManager {
     }
 
     /** Takes the right to answer one prompt; null when something already has. */
-    @Synchronized fun claim(tag: String): IXposedScopeCallback? = open.remove(tag)?.callback
+    @Synchronized fun claim(tag: String): IWbScopeCallback? = open.remove(tag)?.callback
 
     /** Takes every prompt [modulePkg] still has up, in one go, so nothing can answer them after. */
     @Synchronized
-    fun claimAllOf(modulePkg: String): Map<String, IXposedScopeCallback> {
+    fun claimAllOf(modulePkg: String): Map<String, IWbScopeCallback> {
       // The ':' matters: without it "com.foo" would claim the prompts of "com.foobar" as well.
       val mine = open.filterKeys { it.startsWith("$modulePkg:") }
       mine.keys.forEach { open.remove(it) }
@@ -316,7 +316,7 @@ object NotificationManager {
    * Claims the right to answer the prompt for one (module, user, requested set).
    *
    * @return true for the first caller, false for every later one — the module's
-   *   [IXposedScopeCallback] must be called exactly once per request.
+   *   [IWbScopeCallback] must be called exactly once per request.
    */
   fun claimScopeAnswer(modulePkg: String, moduleUserId: Int, scopePkgs: List<String>) =
       OutstandingScopeRequests.claim(scopeTag(modulePkg, moduleUserId, scopePkgs)) != null
@@ -350,7 +350,7 @@ object NotificationManager {
    * completed") ran its handler once per package. Batching the prompt is what fixed that, here and
    * everywhere else on this path: the answer is now shaped like the question the module asked.
    */
-  fun withdrawScopeRequests(modulePkg: String): List<IXposedScopeCallback> {
+  fun withdrawScopeRequests(modulePkg: String): List<IWbScopeCallback> {
     val withdrawn = OutstandingScopeRequests.claimAllOf(modulePkg)
     withdrawn.keys.forEach { cancelByTag(it) }
     return withdrawn.values.toList()
@@ -375,7 +375,7 @@ object NotificationManager {
       modulePkg: String,
       moduleUserId: Int,
       scopePkgs: List<String>,
-      callback: IXposedScopeCallback
+      callback: IWbScopeCallback
   ) {
     val tag = scopeTag(modulePkg, moduleUserId, scopePkgs)
     // Registered before the notification is built, let alone posted: the buttons are live from the
@@ -460,7 +460,7 @@ object NotificationManager {
                     .build())
             // Swiping the prompt away, or leaving it alone until it expires, has to answer the
             // module too. Without a delete intent the "delete" branch of dispatchModuleScope was
-            // unreachable and a dismissed prompt left the module's IXposedScopeCallback waiting
+            // unreachable and a dismissed prompt left the module's IWbScopeCallback waiting
             // for an answer that could no longer arrive from anywhere. It takes a request code of
             // its own because that is half of what identifies a PendingIntent: 4, 5 and 6 are the
             // buttons above, and 1 and 3 the status and module-updated notifications.

@@ -1,8 +1,8 @@
 package org.matrix.vector.impl.hooks
 
-import io.github.libxposed.api.XposedInterface.HookHandle
-import io.github.libxposed.api.XposedInterface.Hooker
-import io.github.libxposed.api.error.HookFailedError
+import de.wwb.android.wbosed.api.WbInterface.HookHandle
+import de.wwb.android.wbosed.api.WbInterface.Hooker
+import de.wwb.android.wbosed.api.error.HookFailedError
 import java.lang.reflect.Executable
 import java.util.concurrent.ConcurrentHashMap
 import org.matrix.vector.nativebridge.HookBridge

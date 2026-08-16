@@ -25,7 +25,10 @@ parcelable ModuleCode {
      */
     List<String> moduleClassNames;
 
-    /** Native libraries the module wants {@code native_init} called on, from native_init.list. */
+    /**
+     * Legacy native_init metadata. Target processes ignore these entries in rustFrida-aligned
+     * mode; module APKs do not provide runtime native libraries.
+     */
     List<String> moduleLibraryNames;
 
     /** True for a module selected by {@code assets/xposed_init} rather than by targetApiVersion. */
@@ -38,11 +41,11 @@ parcelable ModuleCode {
      *
      * <p>Carried into the process because one of API 102's rules is only enforceable there: a
      * module targeting 102 or higher must not be able to resolve the legacy
-     * {@code de.robv.android.xposed} API, and {@link #legacy} is a boolean that cannot tell 101
+     * {@code de.wwb.android.wbosed} API, and {@link #legacy} is a boolean that cannot tell 101
      * from 102.</p>
      *
      * <p>module.prop's {@code minApiVersion} is deliberately absent. The API puts that check on the
-     * module, through {@code XposedInterface#getApiVersion()}, and the manager reads module.prop
+     * module, through {@code WbInterface#getApiVersion()}, and the manager reads module.prop
      * itself for what it displays - a copy here would have no reader.</p>
      */
     int targetApiVersion;
@@ -64,9 +67,8 @@ parcelable ModuleCode {
     boolean exceptionPassthrough;
 
     /**
-     * Where the daemon staged this module's native libraries, for the one process that cannot map
-     * them out of the APK: /data/app is apk_data_file, which system_server may read and map but
-     * never execute.
+     * Legacy native-library staging path. Kept for parcel compatibility; target processes no
+     * longer use module-provided native libraries.
      *
      * <p>Null when the module ships none for this ABI, when staging failed, or when the module was
      * never destined for system_server in the first place.</p>

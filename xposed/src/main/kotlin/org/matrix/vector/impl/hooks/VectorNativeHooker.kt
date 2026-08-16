@@ -1,11 +1,11 @@
 package org.matrix.vector.impl.hooks
 
-import io.github.libxposed.api.XposedInterface
-import io.github.libxposed.api.XposedInterface.ExceptionMode
-import io.github.libxposed.api.XposedInterface.HookBuilder
-import io.github.libxposed.api.XposedInterface.HookHandle
-import io.github.libxposed.api.XposedInterface.Hooker
-import io.github.libxposed.api.error.HookFailedError
+import de.wwb.android.wbosed.api.WbInterface
+import de.wwb.android.wbosed.api.WbInterface.ExceptionMode
+import de.wwb.android.wbosed.api.WbInterface.HookBuilder
+import de.wwb.android.wbosed.api.WbInterface.HookHandle
+import de.wwb.android.wbosed.api.WbInterface.Hooker
+import de.wwb.android.wbosed.api.error.HookFailedError
 import java.lang.reflect.Constructor
 import java.lang.reflect.Executable
 import java.lang.reflect.InvocationTargetException
@@ -26,7 +26,7 @@ class VectorHookBuilder(
     private val defaultExceptionMode: ExceptionMode = ExceptionMode.PROTECTIVE,
 ) : HookBuilder {
 
-    private var priority = XposedInterface.PRIORITY_DEFAULT
+    private var priority = WbInterface.PRIORITY_DEFAULT
     private var exceptionMode = ExceptionMode.DEFAULT
     private var id: String? = null
 
@@ -121,6 +121,7 @@ class VectorHookBuilder(
                 VectorNativeHooker::class.java,
                 record.priority,
                 record,
+                moduleId != null,
             )
         ) {
             throw HookFailedError("Cannot hook $origin")

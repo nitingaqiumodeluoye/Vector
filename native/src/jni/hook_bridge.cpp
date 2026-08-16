@@ -4,12 +4,16 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cstring>
 #include <lsplant.hpp>
 #include <limits>
 #include <memory>
 #include <shared_mutex>
 #include <vector>
 
+#include "art_hook/hook_engine.h"
+#include "art_hook/vector_art_hook.h"
 #include "core/config_bridge.h"
 #include "jni/jni_bridge.h"
 #include "jni/jni_hooks.h"
@@ -31,6 +35,13 @@ struct HookItem {
     // std::greater<> ensures that higher priority numbers are processed first.
     std::multimap<jint, jobject, std::greater<>> legacy_callbacks;
     std::multimap<jint, jobject, std::greater<>> modern_callbacks;
+
+    // RustFrida/WxShadow backend state. The reflected hooker object is also
+    // used as the monitor for callback list snapshots.
+    std::unique_ptr<vector::native::art::MethodState> art_state;
+    std::atomic<vector::native::art::MethodState *> art_state_ptr{nullptr};
+    jobject hooker_object = nullptr;
+    jmethodID hooker_callback = nullptr;
 
 private:
     // The backup is an atomic jobject.
@@ -91,7 +102,260 @@ SharedHashMap<jmethodID, std::unique_ptr<HookItem>> hooked_methods;
 // Cached JNI method and field IDs for performance.
 jmethodID invoke = nullptr;
 
+std::atomic_bool is_manager_process{false};
+std::atomic_bool lsplant_initialized{false};
+std::atomic_bool module_classloader_hidden_api_exempted{false};
+
 }  // namespace
+
+namespace vector::native::jni {
+
+void SetManagerProcess(bool is_manager) {
+    is_manager_process.store(is_manager, std::memory_order_release);
+    if (is_manager) {
+        LOGI("Manager process selected: WxShadow ART backend disabled for bootstrap hooks");
+    }
+}
+
+void SetLsplantInitialized(bool initialized) {
+    lsplant_initialized.store(initialized, std::memory_order_release);
+}
+
+bool IsLsplantInitialized() {
+    return lsplant_initialized.load(std::memory_order_acquire);
+}
+
+namespace {
+
+#if defined(__aarch64__)
+
+using vector::native::art::MethodState;
+using vector::native::art::ValueKind;
+
+static jobject BoxCallbackValue(JNIEnv *env, ValueKind kind, uint64_t raw, uint64_t fp_raw) {
+    const char *clazz_name = nullptr;
+    const char *sig = nullptr;
+    switch (kind) {
+    case ValueKind::Boolean: clazz_name = "java/lang/Boolean"; sig = "(Z)Ljava/lang/Boolean;"; break;
+    case ValueKind::Byte: clazz_name = "java/lang/Byte"; sig = "(B)Ljava/lang/Byte;"; break;
+    case ValueKind::Char: clazz_name = "java/lang/Character"; sig = "(C)Ljava/lang/Character;"; break;
+    case ValueKind::Short: clazz_name = "java/lang/Short"; sig = "(S)Ljava/lang/Short;"; break;
+    case ValueKind::Int: clazz_name = "java/lang/Integer"; sig = "(I)Ljava/lang/Integer;"; break;
+    case ValueKind::Long: clazz_name = "java/lang/Long"; sig = "(J)Ljava/lang/Long;"; break;
+    case ValueKind::Float: clazz_name = "java/lang/Float"; sig = "(F)Ljava/lang/Float;"; break;
+    case ValueKind::Double: clazz_name = "java/lang/Double"; sig = "(D)Ljava/lang/Double;"; break;
+    case ValueKind::Object: return reinterpret_cast<jobject>(raw);
+    case ValueKind::Void: return nullptr;
+    }
+    auto clazz = env->FindClass(clazz_name);
+    if (!clazz) return nullptr;
+    auto mid = env->GetStaticMethodID(clazz, "valueOf", sig);
+    jobject result = nullptr;
+    if (mid) {
+        jvalue argument{};
+        switch (kind) {
+        case ValueKind::Boolean: argument.z = raw != 0; break;
+        case ValueKind::Byte: argument.b = static_cast<jbyte>(raw); break;
+        case ValueKind::Char: argument.c = static_cast<jchar>(raw); break;
+        case ValueKind::Short: argument.s = static_cast<jshort>(raw); break;
+        case ValueKind::Int: argument.i = static_cast<jint>(raw); break;
+        case ValueKind::Long: argument.j = static_cast<jlong>(raw); break;
+        case ValueKind::Float: {
+            const uint32_t bits = static_cast<uint32_t>(fp_raw);
+            std::memcpy(&argument.f, &bits, sizeof(argument.f));
+            break;
+        }
+        case ValueKind::Double: {
+            std::memcpy(&argument.d, &fp_raw, sizeof(argument.d));
+            break;
+        }
+        default: break;
+        }
+        result = env->CallStaticObjectMethodA(clazz, mid, &argument);
+    }
+    env->DeleteLocalRef(clazz);
+    return result;
+}
+
+static bool UnboxCallbackValue(JNIEnv *env, jobject value, ValueKind kind,
+                               uint64_t *raw, uint64_t *fp_raw) {
+    *raw = 0;
+    *fp_raw = 0;
+    if (kind == ValueKind::Object) {
+        *raw = reinterpret_cast<uint64_t>(value);
+        return true;
+    }
+    if (!value) return true;
+    jclass clazz = nullptr;
+    jmethodID method = nullptr;
+    switch (kind) {
+    case ValueKind::Boolean:
+        clazz = env->FindClass("java/lang/Boolean");
+        if (!clazz) return false;
+        method = env->GetMethodID(clazz, "booleanValue", "()Z");
+        if (!method || !env->IsInstanceOf(value, clazz)) {
+            env->DeleteLocalRef(clazz);
+            return false;
+        }
+        *raw = env->CallBooleanMethod(value, method);
+        break;
+    case ValueKind::Byte:
+    case ValueKind::Short:
+    case ValueKind::Int:
+    case ValueKind::Long:
+    case ValueKind::Float:
+    case ValueKind::Double:
+        clazz = env->FindClass("java/lang/Number");
+        if (!clazz || !env->IsInstanceOf(value, clazz)) {
+            if (clazz) env->DeleteLocalRef(clazz);
+            return false;
+        }
+        if (kind == ValueKind::Byte) {
+            method = env->GetMethodID(clazz, "byteValue", "()B");
+            *raw = static_cast<uint64_t>(static_cast<int64_t>(env->CallByteMethod(value, method)));
+        } else if (kind == ValueKind::Short) {
+            method = env->GetMethodID(clazz, "shortValue", "()S");
+            *raw = static_cast<uint64_t>(static_cast<int64_t>(env->CallShortMethod(value, method)));
+        } else if (kind == ValueKind::Int) {
+            method = env->GetMethodID(clazz, "intValue", "()I");
+            *raw = static_cast<uint64_t>(static_cast<int64_t>(env->CallIntMethod(value, method)));
+        } else if (kind == ValueKind::Long) {
+            method = env->GetMethodID(clazz, "longValue", "()J");
+            *raw = static_cast<uint64_t>(env->CallLongMethod(value, method));
+        } else if (kind == ValueKind::Float) {
+            method = env->GetMethodID(clazz, "floatValue", "()F");
+            float f = env->CallFloatMethod(value, method);
+            std::memcpy(fp_raw, &f, sizeof(f));
+            *raw = *fp_raw;
+        } else {
+            method = env->GetMethodID(clazz, "doubleValue", "()D");
+            double d = env->CallDoubleMethod(value, method);
+            std::memcpy(fp_raw, &d, sizeof(d));
+            *raw = *fp_raw;
+        }
+        break;
+    case ValueKind::Char:
+        clazz = env->FindClass("java/lang/Character");
+        if (!clazz) return false;
+        method = env->GetMethodID(clazz, "charValue", "()C");
+        if (!method || !env->IsInstanceOf(value, clazz)) {
+            env->DeleteLocalRef(clazz);
+            return false;
+        }
+        *raw = env->CallCharMethod(value, method);
+        break;
+    case ValueKind::Object:
+        *raw = reinterpret_cast<uint64_t>(value);
+        return true;
+    case ValueKind::Void:
+        return true;
+    }
+    if (clazz) env->DeleteLocalRef(clazz);
+    return !env->ExceptionCheck();
+}
+
+static uint64_t ReadNativeArgument(HookContext *ctx, const ValueKind kind,
+                                   size_t *gp, size_t *fp, size_t *stack) {
+    const bool floating = kind == ValueKind::Float || kind == ValueKind::Double;
+    if (floating) {
+        if (*fp < 8) return ctx->d[(*fp)++];
+        const auto value = *reinterpret_cast<uint64_t *>(ctx->sp + (*stack)++ * 8);
+        ++*fp;
+        return value;
+    }
+    if (*gp < 6) return ctx->x[2 + (*gp)++];
+    const auto value = *reinterpret_cast<uint64_t *>(ctx->sp + (*stack)++ * 8);
+    ++*gp;
+    return value;
+}
+
+static void VectorArtHookCallback(HookContext *ctx, void *raw_user_data) {
+    if (!ctx || !raw_user_data) return;
+    auto target = reinterpret_cast<jmethodID>(raw_user_data);
+    HookItem *item = nullptr;
+    hooked_methods.if_contains(target, [&item](const auto &entry) { item = entry.second.get(); });
+    auto *state = item ? item->art_state_ptr.load(std::memory_order_acquire) : nullptr;
+    if (!item || !state || !item->hooker_object || !item->hooker_callback) {
+        ctx->x[0] = 0;
+        return;
+    }
+    auto *env = reinterpret_cast<JNIEnv *>(ctx->x[0]);
+    if (!env) {
+        ctx->x[0] = 0;
+        return;
+    }
+
+    const size_t receiver_count = state->is_static ? 0 : 1;
+    const size_t count = receiver_count + state->parameter_kinds.size();
+    if (count > static_cast<size_t>(std::numeric_limits<jsize>::max())) {
+        ctx->x[0] = 0;
+        return;
+    }
+    auto object_class = env->FindClass("java/lang/Object");
+    if (!object_class) {
+        ctx->x[0] = 0;
+        return;
+    }
+    auto values = env->NewObjectArray(static_cast<jsize>(count), object_class, nullptr);
+    if (!values) {
+        env->DeleteLocalRef(object_class);
+        ctx->x[0] = 0;
+        return;
+    }
+    size_t index = 0;
+    if (!state->is_static) {
+        env->SetObjectArrayElement(values, static_cast<jsize>(index++),
+                                   reinterpret_cast<jobject>(ctx->x[1]));
+    }
+    size_t gp = 0;
+    size_t fp = 0;
+    size_t stack = 0;
+    for (const auto kind : state->parameter_kinds) {
+        const auto raw = ReadNativeArgument(ctx, kind, &gp, &fp, &stack);
+        const bool floating = kind == ValueKind::Float || kind == ValueKind::Double;
+        auto boxed = BoxCallbackValue(env, kind, raw, floating ? raw : 0);
+        env->SetObjectArrayElement(values, static_cast<jsize>(index++), boxed);
+        if (boxed) env->DeleteLocalRef(boxed);
+    }
+    auto result = env->CallObjectMethod(item->hooker_object, item->hooker_callback, values);
+    env->DeleteLocalRef(values);
+    env->DeleteLocalRef(object_class);
+    if (env->ExceptionCheck()) {
+        ctx->x[0] = 0;
+        return;
+    }
+    if (state->return_kind != ValueKind::Void) {
+        uint64_t raw = 0;
+        uint64_t fp_raw = 0;
+        if (UnboxCallbackValue(env, result, state->return_kind, &raw, &fp_raw)) {
+            ctx->x[0] = raw;
+            if (state->return_kind == ValueKind::Float ||
+                state->return_kind == ValueKind::Double) {
+                ctx->d[0] = fp_raw;
+            }
+        } else {
+            ctx->x[0] = 0;
+        }
+    } else {
+        ctx->x[0] = 0;
+    }
+    // A jobject return is itself the local reference ART will hand back to the
+    // Java caller; deleting it here would return a dangling handle. Primitive
+    // wrapper results have already been unboxed and can be released.
+    if (result && state->return_kind != ValueKind::Object) {
+        env->DeleteLocalRef(result);
+    }
+}
+
+#else
+
+static void VectorArtHookCallback(HookContext *, void *) {}
+
+#endif
+
+}  // namespace
+
+}  // namespace vector::native::jni
 
 namespace vector::native::jni {
 /**
@@ -105,7 +369,9 @@ namespace vector::native::jni {
  * @return JNI_TRUE on success, JNI_FALSE on failure.
  */
 VECTOR_DEF_NATIVE_METHOD(jboolean, HookBridge, hookMethod, jboolean useModernApi,
-                         jobject hookMethod, jclass hooker, jint priority, jobject callback) {
+                         jobject hookMethod, jclass hooker, jint priority, jobject callback,
+                         jboolean allowArtBackend) {
+    if (!hookMethod || !hooker || !callback) return JNI_FALSE;
     bool newHook = false;
 
 #ifndef NDEBUG
@@ -124,6 +390,10 @@ VECTOR_DEF_NATIVE_METHOD(jboolean, HookBridge, hookMethod, jboolean useModernApi
 #endif
 
     auto target = env->FromReflectedMethod(hookMethod);
+    if (!target || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return JNI_FALSE;
+    }
     HookItem *hook_item = nullptr;
 
     // Atomically find or create an entry for the target method.
@@ -140,18 +410,79 @@ VECTOR_DEF_NATIVE_METHOD(jboolean, HookBridge, hookMethod, jboolean useModernApi
             newHook = true;
         });
 
-    // If this is the first time this method is being hooked,
-    // we need to perform the actual native hook using lsplant.
+    // If this is the first time this method is being hooked, install the
+    // rustFrida-compatible clone+native-replacement route. LSPlant remains a
+    // compatibility fallback for unsupported ABIs or ART layouts.
     if (newHook) {
         auto init = env->GetMethodID(hooker, "<init>", "(Ljava/lang/reflect/Executable;)V");
-        auto callback_method = env->ToReflectedMethod(
-            hooker, env->GetMethodID(hooker, "callback", "([Ljava/lang/Object;)Ljava/lang/Object;"),
-            false);
-        auto hooker_object = env->NewObject(hooker, init, hookMethod);
-        // Use lsplant to replace the target method with our trampoline.
-        // The returned jobject is a handle to the original method.
-        hook_item->SetBackup(lsplant::Hook(env, hookMethod, hooker_object, callback_method));
-        env->DeleteLocalRef(hooker_object);
+        auto callback_method = env->GetMethodID(
+            hooker, "callback", "([Ljava/lang/Object;)Ljava/lang/Object;");
+        jobject hooker_object = nullptr;
+        if (init && callback_method) {
+            hooker_object = env->NewObject(hooker, init, hookMethod);
+        } else if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
+        // Framework-owned bootstrap hooks (VectorHookBuilder with no module id) run before
+        // ActivityThread attaches. rustFrida's Java.ready gate deliberately avoids installing
+        // ART routing from that pre-attach path (quickjs-hook/src/jsapi/java/java_boot.js
+        // Java._installGateHook), because shared ART router setup can consume the Android
+        // process-start timeout. Keep those framework bootstrap hooks, and the parasitic manager
+        // bootstrap, on LSPlant; module-requested hooks still prefer the WxShadow backend.
+        if (allowArtBackend && !is_manager_process.load(std::memory_order_acquire) &&
+            hooker_object && callback_method && art::Initialize(env)) {
+            auto state = art::Install(env, hookMethod,
+                                      VectorArtHookCallback,
+                                      reinterpret_cast<uintptr_t>(target));
+            if (state) {
+                auto global_hooker = env->NewGlobalRef(hooker_object);
+                if (global_hooker) {
+                    hook_item->hooker_object = global_hooker;
+                    hook_item->hooker_callback = callback_method;
+                    hook_item->art_state = std::move(state);
+                    hook_item->art_state_ptr.store(hook_item->art_state.get(),
+                                                   std::memory_order_release);
+                }
+                if (hook_item->art_state && art::Activate(*hook_item->art_state)) {
+                    // The object is the callback monitor for this backend;
+                    // original invocation uses the raw clone in art_state.
+                    hook_item->SetBackup(hook_item->hooker_object);
+                    LOGD("Installed WxShadow ART hook for ArtMethod {}", static_cast<void *>(target));
+                } else {
+                    hook_item->art_state_ptr.store(nullptr, std::memory_order_release);
+                    hook_item->art_state.reset();
+                    if (hook_item->hooker_object) {
+                        env->DeleteGlobalRef(hook_item->hooker_object);
+                        hook_item->hooker_object = nullptr;
+                    }
+                    hook_item->hooker_callback = nullptr;
+                    env->ExceptionClear();
+                }
+            }
+        }
+
+        if (!hook_item->art_state && hooker_object && callback_method &&
+            IsLsplantInitialized()) {
+            auto reflected_callback = env->ToReflectedMethod(
+                hooker, callback_method, false);
+            if (reflected_callback) {
+                hook_item->SetBackup(lsplant::Hook(env, hookMethod, hooker_object,
+                                                    reflected_callback));
+                env->DeleteLocalRef(reflected_callback);
+            } else {
+                env->ExceptionClear();
+                hook_item->SetBackup(nullptr);
+            }
+            LOGW("Falling back to LSPlant for ArtMethod {}", static_cast<void *>(target));
+        } else if (!hook_item->art_state && hooker_object && callback_method) {
+            LOGW("No ART backend installed for ArtMethod {}: WxShadow unavailable and LSPlant "
+                 "fallback is not initialized in this process",
+                 static_cast<void *>(target));
+            hook_item->SetBackup(nullptr);
+        } else if (!hook_item->art_state) {
+            hook_item->SetBackup(nullptr);
+        }
+        if (hooker_object) env->DeleteLocalRef(hooker_object);
     }
 
     // Wait for the backup to become available (it might be set by another thread).
@@ -263,7 +594,18 @@ VECTOR_DEF_NATIVE_METHOD(jboolean, HookBridge, replaceCallback, jboolean useMode
  * This can be necessary for some types of hooks to work correctly on JIT-compiled methods.
  */
 VECTOR_DEF_NATIVE_METHOD(jboolean, HookBridge, deoptimizeMethod, jobject hookMethod) {
-    return lsplant::Deoptimize(env, hookMethod);
+    auto target = env->FromReflectedMethod(hookMethod);
+    HookItem *hook_item = nullptr;
+    hooked_methods.if_contains(target,
+                               [&hook_item](const auto &it) { hook_item = it.second.get(); });
+    if (hook_item && hook_item->art_state) {
+        if (art::Deoptimize(env, *hook_item->art_state)) return JNI_TRUE;
+        // Keep the established LSPlant deopt path as a conservative fallback
+        // when a vendor ART build hides the instrumentation symbols.
+        return IsLsplantInitialized() && lsplant::Deoptimize(env, hookMethod) ? JNI_TRUE
+                                                                              : JNI_FALSE;
+    }
+    return IsLsplantInitialized() && lsplant::Deoptimize(env, hookMethod);
 }
 
 /**
@@ -276,8 +618,13 @@ VECTOR_DEF_NATIVE_METHOD(jobject, HookBridge, invokeOriginalMethod, jobject hook
     hooked_methods.if_contains(target,
                                [&hook_item](const auto &it) { hook_item = it.second.get(); });
 
-    // If a hook item exists, invoke its backup. Otherwise, invoke the method directly
-    // (though this case should be rare if called from a hook callback).
+    if (hook_item && hook_item->art_state) {
+        return art::InvokeOriginal(env, *hook_item->art_state, thiz, args);
+    }
+
+    // If a hook item exists, invoke its LSPlant backup. Otherwise, invoke the
+    // method directly (though this case should be rare if called from a hook
+    // callback).
     jobject method_to_invoke = hook_item ? hook_item->GetBackup() : hookMethod;
     if (!method_to_invoke) {
         // Hooking might have failed or is not complete.
@@ -557,7 +904,100 @@ VECTOR_DEF_NATIVE_METHOD(jboolean, HookBridge, instanceOf, jobject object, jclas
  * @brief JNI wrapper to mark a DEX file loaded from memory as trusted.
  */
 VECTOR_DEF_NATIVE_METHOD(jboolean, HookBridge, setTrusted, jobject cookie) {
-    return lsplant::MakeDexFileTrusted(env, cookie);
+    // Ordinary app processes now follow the rustFrida wxshadow path and do not initialize LSPlant
+    // during bootstrap. Do not call LSPlant DexFile trust unless its ART state is ready.
+    return IsLsplantInitialized() && lsplant::MakeDexFileTrusted(env, cookie) ? JNI_TRUE
+                                                                              : JNI_FALSE;
+}
+
+/**
+ * @brief Allows the hidden BaseDexClassLoader ByteBuffer constructors used by the module loader.
+ */
+VECTOR_DEF_NATIVE_METHOD(jboolean, HookBridge, exemptModuleClassLoaderHiddenApi) {
+    // rustFrida wxshadow uses JNI to call:
+    // VMRuntime.getRuntime().setHiddenApiExemptions(new String[]{""})
+    // See quickjs-hook/src/jsapi/java/reflect.rs::bypass_hidden_api_restrictions.
+    // Vector only needs BaseDexClassLoader here. Keeping the prefix narrow avoids making unrelated
+    // hidden APIs visible to the target process (and to probes such as Hunter's @HideApi check).
+    // The first call is made from Startup.initXposed, before target application Java startup.
+    // Later module-loading threads must not look up VMRuntime's hidden methods again: after the
+    // narrow exemption is installed, VMRuntime itself deliberately remains hidden. They only
+    // consume the process-wide result cached here.
+    if (module_classloader_hidden_api_exempted.load(std::memory_order_acquire)) {
+        return JNI_TRUE;
+    }
+
+    auto clear_failure = [&](const char *stage) -> jboolean {
+        LOGW("BaseDexClassLoader hidden-API exemption failed at {}", stage);
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
+        return JNI_FALSE;
+    };
+
+    jclass vm_runtime_class = env->FindClass("dalvik/system/VMRuntime");
+    if (!vm_runtime_class) return clear_failure("FindClass(VMRuntime)");
+
+    jmethodID get_runtime =
+        env->GetStaticMethodID(vm_runtime_class, "getRuntime", "()Ldalvik/system/VMRuntime;");
+    if (!get_runtime) {
+        env->DeleteLocalRef(vm_runtime_class);
+        return clear_failure("GetStaticMethodID(getRuntime)");
+    }
+
+    jobject runtime = env->CallStaticObjectMethod(vm_runtime_class, get_runtime);
+    if (!runtime) {
+        env->DeleteLocalRef(vm_runtime_class);
+        return clear_failure("CallStaticObjectMethod(getRuntime)");
+    }
+
+    jmethodID set_exemptions =
+        env->GetMethodID(vm_runtime_class, "setHiddenApiExemptions", "([Ljava/lang/String;)V");
+    if (!set_exemptions) {
+        env->DeleteLocalRef(runtime);
+        env->DeleteLocalRef(vm_runtime_class);
+        return clear_failure("GetMethodID(setHiddenApiExemptions)");
+    }
+
+    jclass string_class = env->FindClass("java/lang/String");
+    if (!string_class) {
+        env->DeleteLocalRef(runtime);
+        env->DeleteLocalRef(vm_runtime_class);
+        return clear_failure("FindClass(String)");
+    }
+
+    jstring class_prefix = env->NewStringUTF("Ldalvik/system/BaseDexClassLoader;");
+    if (!class_prefix) {
+        env->DeleteLocalRef(string_class);
+        env->DeleteLocalRef(runtime);
+        env->DeleteLocalRef(vm_runtime_class);
+        return clear_failure("NewStringUTF(BaseDexClassLoader)");
+    }
+
+    jobjectArray exemptions = env->NewObjectArray(1, string_class, class_prefix);
+    if (!exemptions) {
+        env->DeleteLocalRef(class_prefix);
+        env->DeleteLocalRef(string_class);
+        env->DeleteLocalRef(runtime);
+        env->DeleteLocalRef(vm_runtime_class);
+        return clear_failure("NewObjectArray(exemptions)");
+    }
+
+    env->CallVoidMethod(runtime, set_exemptions, exemptions);
+    const bool ok = !env->ExceptionCheck();
+    if (!ok) {
+        env->ExceptionClear();
+    } else {
+        module_classloader_hidden_api_exempted.store(true, std::memory_order_release);
+        LOGI("Enabled BaseDexClassLoader-only hidden-API exemption for in-memory modules");
+    }
+
+    env->DeleteLocalRef(exemptions);
+    env->DeleteLocalRef(class_prefix);
+    env->DeleteLocalRef(string_class);
+    env->DeleteLocalRef(runtime);
+    env->DeleteLocalRef(vm_runtime_class);
+    return ok ? JNI_TRUE : JNI_FALSE;
 }
 
 /**
@@ -653,7 +1093,7 @@ VECTOR_DEF_NATIVE_METHOD(jobjectArray, HookBridge, callbackSnapshot, jclass call
  * @brief The class name prefixes of the legacy Xposed API as this process will be asked for them.
  *
  * API 102 forbids a module that targets it from calling the legacy API, and the only place that can
- * be enforced is the module class loader - which is handed a name. A literal "de.robv.android.xposed"
+ * be enforced is the module class loader - which is handed a name. A literal "de.wwb.android.wbosed"
  * is not that name: the daemon rewrites those prefixes in the framework dex and in every module dex
  * when dex obfuscation is on, so the name a module asks for is a different random string on every
  * boot. Resolving them through the same map the rest of the framework uses is what makes the guard
@@ -666,7 +1106,7 @@ VECTOR_DEF_NATIVE_METHOD(jobjectArray, HookBridge, callbackSnapshot, jclass call
 VECTOR_DEF_NATIVE_METHOD(jobjectArray, HookBridge, legacyApiPrefixes) {
     // In the dotted form the obfuscation map is served in - the same form loadClass receives.
     static constexpr const char *kLegacyKeys[] = {
-        "de.robv.android.xposed.",
+        "de.wwb.android.wbosed.",
         "android.app.AndroidApp",
         "android.content.res.XRes",
         "android.content.res.XModule",
@@ -810,7 +1250,7 @@ VECTOR_DEF_NATIVE_METHOD(jobject, HookBridge, findStaticInitializer, jclass targ
 static JNINativeMethod gMethods[] = {
     VECTOR_NATIVE_METHOD(HookBridge, hookMethod,
                          "(ZLjava/lang/reflect/Executable;Ljava/lang/Class;ILjava/"
-                         "lang/Object;)Z"),
+                         "lang/Object;Z)Z"),
     VECTOR_NATIVE_METHOD(HookBridge, unhookMethod,
                          "(ZLjava/lang/reflect/Executable;Ljava/lang/Object;)Z"),
     VECTOR_NATIVE_METHOD(HookBridge, replaceCallback,
@@ -826,6 +1266,7 @@ static JNINativeMethod gMethods[] = {
     VECTOR_NATIVE_METHOD(HookBridge, allocateObject, "(Ljava/lang/Class;)Ljava/lang/Object;"),
     VECTOR_NATIVE_METHOD(HookBridge, instanceOf, "(Ljava/lang/Object;Ljava/lang/Class;)Z"),
     VECTOR_NATIVE_METHOD(HookBridge, setTrusted, "(Ljava/lang/Object;)Z"),
+    VECTOR_NATIVE_METHOD(HookBridge, exemptModuleClassLoaderHiddenApi, "()Z"),
     VECTOR_NATIVE_METHOD(HookBridge, makeFieldWritable, "(Ljava/lang/reflect/Field;I)Z"),
     VECTOR_NATIVE_METHOD(HookBridge, callbackSnapshot,
                          "(Ljava/lang/Class;Ljava/lang/reflect/"

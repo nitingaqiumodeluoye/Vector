@@ -6,9 +6,9 @@
 # built the super class and the runtime never retries a failed resolution. That invariant is checked
 # against the optimised dex by checkXResourcesIsolationRelease, not from this file.
 -keep class android.** { *; }
--keep class de.robv.android.xposed.** { *; }
+-keep class de.wwb.android.wbosed.** { *; }
 
-# The in-memory built class xposed.dummy.XResourcesSuperClass exists only on the device, so the
+# The in-memory built class wbosed.dummy.XResourcesSuperClass exists only on the device, so the
 # class below is a deliberate split: it isolates the reference to XResources from its owner, which
 # would otherwise be verified long before that super class exists.
 -keepclassmembers class org.matrix.vector.legacy.LegacyDelegateImpl$ResourceProxy { *; }

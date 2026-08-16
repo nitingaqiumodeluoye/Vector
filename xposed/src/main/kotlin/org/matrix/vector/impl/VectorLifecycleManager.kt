@@ -3,8 +3,8 @@ package org.matrix.vector.impl
 import android.content.pm.ApplicationInfo
 import android.os.Build
 import androidx.annotation.RequiresApi
-import io.github.libxposed.api.XposedModule
-import io.github.libxposed.api.XposedModuleInterface.*
+import de.wwb.android.wbosed.api.WbModule
+import de.wwb.android.wbosed.api.WbModuleInterface.*
 import java.util.concurrent.ConcurrentHashMap
 import org.matrix.vector.util.Log
 
@@ -15,15 +15,15 @@ object VectorLifecycleManager {
 
     // The framework's only strong reference to entry instances, and what detach() removes. Any
     // dispatch added later, hot reload included, must iterate this rather than keep its own list.
-    val activeModules: MutableSet<XposedModule> = ConcurrentHashMap.newKeySet()
+    val activeModules: MutableSet<WbModule> = ConcurrentHashMap.newKeySet()
 
-    fun detach(module: XposedModule) {
+    fun detach(module: WbModule) {
         if (activeModules.remove(module)) {
             Log.d(TAG, "Detached entry ${module.javaClass.name}")
         }
     }
 
-    fun isActive(module: XposedModule): Boolean = activeModules.contains(module)
+    fun isActive(module: WbModule): Boolean = activeModules.contains(module)
 
     /**
      * The API declares `onPackageLoaded` as API 29 and up, so this carries the same requirement

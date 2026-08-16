@@ -56,14 +56,13 @@ Unlike target applications which request access, the daemon actively pushes its 
 
 * The daemon registers an `IUidObserver` with the Activity Manager to monitor process lifecycles.
 * When a UID becomes active, `ModuleAppService` checks if the UID belongs to an enabled libxposed module.
-* The daemon retrieves an `IXposedService` binder. To deliver it, the daemon calls `IActivityManager.getContentProviderExternal`, targeting a synthetic authority constructed from the module's package name.
+* The daemon retrieves an `IWbService` binder. To deliver it, the daemon calls `IActivityManager.getContentProviderExternal`, targeting a synthetic authority constructed from the module's package name.
 * The daemon executes `IContentProvider.call` with the action `SEND_BINDER` and a `Bundle` containing the binder. This injects the binder into the module's process space before `Application.onCreate` executes, providing access to API verification, scope requests, and remote preferences.
 
 ### 4. Native Socket IPC
 For native components that operate outside the Java Binder context, the daemon provisions two distinct types of UNIX domain sockets.
 
 * Command-Line Interface: The `CliSocketServer` exposes a filesystem-based socket at `/data/adb/lspd/.cli_sock`. The CLI client authenticates using a compiled-in UUID token and communicates using structured JSON. For live log streaming, the daemon attaches the log file's raw `FileDescriptor` to the socket reply payload, allowing the client to read directly from the OS-level stream buffer.
-* Dex2Oat Wrapper: The `Dex2OatServer` listens on an abstract UNIX domain socket. To prevent conflicts and detection, the exact name of this abstract socket is randomized during module installation. The C++ `dex2oat` wrapper connects to this socket to receive necessary file descriptors via `SCM_RIGHTS`.
 
 ## Native Environment Subsystems
 
@@ -71,13 +70,10 @@ The daemon relies on native C++ subsystems to intercept Android's compilation pi
 
 ### AOT Compilation Hijacking
 
-Android's ART compiler aggressively inlines methods, which permanently prevents those methods from being hooked at runtime. To enforce the `--inline-max-code-units=0` flag system-wide, Vector utilizes a C++ binary wrapper mounted over the system's `dex2oat` and `dex2oat64` binaries. 
 
 The daemon manages this interception entirely through its native JNI layer. To ensure the replaced compiler binaries are globally visible to all newly spawned application processes, the daemon forks a privileged child process and uses `setns` with `CLONE_NEWNS` to enter the `init` (`PID 1`) mount namespace via `/proc/1/ns/mnt`. It then performs read-only bind mounts (`MS_BIND | MS_REMOUNT | MS_RDONLY`) over the target compiler binaries located in the `/apex` mount points.
 
-When the wrapper executes, it connects to the daemon's abstract UNIX domain socket to retrieve the original compiler binary and the hooking library (`liboat_hook.so`) via `SCM_RIGHTS`. To guarantee the wrapper can connect without SELinux denials, the daemon dynamically writes to `/proc/self/task/[tid]/attr/sockcreate` before binding the socket. This instructs the kernel to label the abstract socket with a specific context, such as `u:r:dex2oat:s0` or `u:r:installd:s0`, matching the strict domains under which the compiler operates.
 
-If the wrapper is disabled or incompatible, the daemon unmounts the binaries and utilizes `resetprop` to inject the inline flag directly into the `dalvik.vm.dex2oat-flags` system property as a fallback. The Kotlin daemon continuously monitors SELinux states via a `FileObserver` on `/sys/fs/selinux/enforce` and its policy files. It dynamically remounts the wrappers if the system drops to permissive mode or alters policy, ensuring the interception persists across state changes.
 
 ### Native Logcat Monitoring
 Instead of relying on standard logcat shell execution, the daemon runs a native C++ process that interfaces directly with Android's `liblog` buffers (`LOG_ID_MAIN` and `LOG_ID_CRASH`). 

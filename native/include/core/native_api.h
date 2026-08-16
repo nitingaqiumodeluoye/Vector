@@ -1,7 +1,6 @@
 #pragma once
 
 #include <dlfcn.h>
-#include <dobby.h>
 
 #include <string>
 #include <utils/hook_helper.hpp>
@@ -11,12 +10,12 @@
 
 /**
  * @file native_api.h
- * @brief Manages the native module ecosystem and provides a stable API for them.
+ * @brief Internal wxshadow native hook helpers and compatibility ABI declarations.
  *
- * This component is responsible for hooking the dynamic library loader (`dlopen`) to
- * detect when registered native modules are loaded.
- * It then provides these modules with a set of function pointers for
- * interacting with the Vector core, primarily for creating native hooks.
+ * Vector's rustFrida-aligned module model treats module APKs as DEX/script inputs only. Target
+ * processes should not load module-provided native libraries from APK paths. The legacy native
+ * module ABI types remain here for binary/source compatibility, but Java registration is a no-op
+ * and Vector's own native inline hooks are installed by the core wxshadow hook engine.
  */
 
 // NOTE: The following type definitions form a public ABI for native modules.
@@ -27,44 +26,9 @@
  *  Vector Native API Interface
  * =========================================================================================
  *
- * This following function types and data structures allow a native library (your module) to
- * interface with the Vector framework.
- * The core idea is that Vector provides a set of powerful tools (like function hooking),
- * and your module consumes these tools through a well-defined entry point.
- *
- * The interaction flow is as follows:
- *
- *   1. Vector intercepts the loading of your native library (e.g., libnative.so).
- *   2. Vector looks for and calls the `native_init` function within your library.
- *   3. Vector passes a `NativeAPIEntries` struct to your `native_init`,
- *      which contains function pointers to Vector's hooking
- *      and unhooking implementations (powered by Dobby).
- *   4. Your `native_init` function saves these function pointers for later use
- *      and returns a callback function (`NativeOnModuleLoaded`).
- *   5. Vector will then invoke your returned callback every time
- *      a new native library is loaded into the target process,
- *      allowing you to perform "late" hooks on specific libraries.
- *
- *
- * Initialization Flow
- *
- *   Vector Framework                    Your Native Module (e.g., libnative.so)
- *   -----------------                    -------------------------------------
- *
- *        |                                            |
- * [ Intercepts dlopen("libnative.so") ]               |
- *        |                                            |
- *        |----------> [ Finds & Calls native_init() ] |
- *        |                                            |
- *   [ Passes NativeAPIEntries* ]  ---> [ Stores function pointers ]
- *   (Contains hook/unhook funcs)                      |
- *        |                                            |
- *        |                                            |
- *        |             <-----------[ Returns `NativeOnModuleLoaded` callback ]
- *        |                                            |
- *        |                                            |
- *   [ Stores your callback ]                          |
- *        |                                            |
+ * These declarations describe the old native module ABI. New module code must not ship native
+ * libraries for target-process loading; native inline hook functionality should be exposed through
+ * Vector core APIs implemented inside the framework.
  *
  */
 
@@ -102,46 +66,55 @@ using NativeInit = NativeOnModuleLoaded (*)(const NativeAPIEntries *entries);
 bool InstallNativeAPI(const lsplant::HookHandler &handler);
 
 /**
- * @brief Registers a native library by its filename for module initialization.
+ * @brief Legacy native-library registration entry point.
  *
- * When a library with a matching filename is loaded via `dlopen`, the runtime will attempt to
- * initialize it as a native module by calling its `native_init` function.
+ * Do not call from module paths. The Java bridge is intentionally a no-op in rustFrida-aligned
+ * mode so module APKs do not cause foreign native mappings in target processes.
  *
  * @param library_name The filename of the native module's .so file (e.g., "libmymodule.so").
  */
 void RegisterNativeLib(const std::string &library_name);
 
 /**
- * @brief A wrapper around DobbyHook.
+ * @brief WxShadow inline hook implementation used by Vector's internal and module-facing native hooks.
+ */
+int HookInlineWxshadow(void *original, void *replace, void **backup);
+
+/**
+ * @brief WxShadow inline unhook implementation used by Vector's internal and module-facing native hooks.
+ */
+int UnhookInlineWxshadow(void *original);
+
+/**
+ * @brief Compatibility wrapper for existing Vector/LSPlant call sites.
  */
 inline int HookInline(void *original, void *replace, void **backup) {
     if constexpr (kIsDebugBuild) {
         Dl_info info;
         if (dladdr(original, &info)) {
-            LOGD("Dobby hooking {} ({}) from {} ({})",
+            LOGD("WxShadow inline hooking {} ({}) from {} ({})",
                  info.dli_sname ? info.dli_sname : "(unknown symbol)",
                  info.dli_saddr ? info.dli_saddr : original,
                  info.dli_fname ? info.dli_fname : "(unknown file)", info.dli_fbase);
         }
     }
-    return DobbyHook(original, reinterpret_cast<dobby_dummy_func_t>(replace),
-                     reinterpret_cast<dobby_dummy_func_t *>(backup));
+    return HookInlineWxshadow(original, replace, backup);
 }
 
 /**
- * @brief A wrapper around DobbyDestroy.
+ * @brief Compatibility wrapper for existing Vector/LSPlant call sites.
  */
 inline int UnhookInline(void *original) {
     if constexpr (kIsDebugBuild) {
         Dl_info info;
         if (dladdr(original, &info)) {
-            LOGD("Dobby unhooking {} ({}) from {} ({})",
+            LOGD("WxShadow inline unhooking {} ({}) from {} ({})",
                  info.dli_sname ? info.dli_sname : "(unknown symbol)",
                  info.dli_saddr ? info.dli_saddr : original,
                  info.dli_fname ? info.dli_fname : "(unknown file)", info.dli_fbase);
         }
     }
-    return DobbyDestroy(original);
+    return UnhookInlineWxshadow(original);
 }
 
 }  // namespace vector::native

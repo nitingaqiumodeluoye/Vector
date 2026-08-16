@@ -202,7 +202,10 @@ abstract class GitCommitHashValueSource : ValueSource<String, GitCommitHashValue
 // the string here and the property name have to stay in step by hand now.
 //
 // This defers the execution of the git commands and allows Gradle to cache the results.
-val versionCodeProvider = providers.of(GitCommitCountValueSource::class.java) {}
+// Use an explicit sequence so rebuilding the same dirty tree still produces a visibly newer
+// artifact. The checked-in value keeps local and CI artifacts on the same numbering scheme.
+val versionCodeProvider =
+    providers.gradleProperty("vectorBuildNumber").orElse(providers.of(GitCommitCountValueSource::class.java) {})
 val versionHashProvider =
     providers.of(GitCommitHashValueSource::class.java) {
         // Set on every GitHub Actions runner and on nothing else, so the presence of either is

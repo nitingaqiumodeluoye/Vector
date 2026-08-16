@@ -1,0 +1,2916 @@
+#include "art_hook/vector_art_hook.h"
+
+#include <dlfcn.h>
+#include <cerrno>
+#include <cctype>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/system_properties.h>
+#include <ucontext.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <atomic>
+#include <array>
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
+#include <limits>
+#include <mutex>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "art_hook/hook_engine.h"
+#include "common/logging.h"
+#include "elf/elf_image.h"
+#include "elf/symbol_cache.h"
+
+namespace vector::native::art {
+
+namespace {
+
+#if defined(__aarch64__)
+
+constexpr uint32_t kAccStatic = 0x0008u;
+constexpr uint32_t kAccNative = 0x0100u;
+constexpr uint64_t kPacStripMask = 0x0000FFFFFFFFFFFFULL;
+constexpr uint32_t kAccCriticalNative = 0x00200000u;
+constexpr uint32_t kAccFastNative = 0x00080000u;
+constexpr uint32_t kAccNterpFastPath = 0x00100000u;
+constexpr uint32_t kAccFastInterpreterToInterpreterInvoke = 0x40000000u;
+constexpr uint32_t kAccPublicApi = 0x10000000u;
+constexpr uint32_t kAccNterpInvokeFastPath = 0x00200000u;
+constexpr size_t kInitialPoolSize = 128 * 1024;
+constexpr char kHookExecPoolVmaName[] = "wwb_hook_exec";
+
+#ifndef PR_SET_VMA
+#define PR_SET_VMA 0x53564d41
+#endif
+#ifndef PR_SET_VMA_ANON_NAME
+#define PR_SET_VMA_ANON_NAME 0
+#endif
+
+void SetHookExecPoolVmaName(void *base, size_t size) {
+    // Keep Vector's ART hook initial executable pool aligned with rustFrida:
+    // agent/src/quickjs_loader.rs::ExecMemory::new_near names the initial exec_mem
+    // "wwb_hook_exec". Extension pools remain "wwb_hook_pool" in
+    // quickjs-hook/src/hook_engine_mem.c::create_pool_near_range_sized.
+    if (!base || base == MAP_FAILED || size == 0) return;
+    errno = 0;
+    int ret = prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME,
+                    reinterpret_cast<unsigned long>(base), size,
+                    reinterpret_cast<unsigned long>(kHookExecPoolVmaName));
+    if (ret != 0) {
+        LOGW("WxShadow ART trace: failed to name exec pool base={} size={} name={} errno={}",
+             base, size, kHookExecPoolVmaName, errno);
+    }
+}
+
+enum class ArtStealthMode : int {
+    Normal = 0,
+    WxShadow = 1,
+};
+
+enum class NativeRouteKind : unsigned char {
+    NotNative,
+    RegisteredNative,
+    SharedNative,
+    UnsupportedNative,
+};
+
+constexpr NativeRouteKind ClassifyNativeRoute(uint32_t access_flags, uintptr_t data,
+                                               bool data_is_executable,
+                                               bool data_is_in_art) {
+    if ((access_flags & kAccNative) == 0) return NativeRouteKind::NotNative;
+    if ((access_flags & kAccCriticalNative) != 0) {
+        return NativeRouteKind::UnsupportedNative;
+    }
+    if (data < 0x10000 || !data_is_executable || data_is_in_art) {
+        // rustFrida treats a native method without an independently
+        // registered fnPtr as a shared/ART-entry route. The entry-point
+        // classifier below decides whether it can use the shared JNI router
+        // or must remain on LSPlant; do not reject it at data_ probing time.
+        return NativeRouteKind::SharedNative;
+    }
+    return NativeRouteKind::RegisteredNative;
+}
+
+static_assert(ClassifyNativeRoute(0, 0, false, false) == NativeRouteKind::NotNative);
+static_assert(ClassifyNativeRoute(kAccNative, 0x10000, true, false) ==
+              NativeRouteKind::RegisteredNative);
+static_assert(ClassifyNativeRoute(kAccNative | kAccCriticalNative, 0x10000, true, false) ==
+              NativeRouteKind::UnsupportedNative);
+static_assert(ClassifyNativeRoute(kAccNative, 0, false, false) ==
+              NativeRouteKind::SharedNative);
+
+struct Layout {
+    size_t method_size = 0;
+    size_t access_flags_offset = 4;
+    size_t data_offset = 0;
+    size_t entry_offset = 0;
+    void *jni_trampoline = nullptr;
+};
+
+// Mirrors rustFrida art_thread.rs for the supported API >= 23 layout. The
+// enclosing Thread offset is still discovered from the live JNIEnv instead of
+// being hard-coded, because vendor ART builds may move tlsPtr_.jni_env.
+struct ArtThreadLayout {
+    size_t managed_stack_offset = 0;
+    size_t suspend_trigger_offset = 0;
+    bool valid = false;
+};
+
+struct SharedNterpRouter {
+    uintptr_t source = 0;
+    uintptr_t target = 0;
+    uintptr_t trampoline = 0;
+};
+
+// Matches rustFrida art_method/bridge.rs::find_classlinker_trampolines.
+// art_quick_* symbols are LOCAL/HIDDEN on a number of ART builds, so the
+// symbol-cache path must have a layout-validated ClassLinker fallback.
+struct ClassLinkerTrampolines {
+    uintptr_t generic_jni = 0;
+    uintptr_t interpreter = 0;
+    uintptr_t resolution = 0;
+    uintptr_t imt_conflict = 0;
+};
+
+using ThreadCurrentFn = uintptr_t (*)();
+
+Layout g_layout;
+ArtThreadLayout g_thread_layout;
+ThreadCurrentFn g_thread_current = nullptr;
+SharedNterpRouter g_nterp_router;
+SharedNterpRouter g_nterp_clinit_router;
+SharedNterpRouter g_jni_router;
+SharedNterpRouter g_interpreter_bridge_router;
+SharedNterpRouter g_resolution_router;
+std::array<uintptr_t, 4> g_do_call_targets{};
+size_t g_do_call_target_count = 0;
+std::array<uintptr_t, 8> g_gc_hook_targets{};
+size_t g_gc_hook_target_count = 0;
+uintptr_t g_oat_header_hook_target = 0;
+uintptr_t g_fixup_hook_target = 0;
+std::mutex g_state_mutex;
+std::vector<MethodState *> g_active_states;
+JNIEnv *g_init_env = nullptr;
+std::once_flag g_quick_entrypoints_once;
+uintptr_t g_quick_test_suspend_entrypoint = 0;
+std::atomic<bool> g_sigchain_guard_installed{false};
+std::atomic<bool> g_bionic_sigsegv_guard_installed{false};
+struct sigaction g_previous_sigsegv_action {};
+std::atomic<uintptr_t> g_implicit_suspend_entrypoint{0};
+std::atomic<uintptr_t> g_implicit_suspend_trigger_offset{UINTPTR_MAX};
+std::once_flag g_classlinker_discovery_once;
+ClassLinkerTrampolines g_classlinker_trampolines;
+ArtStealthMode g_art_stealth_mode = ArtStealthMode::Normal;
+bool g_art_stealth_auto_selected = true;
+std::string g_art_stealth_source = "default:auto";
+std::string g_art_stealth_value = "auto";
+
+bool ResolveRuntime(JNIEnv *env, uintptr_t *runtime);
+int GetAndroidApiLevel();
+void DiscoverClassLinkerTrampolines(JNIEnv *env);
+jobject FindKnownNativeMethod(JNIEnv *env, uintptr_t *art_method);
+uint32_t CompileDontBotherFlag();
+void RegisterActiveState(MethodState *state);
+void UnregisterActiveState(MethodState *state);
+void SynchronizeReplacementMethods();
+void *g_exec_pool = nullptr;
+std::once_flag g_init_once;
+bool g_initialized = false;
+std::mutex g_install_mutex;
+jfieldID g_art_method_field = nullptr;
+std::once_flag g_art_method_field_once;
+
+const char *ArtStealthModeName(ArtStealthMode mode) {
+    return mode == ArtStealthMode::WxShadow ? "wxshadow" : "normal";
+}
+
+int ArtStealthFlag() {
+    return static_cast<int>(g_art_stealth_mode);
+}
+
+bool IsWxShadowStealthMode() {
+    return g_art_stealth_mode == ArtStealthMode::WxShadow;
+}
+
+std::string NormalizeStealthValue(const char *raw) {
+    if (!raw) return {};
+    std::string value(raw);
+    const auto first = std::find_if(value.begin(), value.end(), [](unsigned char c) {
+        return std::isspace(c) == 0;
+    });
+    const auto last = std::find_if(value.rbegin(), value.rend(), [](unsigned char c) {
+        return std::isspace(c) == 0;
+    }).base();
+    if (first >= last) return {};
+    std::string normalized(first, last);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                   [](unsigned char c) {
+                       return static_cast<char>(std::tolower(c));
+                   });
+    return normalized;
+}
+
+bool ParseArtStealthConfig(const char *raw, ArtStealthMode *mode, bool *auto_mode) {
+    const std::string value = NormalizeStealthValue(raw);
+    if (value.empty()) return false;
+    if (value == "auto") {
+        if (auto_mode) *auto_mode = true;
+        return true;
+    }
+    if (auto_mode) *auto_mode = false;
+    if (value == "1" || value == "wxshadow" || value == "shadow" ||
+        value == "true" || value == "on" || value == "yes") {
+        if (mode) *mode = ArtStealthMode::WxShadow;
+        return true;
+    }
+    if (value == "0" || value == "normal" || value == "mprotect" ||
+        value == "false" || value == "off" || value == "no") {
+        if (mode) *mode = ArtStealthMode::Normal;
+        return true;
+    }
+    return false;
+}
+
+bool ParseBooleanConfig(const char *raw, bool *enabled) {
+    const std::string value = NormalizeStealthValue(raw);
+    if (value.empty()) return false;
+    if (value == "1" || value == "true" || value == "on" || value == "yes" ||
+        value == "enable" || value == "enabled") {
+        if (enabled) *enabled = true;
+        return true;
+    }
+    if (value == "0" || value == "false" || value == "off" || value == "no" ||
+        value == "disable" || value == "disabled") {
+        if (enabled) *enabled = false;
+        return true;
+    }
+    return false;
+}
+
+bool ReadArtStealthProperty(const char *name, std::string *value) {
+    char buffer[PROP_VALUE_MAX] = {};
+    if (__system_property_get(name, buffer) <= 0 || buffer[0] == '\0') return false;
+    if (value) *value = buffer;
+    return true;
+}
+
+bool ReadConfiguredArtStealthMode(ArtStealthMode *mode, bool *auto_mode,
+                                  std::string *source, std::string *raw_value) {
+    const char *env_value = getenv("VECTOR_ART_HOOK_STEALTH");
+    if (ParseArtStealthConfig(env_value, mode, auto_mode)) {
+        if (source) *source = "env:VECTOR_ART_HOOK_STEALTH";
+        if (raw_value) *raw_value = env_value ? env_value : "";
+        return true;
+    }
+    for (const char *property :
+         {"debug.vector.art.stealth", "persist.vector.art.stealth"}) {
+        std::string property_value;
+        if (!ReadArtStealthProperty(property, &property_value)) continue;
+        if (ParseArtStealthConfig(property_value.c_str(), mode, auto_mode)) {
+            if (source) *source = std::string("prop:") + property;
+            if (raw_value) *raw_value = property_value;
+            return true;
+        }
+        LOGW("WxShadow ART stealth config ignored: {}={}", property,
+             property_value.c_str());
+    }
+    return false;
+}
+
+bool ReadConfiguredSharedLayer1(bool *enabled, std::string *source,
+                                std::string *raw_value) {
+    const char *env_value = getenv("VECTOR_ART_HOOK_SHARED_LAYER1");
+    if (ParseBooleanConfig(env_value, enabled)) {
+        if (source) *source = "env:VECTOR_ART_HOOK_SHARED_LAYER1";
+        if (raw_value) *raw_value = env_value ? env_value : "";
+        return true;
+    }
+    for (const char *property :
+         {"debug.vector.art.shared_layer1", "persist.vector.art.shared_layer1"}) {
+        std::string property_value;
+        if (!ReadArtStealthProperty(property, &property_value)) continue;
+        if (ParseBooleanConfig(property_value.c_str(), enabled)) {
+            if (source) *source = std::string("prop:") + property;
+            if (raw_value) *raw_value = property_value;
+            return true;
+        }
+        LOGW("WxShadow ART shared Layer1 config ignored: {}={}", property,
+             property_value.c_str());
+    }
+    return false;
+}
+
+bool UseSharedJniNterpLayer1() {
+    if (!IsWxShadowStealthMode()) return false;
+
+    bool enabled = false;
+    std::string source;
+    std::string raw_value;
+    if (ReadConfiguredSharedLayer1(&enabled, &source, &raw_value)) {
+        LOGI("WxShadow ART shared JNI/Nterp Layer1 selected: {} source={} value={}",
+             enabled, source.c_str(), raw_value.c_str());
+        return enabled;
+    }
+
+    // rustFrida reference:
+    // - quickjs-hook/src/jsapi/java/art_controller.rs installs
+    //   quick_generic_jni_trampoline and Nterp only when
+    //   stealth_mode() != Normal.
+    // - rust_frida/src/repl.rs preconfigures that mode only when the script
+    //   explicitly declares Java.setStealth(...).
+    //
+    // Vector's default "auto" chooses wxshadow after a local probe so
+    // per-method patching can stay stealthy, but that is not equivalent to
+    // rustFrida's explicit Java.setStealth(1/2).  Do not hook process-wide
+    // hot JNI/Nterp stubs in auto mode; Hunter executes Nterp at very high
+    // frequency and that creates a wxshadow read/exec switch storm.
+    return !g_art_stealth_auto_selected;
+}
+
+bool ProbeWxShadowPatchAvailable() {
+    const long sys_page_size = sysconf(_SC_PAGESIZE);
+    const size_t page_size = sys_page_size > 0 ? static_cast<size_t>(sys_page_size)
+                                               : static_cast<size_t>(4096);
+    void *page = mmap(nullptr, page_size, PROT_READ | PROT_WRITE | PROT_EXEC,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    LOGI("WxShadow ART trace: probe exec mmap base={} size={} pid={}",
+         page, page_size, getpid());
+    if (page == MAP_FAILED) {
+        LOGW("WxShadow ART stealth auto probe: scratch mmap failed errno={}", errno);
+        return false;
+    }
+    SetHookExecPoolVmaName(page, page_size);
+    constexpr uint32_t kRetInsn = 0xd65f03c0u;
+    memcpy(page, &kRetInsn, sizeof(kRetInsn));
+    hook_flush_cache(page, sizeof(kRetInsn));
+
+    constexpr uint32_t kNopInsn = 0xd503201fu;
+    const uint32_t patched = kNopInsn;
+    const int result = wxshadow_patch(page, &patched, sizeof(patched));
+    bool released = false;
+    if (result == HOOK_OK) {
+        const int release_result = wxshadow_release(page);
+        released = release_result == HOOK_OK;
+        if (release_result != HOOK_OK) {
+            LOGW("WxShadow ART stealth auto probe: release failed result={}",
+                 release_result);
+        }
+    }
+    munmap(page, page_size);
+    return result == HOOK_OK && released;
+}
+
+ArtStealthMode SelectArtStealthMode() {
+    ArtStealthMode configured_mode = ArtStealthMode::Normal;
+    bool auto_mode = true;
+    std::string source = "default:auto";
+    std::string raw_value = "auto";
+    const bool configured =
+        ReadConfiguredArtStealthMode(&configured_mode, &auto_mode, &source, &raw_value);
+    g_art_stealth_auto_selected = auto_mode || !configured;
+    g_art_stealth_source = source;
+    g_art_stealth_value = raw_value;
+
+    // Source reference: rustFrida quickjs-hook/src/jsapi/hook_api/registry.rs
+    // defines StealthMode { Normal=0, WxShadow=1 }, and
+    // art_controller.rs keeps the default Normal until Java.setStealth opts in.
+    // Vector has no Java-facing setStealth bootstrap here, so auto only opts
+    // into WxShadow after the kernel prctl path is proven available in-process.
+    if (auto_mode || !configured) {
+        const bool available = ProbeWxShadowPatchAvailable();
+        const auto selected = available ? ArtStealthMode::WxShadow
+                                        : ArtStealthMode::Normal;
+        LOGI("WxShadow ART stealth mode selected: {} source={} value={} probe={}",
+             ArtStealthModeName(selected), source.c_str(), raw_value.c_str(),
+             available ? "ready" : "unavailable");
+        return selected;
+    }
+
+    LOGI("WxShadow ART stealth mode selected: {} source={} value={} probe=skipped",
+         ArtStealthModeName(configured_mode), source.c_str(), raw_value.c_str());
+    return configured_mode;
+}
+
+bool IsMappedExecutable(uintptr_t address) {
+    address &= kPacStripMask;
+    if (address < 0x1000) return false;
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) return false;
+    char line[512];
+    bool executable = false;
+    while (fgets(line, sizeof(line), maps)) {
+        uintptr_t start = 0;
+        uintptr_t end = 0;
+        char perms[5] = {};
+        if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) == 3 &&
+            address >= start && address < end) {
+            executable = perms[2] == 'x';
+            break;
+        }
+    }
+    fclose(maps);
+    return executable;
+}
+
+bool IsReadable(uintptr_t address, size_t size) {
+    if (address < 0x1000 || size == 0) return false;
+    const uintptr_t end = address + size - 1;
+    if (end < address) return false;
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) return false;
+    char line[512];
+    bool readable = false;
+    while (fgets(line, sizeof(line), maps)) {
+        uintptr_t start = 0;
+        uintptr_t finish = 0;
+        char perms[5] = {};
+        if (sscanf(line, "%lx-%lx %4s", &start, &finish, perms) == 3 &&
+            address >= start && end < finish) {
+            readable = perms[0] == 'r';
+            break;
+        }
+    }
+    fclose(maps);
+    return readable;
+}
+
+bool FindModuleRange(const char *module_name, uintptr_t *start_out, uintptr_t *end_out) {
+    if (!module_name || !start_out || !end_out) return false;
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) return false;
+    uintptr_t start = std::numeric_limits<uintptr_t>::max();
+    uintptr_t end = 0;
+    char line[768];
+    while (fgets(line, sizeof(line), maps)) {
+        uintptr_t map_start = 0;
+        uintptr_t map_end = 0;
+        if (sscanf(line, "%lx-%lx", &map_start, &map_end) != 2) continue;
+        if (strstr(line, module_name) == nullptr) continue;
+        start = std::min(start, map_start);
+        end = std::max(end, map_end);
+    }
+    fclose(maps);
+    if (start == std::numeric_limits<uintptr_t>::max() || end <= start) return false;
+    *start_out = start;
+    *end_out = end;
+    return true;
+}
+
+uintptr_t FindLibartExecutableBase() {
+    // Source reference: rustFrida agent/src/quickjs_loader.rs::find_libart_base
+    // uses the r-xp libart.so mapping as hook_mmap_near() hint.
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) return 0;
+    char line[512];
+    uintptr_t base = 0;
+    while (fgets(line, sizeof(line), maps)) {
+        unsigned long map_start = 0;
+        if (sscanf(line, "%lx-", &map_start) != 1) continue;
+        if (strstr(line, "libart.so") && strstr(line, "r-xp")) {
+            base = static_cast<uintptr_t>(map_start);
+            break;
+        }
+    }
+    fclose(maps);
+    return base;
+}
+
+bool ReadExecutableModifiers(JNIEnv *env, jobject executable, jint *modifiers) {
+    if (!env || !executable || !modifiers) return false;
+    auto executable_class = env->FindClass("java/lang/reflect/Executable");
+    if (!executable_class) return false;
+    auto get_modifiers = env->GetMethodID(executable_class, "getModifiers", "()I");
+    if (!get_modifiers) {
+        env->DeleteLocalRef(executable_class);
+        return false;
+    }
+    *modifiers = env->CallIntMethod(executable, get_modifiers);
+    const bool ok = !env->ExceptionCheck();
+    if (!ok) env->ExceptionClear();
+    env->DeleteLocalRef(executable_class);
+    return ok;
+}
+
+uintptr_t ReflectedArtMethod(JNIEnv *env, jobject executable) {
+    if (!env || !executable) return 0;
+    return reinterpret_cast<uintptr_t>(env->FromReflectedMethod(executable));
+}
+
+void ResolveArtMethodField(JNIEnv *env) {
+    if (!env) return;
+    auto executable = env->FindClass("java/lang/reflect/Executable");
+    if (!executable) {
+        env->ExceptionClear();
+        return;
+    }
+    g_art_method_field = env->GetFieldID(executable, "artMethod", "J");
+    if (!g_art_method_field) env->ExceptionClear();
+    env->DeleteLocalRef(executable);
+}
+
+uintptr_t DecodeReflectedArtMethod(JNIEnv *env, jobject executable) {
+    const auto raw = ReflectedArtMethod(env, executable);
+    if (raw == 0) return 0;
+
+    // Prefer the reflection object's ArtMethod field whenever it is exposed.
+    // This handles both direct and opaque jmethodIDs; the latter are not
+    // guaranteed to be distinguishable solely by bit 0 on vendor ART builds.
+    std::call_once(g_art_method_field_once, [env] { ResolveArtMethodField(env); });
+    if (g_art_method_field) {
+        const auto decoded = static_cast<uintptr_t>(
+            env->GetLongField(executable, g_art_method_field));
+        if (!env->ExceptionCheck() && decoded != 0) {
+            return decoded & kPacStripMask;
+        }
+        env->ExceptionClear();
+    }
+
+    // On older ART versions the field may be absent; retain the direct ID
+    // fallback, including the odd value so callers can reject it safely.
+    return (raw & 1u) == 0 ? (raw & kPacStripMask) : raw;
+}
+
+std::vector<uintptr_t> CollectArtMethodAddresses(JNIEnv *env) {
+    std::vector<uintptr_t> result;
+    auto class_class = env->FindClass("java/lang/Class");
+    auto object_class = env->FindClass("java/lang/Object");
+    if (!class_class || !object_class) {
+        if (class_class) env->DeleteLocalRef(class_class);
+        if (object_class) env->DeleteLocalRef(object_class);
+        env->ExceptionClear();
+        return result;
+    }
+    auto get_declared_methods =
+        env->GetMethodID(class_class, "getDeclaredMethods", "()[Ljava/lang/reflect/Method;");
+    if (!get_declared_methods) {
+        env->DeleteLocalRef(object_class);
+        env->DeleteLocalRef(class_class);
+        env->ExceptionClear();
+        return result;
+    }
+    auto methods = reinterpret_cast<jobjectArray>(
+        env->CallObjectMethod(object_class, get_declared_methods));
+    if (!methods || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(object_class);
+        env->DeleteLocalRef(class_class);
+        return result;
+    }
+    const jsize count = env->GetArrayLength(methods);
+    for (jsize i = 0; i < count; ++i) {
+        jobject method = env->GetObjectArrayElement(methods, i);
+        if (method) {
+            const auto address = DecodeReflectedArtMethod(env, method);
+            if (address != 0) result.push_back(address);
+            env->DeleteLocalRef(method);
+        }
+    }
+    env->DeleteLocalRef(methods);
+    env->DeleteLocalRef(object_class);
+    env->DeleteLocalRef(class_class);
+    return result;
+}
+
+size_t InferMethodSize(JNIEnv *env, uintptr_t target) {
+    auto addresses = CollectArtMethodAddresses(env);
+    addresses.push_back(target);
+    std::sort(addresses.begin(), addresses.end());
+    addresses.erase(std::unique(addresses.begin(), addresses.end()), addresses.end());
+    std::array<size_t, 15> frequency{};
+    size_t best = std::numeric_limits<size_t>::max();
+    for (size_t i = 1; i < addresses.size(); ++i) {
+        const uintptr_t delta = addresses[i] - addresses[i - 1];
+        if (delta >= 16 && delta <= 128 && (delta % alignof(void *)) == 0) {
+            const auto index = static_cast<size_t>((delta - 16) / 8);
+            ++frequency[index];
+            best = std::min(best, static_cast<size_t>(delta));
+        }
+    }
+    size_t repeated = 0;
+    size_t repeated_count = 0;
+    for (size_t i = 0; i < frequency.size(); ++i) {
+        if (frequency[i] > repeated_count) {
+            repeated = 16 + i * 8;
+            repeated_count = frequency[i];
+        }
+    }
+    if (repeated_count > 0) return repeated;
+    if (best != std::numeric_limits<size_t>::max()) return best;
+    return 32;
+}
+
+void *ResolveArtSymbol(const char *name) {
+    if (const auto *art = ElfSymbolCache::GetArt()) {
+        if (void *address = art->getSymbAddress<void *>(name)) return address;
+    }
+    return dlsym(RTLD_DEFAULT, name);
+}
+
+bool ProbeArtThreadLayout(JNIEnv *env) {
+    if (!env) return false;
+    const auto env_address = reinterpret_cast<uintptr_t>(env);
+    if (!IsReadable(env_address + sizeof(uintptr_t), sizeof(uintptr_t))) {
+        LOGW("WxShadow ART thread layout: JNIEnvExt unreadable at {}",
+             static_cast<void *>(env));
+        return false;
+    }
+
+    // rustFrida art_thread.rs: JNIEnvExt starts with functions_ then self_.
+    const auto raw_thread = *reinterpret_cast<volatile const uintptr_t *>(
+        env_address + sizeof(uintptr_t));
+    const auto thread = raw_thread & kPacStripMask;
+    if (!IsReadable(thread + 144, 384 - 144)) {
+        LOGW("WxShadow ART thread layout: Thread range unreadable env={} raw_thread={} thread={}",
+             static_cast<void *>(env), reinterpret_cast<void *>(raw_thread),
+             reinterpret_cast<void *>(thread));
+        return false;
+    }
+
+    const auto stripped_env = reinterpret_cast<uintptr_t>(env) & kPacStripMask;
+    for (size_t offset = 144; offset < 384; offset += sizeof(uintptr_t)) {
+        const auto candidate = *reinterpret_cast<volatile const uintptr_t *>(thread + offset);
+        if ((candidate & kPacStripMask) != stripped_env) continue;
+
+        // API >= 23 in rustFrida: managed_stack_ is four pointer slots before
+        // tlsPtr_.jni_env; ManagedStack::top_quick_frame_ is at offset zero.
+        g_thread_layout.managed_stack_offset = offset - 4 * sizeof(uintptr_t);
+        // Source reference: rustFrida art_thread.rs::probe_art_thread_spec.
+        // tlsPtr_.suspend_trigger_ immediately precedes tlsPtr_.jni_env.
+        g_thread_layout.suspend_trigger_offset = offset - sizeof(uintptr_t);
+        g_thread_layout.valid = true;
+        LOGI("WxShadow ART thread layout: Thread+{} managed_stack=Thread+{}",
+             offset, g_thread_layout.managed_stack_offset);
+        return true;
+    }
+
+    LOGW("WxShadow ART thread layout: JNIEnv not found in Thread offsets 144..384");
+    return false;
+}
+
+bool IsInArtModule(uintptr_t address);
+
+bool ShouldReplaceForManagedStack(uintptr_t replacement) {
+    // Keep rustFrida's fail-open behavior: this guard is recursion protection,
+    // not a prerequisite for ordinary per-method routing.
+    if (!g_thread_current || !g_thread_layout.valid) return true;
+
+    const auto thread = g_thread_current() & kPacStripMask;
+    if (thread == 0) return true;
+    const auto managed_stack = thread + g_thread_layout.managed_stack_offset;
+
+    const auto top_quick_frame = *reinterpret_cast<volatile const uintptr_t *>(managed_stack);
+    if (top_quick_frame != 0) {
+        const auto frame = (top_quick_frame & ~uintptr_t{1}) & kPacStripMask;
+        if (frame == 0) return true;
+        const auto method =
+            *reinterpret_cast<volatile const uintptr_t *>(frame) & kPacStripMask;
+        return method != (replacement & kPacStripMask);
+    }
+
+    // API >= 23 ManagedStack::link_ is the second pointer slot. This matches
+    // rustFrida should_replace_for_stack, including TaggedQuickFrame bit 0.
+    const auto link =
+        *reinterpret_cast<volatile const uintptr_t *>(managed_stack + sizeof(uintptr_t)) &
+        kPacStripMask;
+    if (link == 0) return true;
+    const auto linked_top = *reinterpret_cast<volatile const uintptr_t *>(link);
+    const auto frame = (linked_top & ~uintptr_t{1}) & kPacStripMask;
+    if (frame == 0) return true;
+    const auto method = *reinterpret_cast<volatile const uintptr_t *>(frame) & kPacStripMask;
+    return method != (replacement & kPacStripMask);
+}
+
+void OnDoCallEnter(HookContext *ctx, void *) {
+    if (!ctx) return;
+    ctx->intercept_leave = 0;
+    if (hook_managed_reentry_guard_active() != 0) return;
+
+    const auto method = ctx->x[0] & kPacStripMask;
+    uint64_t route_mode = 0;
+    const auto replacement = hook_art_router_table_lookup_do_call(method, &route_mode) &
+                             kPacStripMask;
+    if (!replacement) return;
+
+    // Source reference: rustFrida art_controller.rs::on_do_call_enter. Vector's
+    // InvokeOriginal calls a cloned ArtMethod, but keep the engine's one-shot
+    // bypass for managed helper routes and future API-compatible call paths.
+    if (orig_bypass_consume_current_thread(method) != 0) return;
+    if (!ShouldReplaceForManagedStack(replacement)) return;
+
+    // malloc-backed native replacement ArtMethods are not visited by GC. Keep
+    // their compressed declaring_class_ synchronized before interpreter entry.
+    // Managed helper modes (>= 4) own a real dex ArtMethod and must retain it.
+    if (route_mode < 4) {
+        const auto declaring_class =
+            *reinterpret_cast<volatile const uint32_t *>(method);
+        *reinterpret_cast<volatile uint32_t *>(replacement) = declaring_class;
+    }
+    ctx->x[0] = replacement;
+}
+
+int GetAndroidApiLevel() {
+    char value[PROP_VALUE_MAX] = {};
+    if (__system_property_get("ro.build.version.sdk", value) <= 0) return 0;
+    return atoi(value);
+}
+
+uint32_t CompileDontBotherFlag() {
+    // Source: rustFrida jni_core.rs::k_acc_compile_dont_bother. The bit moved
+    // between API 24-26 and API 27+, and is absent on older ART releases.
+    const int api = GetAndroidApiLevel();
+    if (api >= 27) return 0x02000000u;
+    if (api >= 24) return 0x01000000u;
+    return 0;
+}
+
+std::string GetAndroidCodename() {
+    char value[PROP_VALUE_MAX] = {};
+    if (__system_property_get("ro.build.version.codename", value) <= 0) return {};
+    return value;
+}
+
+void DiscoverClassLinkerTrampolines(JNIEnv *env) {
+    // Source reference: rustFrida art_method/bridge.rs::find_classlinker_trampolines,
+    // art_method/runtime.rs::find_runtime_java_vm and shared.rs::
+    // compute_classlinker_candidates. art_quick_* entries are commonly LOCAL/HIDDEN;
+    // keep this discovery layout-validated and fail closed when an anchor is absent.
+    std::call_once(g_classlinker_discovery_once, [env] {
+        if (!env) return;
+
+        auto direct = [](const char *name) {
+            return reinterpret_cast<uintptr_t>(ResolveArtSymbol(name)) & kPacStripMask;
+        };
+        const auto direct_jni = direct("art_quick_generic_jni_trampoline");
+        const auto direct_interpreter = direct("art_quick_to_interpreter_bridge");
+        const auto direct_resolution = direct("art_quick_resolution_trampoline");
+        const auto direct_imt = direct("art_quick_imt_conflict_trampoline");
+        const bool direct_jni_valid = IsMappedExecutable(direct_jni) && IsInArtModule(direct_jni);
+        const bool direct_interpreter_valid =
+            IsMappedExecutable(direct_interpreter) && IsInArtModule(direct_interpreter);
+        const bool direct_resolution_valid =
+            IsMappedExecutable(direct_resolution) && IsInArtModule(direct_resolution);
+        const bool direct_imt_valid = IsMappedExecutable(direct_imt) && IsInArtModule(direct_imt);
+        // Source: rustFrida art_method/bridge.rs::find_classlinker_trampolines
+        // returns usable direct symbols even when only a subset is visible.
+        g_classlinker_trampolines.generic_jni = direct_jni_valid ? direct_jni : 0;
+        g_classlinker_trampolines.interpreter = direct_interpreter_valid ? direct_interpreter : 0;
+        g_classlinker_trampolines.resolution = direct_resolution_valid ? direct_resolution : 0;
+        g_classlinker_trampolines.imt_conflict = direct_imt_valid ? direct_imt : 0;
+        if (direct_jni_valid && direct_interpreter_valid && direct_resolution_valid) {
+            LOGI("WxShadow ART ClassLinker trampolines ready from symbols: jni={} interp={} "
+                 "resolution={} imt={}",
+                 reinterpret_cast<void *>(direct_jni),
+                 reinterpret_cast<void *>(direct_interpreter),
+                 reinterpret_cast<void *>(direct_resolution),
+                 reinterpret_cast<void *>(g_classlinker_trampolines.imt_conflict));
+            return;
+        }
+
+        JavaVM *vm = nullptr;
+        if (env->GetJavaVM(&vm) != JNI_OK || !vm) {
+            LOGW("WxShadow ART ClassLinker discovery: JavaVM unavailable");
+            return;
+        }
+        uintptr_t runtime = 0;
+        if (!ResolveRuntime(env, &runtime)) {
+            LOGW("WxShadow ART ClassLinker discovery: Runtime unavailable");
+            return;
+        }
+
+        const auto vm_address = reinterpret_cast<uintptr_t>(vm) & kPacStripMask;
+        size_t java_vm_offset = 0;
+        for (size_t offset = 384; offset < 384 + 800; offset += sizeof(uintptr_t)) {
+            if (!IsReadable(runtime + offset, sizeof(uintptr_t))) continue;
+            const auto candidate = *reinterpret_cast<const uintptr_t *>(runtime + offset) &
+                                   kPacStripMask;
+            if (candidate == vm_address) {
+                java_vm_offset = offset;
+                break;
+            }
+        }
+        if (java_vm_offset == 0) {
+            LOGW("WxShadow ART ClassLinker discovery: Runtime java_vm_ anchor not found");
+            return;
+        }
+
+        const int api_level = GetAndroidApiLevel();
+        const auto codename = GetAndroidCodename();
+        std::vector<size_t> class_linker_offsets;
+        auto add_offset = [&class_linker_offsets](size_t distance) {
+            if (distance > 0 && distance <= 384) {
+                class_linker_offsets.push_back(distance);
+            }
+        };
+        if (api_level >= 33 || codename == "Tiramisu") {
+            add_offset(4 * sizeof(uintptr_t));
+        } else if (api_level >= 30 || codename == "R" || codename == "S") {
+            add_offset(3 * sizeof(uintptr_t));
+            add_offset(4 * sizeof(uintptr_t));
+        } else if (api_level >= 29 || codename == "Q") {
+            add_offset(2 * sizeof(uintptr_t));
+        } else if (api_level >= 27) {
+            add_offset(6 * sizeof(uintptr_t));
+        } else {
+            add_offset(5 * sizeof(uintptr_t));
+        }
+
+        const size_t delta = (api_level >= 30 || codename == "R" || codename == "S") ?
+                                 6 : ((api_level >= 29 || codename == "Q") ? 4 :
+                                      (api_level >= 23 ? 3 : 5));
+        const size_t resolution_delta = api_level >= 23 ? 2 : 3;
+        for (const auto distance : class_linker_offsets) {
+            if (java_vm_offset <= distance || java_vm_offset - distance < sizeof(uintptr_t)) {
+                continue;
+            }
+            const auto class_linker_offset = java_vm_offset - distance;
+            const auto intern_table_offset = class_linker_offset - sizeof(uintptr_t);
+            if (!IsReadable(runtime + class_linker_offset, sizeof(uintptr_t)) ||
+                !IsReadable(runtime + intern_table_offset, sizeof(uintptr_t))) {
+                continue;
+            }
+            const auto class_linker =
+                *reinterpret_cast<const uintptr_t *>(runtime + class_linker_offset) &
+                kPacStripMask;
+            const auto intern_table =
+                *reinterpret_cast<const uintptr_t *>(runtime + intern_table_offset) &
+                kPacStripMask;
+            if (!class_linker || !intern_table || !IsReadable(class_linker + 200, 800)) {
+                continue;
+            }
+
+            size_t intern_table_class_linker_offset = 0;
+            for (size_t offset = 200; offset < 200 + 800; offset += sizeof(uintptr_t)) {
+                const auto candidate =
+                    *reinterpret_cast<const uintptr_t *>(class_linker + offset) &
+                    kPacStripMask;
+                if (candidate == intern_table) {
+                    intern_table_class_linker_offset = offset;
+                    break;
+                }
+            }
+            if (intern_table_class_linker_offset < delta * sizeof(uintptr_t)) continue;
+
+            const auto jni_offset = intern_table_class_linker_offset +
+                                    delta * sizeof(uintptr_t);
+            const auto interp_offset = jni_offset + sizeof(uintptr_t);
+            const auto imt_offset = jni_offset - sizeof(uintptr_t);
+            if (jni_offset < resolution_delta * sizeof(uintptr_t)) continue;
+            const auto resolution_offset =
+                jni_offset - resolution_delta * sizeof(uintptr_t);
+            if (!IsReadable(class_linker + resolution_offset, sizeof(uintptr_t)) ||
+                !IsReadable(class_linker + imt_offset, sizeof(uintptr_t)) ||
+                !IsReadable(class_linker + jni_offset, sizeof(uintptr_t)) ||
+                !IsReadable(class_linker + interp_offset, sizeof(uintptr_t))) {
+                continue;
+            }
+
+            const auto generic_jni =
+                *reinterpret_cast<const uintptr_t *>(class_linker + jni_offset) &
+                kPacStripMask;
+            const auto interpreter =
+                *reinterpret_cast<const uintptr_t *>(class_linker + interp_offset) &
+                kPacStripMask;
+            const auto resolution =
+                *reinterpret_cast<const uintptr_t *>(class_linker + resolution_offset) &
+                kPacStripMask;
+            const auto imt_conflict =
+                *reinterpret_cast<const uintptr_t *>(class_linker + imt_offset) &
+                kPacStripMask;
+            if (!generic_jni || !IsMappedExecutable(generic_jni) ||
+                !IsInArtModule(generic_jni)) {
+                continue;
+            }
+
+            // Keep direct symbols when present and use the validated scan to
+            // fill only entries hidden from symbol lookup, matching source
+            // find_classlinker_trampolines' per-field merge.
+            if (!direct_jni_valid) g_classlinker_trampolines.generic_jni = generic_jni;
+            if (!direct_interpreter_valid) {
+                g_classlinker_trampolines.interpreter =
+                    IsMappedExecutable(interpreter) && IsInArtModule(interpreter) ?
+                        interpreter : 0;
+            }
+            if (!direct_resolution_valid) {
+                g_classlinker_trampolines.resolution =
+                    IsMappedExecutable(resolution) && IsInArtModule(resolution) ?
+                        resolution : 0;
+            }
+            if (!direct_imt_valid) {
+                g_classlinker_trampolines.imt_conflict =
+                    IsMappedExecutable(imt_conflict) && IsInArtModule(imt_conflict) ?
+                        imt_conflict : 0;
+            }
+            LOGI("WxShadow ART ClassLinker trampolines ready: api={} java_vm=+{} "
+                 "class_linker=+{} intern_table=+{} jni={} interp={} resolution={} imt={}",
+                 api_level, java_vm_offset, class_linker_offset,
+                 intern_table_class_linker_offset, reinterpret_cast<void *>(generic_jni),
+                 reinterpret_cast<void *>(g_classlinker_trampolines.interpreter),
+                 reinterpret_cast<void *>(g_classlinker_trampolines.resolution),
+                 reinterpret_cast<void *>(g_classlinker_trampolines.imt_conflict));
+            return;
+        }
+        LOGW("WxShadow ART ClassLinker discovery: no validated candidate");
+    });
+}
+
+size_t InitializeDoCallLayer() {
+    // Source reference: rustFrida art_method/bridge.rs::find_do_call_symbols and
+    // art_controller.rs Layer 2. DoCall is attached once per template instance;
+    // misses tail-jump directly to the original trampoline.
+    const int api_level = GetAndroidApiLevel();
+    std::vector<std::string> symbols;
+    // Source: rustFrida art_method/bridge.rs::find_do_call_symbols treats an
+    // unavailable API property (0) like the legacy <=22 signature.
+    if (api_level <= 22) {
+        for (const char *b0 : {"0", "1"}) {
+            for (const char *b1 : {"0", "1"}) {
+                symbols.emplace_back(
+                    "_ZN3art11interpreter6DoCallILb" + std::string(b0) +
+                    "ELb" + b1 +
+                    "EEEbPNS_6mirror9ArtMethodEPNS_6ThreadERNS_11ShadowFrameEPKNS_11InstructionEtPNS_6JValueE");
+            }
+        }
+    } else if (api_level <= 33) {
+        for (const char *b0 : {"0", "1"}) {
+            for (const char *b1 : {"0", "1"}) {
+                symbols.emplace_back(
+                    "_ZN3art11interpreter6DoCallILb" + std::string(b0) +
+                    "ELb" + b1 +
+                    "EEEbPNS_9ArtMethodEPNS_6ThreadERNS_11ShadowFrameEPKNS_11InstructionEtPNS_6JValueE");
+            }
+        }
+    } else {
+        for (const char *b0 : {"0", "1"}) {
+            symbols.emplace_back(
+                "_ZN3art11interpreter6DoCallILb" + std::string(b0) +
+                "EEEbPNS_9ArtMethodEPNS_6ThreadERNS_11ShadowFrameEPKNS_11InstructionEtbPNS_6JValueE");
+        }
+    }
+
+    for (size_t i = 0; i < symbols.size() &&
+                       g_do_call_target_count < g_do_call_targets.size(); ++i) {
+        const auto source = reinterpret_cast<uintptr_t>(
+            ResolveArtSymbol(symbols[i].c_str())) & kPacStripMask;
+        if (!source) continue;
+        void *resolved = resolve_art_trampoline(reinterpret_cast<void *>(source), nullptr);
+        if (!resolved) resolved = reinterpret_cast<void *>(source);
+        const auto target = reinterpret_cast<uintptr_t>(resolved) & kPacStripMask;
+        if (!IsMappedExecutable(target) || !IsInArtModule(target)) {
+            LOGW("WxShadow ART controller: rejected DoCall[{}] target {}", i,
+                 reinterpret_cast<void *>(target));
+            continue;
+        }
+        if (std::find(g_do_call_targets.begin(),
+                      g_do_call_targets.begin() + g_do_call_target_count,
+                      target) != g_do_call_targets.begin() + g_do_call_target_count) {
+            continue;
+        }
+        const int result = hook_attach(reinterpret_cast<void *>(target), OnDoCallEnter,
+                                       nullptr, reinterpret_cast<void *>(i & 1),
+                                       ArtStealthFlag());
+        if (result != HOOK_OK) {
+            LOGW("WxShadow ART controller: DoCall[{}] hook failed target={} result={}",
+                 i, reinterpret_cast<void *>(target), result);
+            continue;
+        }
+        g_do_call_targets[g_do_call_target_count++] = target;
+        LOGI("WxShadow ART controller: DoCall[{}] ready source={} target={}", i,
+             reinterpret_cast<void *>(source), reinterpret_cast<void *>(target));
+    }
+    return g_do_call_target_count;
+}
+
+void RegisterActiveState(MethodState *state) {
+    if (!state) return;
+    std::lock_guard lock(g_state_mutex);
+    if (std::find(g_active_states.begin(), g_active_states.end(), state) ==
+        g_active_states.end()) {
+        g_active_states.push_back(state);
+    }
+}
+
+void UnregisterActiveState(MethodState *state) {
+    std::lock_guard lock(g_state_mutex);
+    g_active_states.erase(
+        std::remove(g_active_states.begin(), g_active_states.end(), state),
+        g_active_states.end());
+}
+
+void SynchronizeReplacementMethods() {
+    // Source reference: rustFrida art_controller.rs::synchronize_replacement_methods.
+    // Vector's registry owns MethodState for the process lifetime after a
+    // successful activation, so a short mutex-protected snapshot is sufficient.
+    std::lock_guard lock(g_state_mutex);
+    for (auto *state : g_active_states) {
+        if (!state || state->native_entry_hook || !state->replacement ||
+            !state->original_art_method) {
+            continue;
+        }
+        if (!IsReadable(state->original_art_method, sizeof(uint32_t)) ||
+            !IsReadable(state->replacement, state->method_size)) {
+            continue;
+        }
+        const auto declaring_class = *reinterpret_cast<volatile const uint32_t *>(
+            state->original_art_method);
+        *reinterpret_cast<volatile uint32_t *>(state->replacement) = declaring_class;
+        if (state->access_flags_offset + sizeof(uint32_t) <= state->method_size) {
+            constexpr uint32_t kAccFastInterpreterToInterpreterInvoke = 0x40000000u;
+            auto flags = *reinterpret_cast<volatile uint32_t *>(
+                state->replacement + state->access_flags_offset);
+            flags = (flags | CompileDontBotherFlag()) &
+                    ~kAccFastInterpreterToInterpreterInvoke;
+            *reinterpret_cast<volatile uint32_t *>(
+                state->replacement + state->access_flags_offset) = flags;
+        }
+        if (state->original_entry_mutated &&
+            state->entry_offset + sizeof(uintptr_t) <= state->method_size &&
+            g_interpreter_bridge_router.source != 0 &&
+            IsReadable(state->original_art_method,
+                       state->entry_offset + sizeof(uintptr_t))) {
+            auto *entry = reinterpret_cast<volatile uintptr_t *>(
+                state->original_art_method + state->entry_offset);
+            if ((*entry & kPacStripMask) !=
+                (g_interpreter_bridge_router.source & kPacStripMask)) {
+                // rustFrida's post-install/delayed-entry-refresh keeps an
+                // internal entry downgrade stable when ART class fixup writes
+                // the original shared entry back. Vector folds the same repair
+                // into its existing GC/ClassLinker synchronization hooks.
+                *entry = g_interpreter_bridge_router.source;
+                hook_flush_cache(reinterpret_cast<void *>(
+                                     state->original_art_method + state->entry_offset),
+                                 sizeof(uintptr_t));
+            }
+        }
+        hook_flush_cache(reinterpret_cast<void *>(state->replacement), state->method_size);
+    }
+}
+
+void OnGcSyncLeave(HookContext *, void *) { SynchronizeReplacementMethods(); }
+void OnGcSyncEnter(HookContext *, void *) { SynchronizeReplacementMethods(); }
+
+bool IsReplacementMethod(uintptr_t method) {
+    method &= kPacStripMask;
+    if (!method) return false;
+    std::lock_guard lock(g_state_mutex);
+    return std::any_of(g_active_states.begin(), g_active_states.end(),
+                       [method](const MethodState *state) {
+                           return state && !state->native_entry_hook &&
+                                  (state->replacement & kPacStripMask) == method;
+                       });
+}
+
+void OnGetOatQuickMethodHeader(HookContext *ctx, void *) {
+    if (!ctx) return;
+    const auto method = ctx->x[0] & kPacStripMask;
+    const auto pc = ctx->x[1] & kPacStripMask;
+
+    // Source reference: rustFrida art_controller.rs::on_get_oat_quick_method_header.
+    // Hook-pool PCs do not belong to ART-owned quick code, and malloc-backed
+    // replacement ArtMethods have no valid OAT header.
+    if (hook_is_in_exec_pool(pc) != 0 || IsReplacementMethod(method)) {
+        ctx->x[0] = 0;
+        return;
+    }
+    if (ctx->trampoline) {
+        ctx->x[0] = hook_invoke_trampoline(ctx, ctx->trampoline);
+    } else {
+        ctx->x[0] = 0;
+    }
+}
+
+bool InitializeOatHeaderLayer() {
+    constexpr const char *kCandidates[] = {
+        "_ZN3art9ArtMethod23GetOatQuickMethodHeaderEm",
+        "_ZN3art9ArtMethod23GetOatQuickMethodHeaderEj",
+    };
+    for (const auto *name : kCandidates) {
+        const auto target = reinterpret_cast<uintptr_t>(ResolveArtSymbol(name)) &
+                            kPacStripMask;
+        if (!target || !IsMappedExecutable(target) || !IsInArtModule(target)) continue;
+        void *trampoline = hook_replace(reinterpret_cast<void *>(target),
+                                        OnGetOatQuickMethodHeader, nullptr,
+                                        ArtStealthFlag());
+        if (!trampoline) {
+            LOGW("WxShadow ART GetOatQuickMethodHeader hook failed: {}", name);
+            return false;
+        }
+        g_oat_header_hook_target = target;
+        LOGI("WxShadow ART GetOatQuickMethodHeader ready target={} trampoline={}",
+             reinterpret_cast<void *>(target), trampoline);
+        return true;
+    }
+    LOGW("WxShadow ART GetOatQuickMethodHeader unavailable");
+    return false;
+}
+
+size_t InitializeGcSyncLayer() {
+    // Source reference: rustFrida art_method/bridge.rs discovery and
+    // art_controller.rs GC hook installation. Signatures vary by API, so try
+    // the same candidate symbols and attach generic enter/leave callbacks.
+    constexpr const char *kCopyingCandidates[] = {
+        "_ZN3art2gc9collector17ConcurrentCopying12CopyingPhaseEv",
+        "_ZN3art2gc9collector17ConcurrentCopying12MarkingPhaseEv",
+    };
+    constexpr const char *kCollectCandidates[] = {
+        "_ZN3art2gc4Heap22CollectGarbageInternalENS0_9collector6GcTypeENS0_7GcCauseEbj",
+        "_ZN3art2gc4Heap22CollectGarbageInternalENS0_9collector6GcTypeENS0_7GcCauseEb",
+        "_ZN3art2gc4Heap22CollectGarbageInternalENS0_9collector6GcTypeENS0_7GcCauseEbPKNS0_9collector14GarbageCollectorE",
+        "_ZN3art2gc4Heap22CollectGarbageInternalENS0_13GcCauseEb",
+    };
+    constexpr const char *kFlipCandidates[] = {
+        "_ZN3art6Thread15RunFlipFunctionEPS0_b",
+        "_ZN3art6Thread15RunFlipFunctionEPS0_",
+    };
+    constexpr const char *kFixupCandidates[] = {
+        "_ZN3art11ClassLinker40MakeInitializedClassesVisiblyInitializedEPNS_6ThreadEb",
+        "_ZN3art11ClassLinker22FixupStaticTrampolinesEPNS_6ThreadENS_6ObjPtrINS_6mirror5ClassEEE",
+        "_ZN3art11ClassLinker22FixupStaticTrampolinesEPNS_6ObjPtrINS_6mirror5ClassEEE",
+        "_ZN3art11ClassLinker22FixupStaticTrampolinesEPNS_6mirror5ClassE",
+    };
+    std::vector<uintptr_t> targets;
+    auto add_first = [&targets](const auto &candidates) {
+        for (const auto *name : candidates) {
+            const auto address = reinterpret_cast<uintptr_t>(ResolveArtSymbol(name)) &
+                                 kPacStripMask;
+            if (!address || !IsMappedExecutable(address) || !IsInArtModule(address)) continue;
+            if (std::find(targets.begin(), targets.end(), address) == targets.end()) {
+                targets.push_back(address);
+            }
+            return address;
+        }
+        return uintptr_t{0};
+    };
+
+    const auto copying = add_first(kCopyingCandidates);
+    const auto collecting = add_first(kCollectCandidates);
+    const auto flipping = add_first(kFlipCandidates);
+    const auto fixup = add_first(kFixupCandidates);
+    for (const auto address : {copying, collecting, fixup}) {
+        if (!address || g_gc_hook_target_count >= g_gc_hook_targets.size()) continue;
+        if (std::find(g_gc_hook_targets.begin(),
+                      g_gc_hook_targets.begin() + g_gc_hook_target_count,
+                      address) != g_gc_hook_targets.begin() + g_gc_hook_target_count) {
+            continue;
+        }
+        if (hook_attach(reinterpret_cast<void *>(address), nullptr, OnGcSyncLeave,
+                        nullptr, ArtStealthFlag()) == HOOK_OK) {
+            g_gc_hook_targets[g_gc_hook_target_count++] = address;
+            if (address == fixup) g_fixup_hook_target = address;
+            LOGI("WxShadow ART GC sync leave hook ready: {}",
+                 reinterpret_cast<void *>(address));
+        }
+    }
+    if (flipping && g_gc_hook_target_count < g_gc_hook_targets.size() &&
+        std::find(g_gc_hook_targets.begin(),
+                  g_gc_hook_targets.begin() + g_gc_hook_target_count,
+                  flipping) == g_gc_hook_targets.begin() + g_gc_hook_target_count &&
+        hook_attach(reinterpret_cast<void *>(flipping), OnGcSyncEnter, nullptr,
+                    nullptr, ArtStealthFlag()) == HOOK_OK) {
+        g_gc_hook_targets[g_gc_hook_target_count++] = flipping;
+        LOGI("WxShadow ART GC sync enter hook ready: {}",
+             reinterpret_cast<void *>(flipping));
+    }
+    return g_gc_hook_target_count;
+}
+
+void *FindJniTrampoline(JNIEnv *env, uintptr_t known_native_method) {
+    if (void *address = ResolveArtSymbol("art_quick_generic_jni_trampoline")) {
+        const auto value = reinterpret_cast<uintptr_t>(address) & kPacStripMask;
+        if (IsMappedExecutable(value) && IsInArtModule(value)) return address;
+    }
+    DiscoverClassLinkerTrampolines(env);
+    if (g_classlinker_trampolines.generic_jni != 0) {
+        return reinterpret_cast<void *>(g_classlinker_trampolines.generic_jni);
+    }
+    // Source: rustFrida art_method/bridge.rs::
+    // find_jni_trampoline_from_known_native. Once the known native method's
+    // data_/entry_ layout is validated, read its exact entry_point_ rather
+    // than selecting an arbitrary executable ArtMethod field.
+    if (known_native_method != 0 && g_layout.entry_offset != 0 &&
+        IsReadable(known_native_method, g_layout.entry_offset + sizeof(uintptr_t))) {
+        const auto entry = *reinterpret_cast<const volatile uintptr_t *>(
+            known_native_method + g_layout.entry_offset) & kPacStripMask;
+        if (IsMappedExecutable(entry) && IsInArtModule(entry)) {
+            return reinterpret_cast<void *>(entry);
+        }
+    }
+    return nullptr;
+}
+
+struct InstrumentationLayout {
+    size_t runtime_offset = 0;
+    bool pointer_mode = false;
+};
+
+bool IsInArtModule(uintptr_t address) {
+    uintptr_t start = 0;
+    uintptr_t end = 0;
+    return FindModuleRange("libart.so", &start, &end) &&
+           address >= start && address < end;
+}
+
+bool InitializeSharedNterpRouter(JNIEnv *env) {
+    // Source reference: rustFrida bridge.rs::find_nterp_entry_point uses the
+    // exported getter, OatQuickMethodHeader::NterpImpl, then ExecuteNterpImpl;
+    // art_controller.rs installs Nterp once as a Layer 1 shared router with
+    // pre_scan enabled.
+    using GetNterpEntryPointFn = uintptr_t (*)();
+    auto getter = reinterpret_cast<GetNterpEntryPointFn>(
+        ResolveArtSymbol("_ZN3art11interpreter18GetNterpEntryPointEv"));
+    uintptr_t source = 0;
+    const char *source_kind = nullptr;
+    if (getter && IsMappedExecutable(reinterpret_cast<uintptr_t>(getter))) {
+        source = getter() & kPacStripMask;
+        source_kind = "GetNterpEntryPoint";
+    }
+    if ((!source || !IsMappedExecutable(source) || !IsInArtModule(source))) {
+        const auto header = reinterpret_cast<uintptr_t>(ResolveArtSymbol(
+            "_ZN3art20OatQuickMethodHeader9NterpImplE"));
+        if (header && IsReadable(header, sizeof(uintptr_t))) {
+            const auto candidate = *reinterpret_cast<const uintptr_t *>(header) &
+                                   kPacStripMask;
+            if (IsMappedExecutable(candidate) && IsInArtModule(candidate)) {
+                source = candidate;
+                source_kind = "OatQuickMethodHeader::NterpImpl";
+            }
+        }
+    }
+    if ((!source || !IsMappedExecutable(source) || !IsInArtModule(source))) {
+        const auto execute = reinterpret_cast<uintptr_t>(
+            ResolveArtSymbol("ExecuteNterpImpl")) & kPacStripMask;
+        if (IsMappedExecutable(execute) && IsInArtModule(execute)) {
+            source = execute;
+            source_kind = "ExecuteNterpImpl";
+        }
+    }
+    if (!IsMappedExecutable(source) || !IsInArtModule(source)) {
+        LOGW("WxShadow ART controller: Nterp entry unavailable/rejected (getter={} source={})",
+             reinterpret_cast<void *>(getter), reinterpret_cast<void *>(source));
+        return false;
+    }
+
+    void *resolved = resolve_art_trampoline(reinterpret_cast<void *>(source), env);
+    if (!resolved) resolved = reinterpret_cast<void *>(source);
+    const auto target = reinterpret_cast<uintptr_t>(resolved) & kPacStripMask;
+    if (!IsMappedExecutable(target) || !IsInArtModule(target)) {
+        LOGW("WxShadow ART controller: rejected resolved Nterp target {}",
+             reinterpret_cast<void *>(target));
+        return false;
+    }
+
+    void *hooked_target = nullptr;
+    void *trampoline = hook_install_art_router(
+        reinterpret_cast<void *>(target), static_cast<uint32_t>(g_layout.entry_offset),
+        ArtStealthFlag(), env, &hooked_target,
+        1,  // Source already resolved, matching rustFrida prepare_hook_target.
+        0,  // Layer 1 has no current-PC hint.
+        0,  // Layer 1 shared stubs do not use BLR mode.
+        1); // Nterp misses must bypass the full ART-visible router frame.
+    if (!trampoline) {
+        LOGE("WxShadow ART controller: shared Nterp router installation failed");
+        return false;
+    }
+
+    g_nterp_router.source = source;
+    g_nterp_router.target = reinterpret_cast<uintptr_t>(
+        hooked_target ? hooked_target : reinterpret_cast<void *>(target));
+    g_nterp_router.trampoline = reinterpret_cast<uintptr_t>(trampoline);
+    LOGI("WxShadow ART controller: shared Nterp ready via {} source={} target={} trampoline={} pre_scan=1",
+         source_kind ? source_kind : "fallback",
+         reinterpret_cast<void *>(g_nterp_router.source),
+         reinterpret_cast<void *>(g_nterp_router.target), trampoline);
+    return true;
+}
+
+bool InitializeSharedNterpWithClinitRouter(JNIEnv *env) {
+    // Source reference: rustFrida art_method/bridge.rs::find_nterp_with_clinit_entry_point
+    // and art_controller.rs Layer 1. The exported symbol is an OatQuickMethodHeader
+    // whose first word is the actual entry point.
+    auto header = reinterpret_cast<uintptr_t>(ResolveArtSymbol(
+        "_ZN3art20OatQuickMethodHeader19NterpWithClinitImplE"));
+    if (!header || !IsReadable(header, sizeof(uintptr_t))) {
+        LOGW("WxShadow ART controller: NterpWithClinit header unavailable");
+        return false;
+    }
+    const auto source = (*reinterpret_cast<const uintptr_t *>(header)) & kPacStripMask;
+    if (!IsMappedExecutable(source) || !IsInArtModule(source)) {
+        LOGW("WxShadow ART controller: rejected NterpWithClinit entry {}",
+             reinterpret_cast<void *>(source));
+        return false;
+    }
+    void *resolved = resolve_art_trampoline(reinterpret_cast<void *>(source), env);
+    if (!resolved) resolved = reinterpret_cast<void *>(source);
+    const auto target = reinterpret_cast<uintptr_t>(resolved) & kPacStripMask;
+    if (!IsMappedExecutable(target) || !IsInArtModule(target)) {
+        LOGW("WxShadow ART controller: rejected resolved NterpWithClinit target {}",
+             reinterpret_cast<void *>(target));
+        return false;
+    }
+
+    void *hooked_target = nullptr;
+    void *trampoline = hook_install_art_router(
+        reinterpret_cast<void *>(target), static_cast<uint32_t>(g_layout.entry_offset),
+        ArtStealthFlag(), env, &hooked_target, 1, 0, 0, 1);
+    if (!trampoline) {
+        LOGE("WxShadow ART controller: shared NterpWithClinit router installation failed");
+        return false;
+    }
+    g_nterp_clinit_router.source = source;
+    g_nterp_clinit_router.target = reinterpret_cast<uintptr_t>(
+        hooked_target ? hooked_target : reinterpret_cast<void *>(target));
+    g_nterp_clinit_router.trampoline = reinterpret_cast<uintptr_t>(trampoline);
+    LOGI("WxShadow ART controller: shared NterpWithClinit ready source={} target={} trampoline={} pre_scan=1",
+         reinterpret_cast<void *>(source),
+         reinterpret_cast<void *>(g_nterp_clinit_router.target), trampoline);
+    return true;
+}
+
+bool IsSharedRouterEntry(uintptr_t entry, const SharedNterpRouter &router) {
+    return router.trampoline != 0 &&
+           (entry == router.source || entry == router.target);
+}
+
+// Source reference: rustFrida
+// java_hook_api/install_support.rs::install_per_method_router_hook with
+// allow_internal_entry_downgrade=true. The write is deliberately limited to
+// the non-native, unclassified shared-entry path. Compiled quick code and
+// native/shared-native routes must keep their original ArtMethod entry.
+bool DowngradeMethodEntryToInterpreterBridge(MethodState &state) {
+    const auto bridge = g_interpreter_bridge_router.source & kPacStripMask;
+    if (!bridge || g_interpreter_bridge_router.trampoline == 0 ||
+        !state.original_art_method ||
+        state.entry_offset + sizeof(uintptr_t) > state.method_size ||
+        !IsReadable(state.original_art_method,
+                     state.entry_offset + sizeof(uintptr_t))) {
+        return false;
+    }
+
+    auto *entry = reinterpret_cast<volatile uintptr_t *>(
+        state.original_art_method + state.entry_offset);
+    const auto current = *entry & kPacStripMask;
+    if (current == bridge) {
+        return true;
+    }
+
+    *entry = bridge;
+    hook_flush_cache(reinterpret_cast<void *>(
+                         state.original_art_method + state.entry_offset),
+                     sizeof(uintptr_t));
+    state.original_entry_mutated = true;
+    LOGI("WxShadow ART shared entry downgraded: method={} source={} bridge={} "
+         "(internal entry only)",
+         reinterpret_cast<void *>(state.original_art_method),
+         reinterpret_cast<void *>(state.original_entry), reinterpret_cast<void *>(bridge));
+    return true;
+}
+
+bool InitializeSharedLibartRouter(const char *label, const char *symbol, JNIEnv *env,
+                                  SharedNterpRouter *router) {
+    if (!label || !symbol || !router) return false;
+    auto source = reinterpret_cast<uintptr_t>(ResolveArtSymbol(symbol)) & kPacStripMask;
+    if (!source || !IsMappedExecutable(source) || !IsInArtModule(source)) {
+        DiscoverClassLinkerTrampolines(env);
+        if (strcmp(symbol, "art_quick_generic_jni_trampoline") == 0) {
+            source = g_classlinker_trampolines.generic_jni;
+        } else if (strcmp(symbol, "art_quick_to_interpreter_bridge") == 0) {
+            source = g_classlinker_trampolines.interpreter;
+        } else if (strcmp(symbol, "art_quick_resolution_trampoline") == 0) {
+            source = g_classlinker_trampolines.resolution;
+        } else if (strcmp(symbol, "art_quick_imt_conflict_trampoline") == 0) {
+            source = g_classlinker_trampolines.imt_conflict;
+        }
+    }
+    if (!source || !IsMappedExecutable(source) || !IsInArtModule(source)) {
+        LOGW("WxShadow ART controller: {} shared symbol unavailable: {}", label, symbol);
+        return false;
+    }
+    void *resolved = resolve_art_trampoline(reinterpret_cast<void *>(source), env);
+    if (!resolved) resolved = reinterpret_cast<void *>(source);
+    const auto target = reinterpret_cast<uintptr_t>(resolved) & kPacStripMask;
+    if (!IsMappedExecutable(target) || !IsInArtModule(target)) {
+        LOGW("WxShadow ART controller: rejected resolved {} target {}", label,
+             reinterpret_cast<void *>(target));
+        return false;
+    }
+    void *hooked_target = nullptr;
+    void *trampoline = hook_install_art_router(
+        reinterpret_cast<void *>(target), static_cast<uint32_t>(g_layout.entry_offset),
+        ArtStealthFlag(), env, &hooked_target, 1, 0, 0, 0);
+    if (!trampoline) {
+        LOGW("WxShadow ART controller: {} shared router installation failed", label);
+        return false;
+    }
+    router->source = source;
+    router->target = reinterpret_cast<uintptr_t>(
+        hooked_target ? hooked_target : reinterpret_cast<void *>(target));
+    router->trampoline = reinterpret_cast<uintptr_t>(trampoline);
+    LOGI("WxShadow ART controller: shared {} ready source={} target={} trampoline={} pre_scan=0",
+         label, reinterpret_cast<void *>(source),
+         reinterpret_cast<void *>(router->target), trampoline);
+    return true;
+}
+
+bool ResolveRuntime(JNIEnv *env, uintptr_t *runtime) {
+    if (!env || !runtime) return false;
+    JavaVM *vm = nullptr;
+    if (env->GetJavaVM(&vm) != JNI_OK || !vm) return false;
+    const auto vm_addr = reinterpret_cast<uintptr_t>(vm);
+    if (!IsReadable(vm_addr + sizeof(void *), sizeof(uintptr_t))) return false;
+    const auto value = *reinterpret_cast<const uintptr_t *>(vm_addr + sizeof(void *));
+    if (!value) return false;
+    *runtime = value & kPacStripMask;
+    return *runtime != 0 && IsReadable(*runtime, sizeof(uintptr_t));
+}
+
+bool ProbeInstrumentationLayout(uintptr_t runtime, InstrumentationLayout *layout) {
+    if (!runtime || !layout) return false;
+    auto boot_image_deopt = reinterpret_cast<uintptr_t>(
+        ResolveArtSymbol("_ZN3art7Runtime19DeoptimizeBootImageEv"));
+    if (!boot_image_deopt || !IsMappedExecutable(boot_image_deopt) ||
+        !IsInArtModule(boot_image_deopt) ||
+        !IsReadable(boot_image_deopt, 30 * sizeof(uint32_t))) {
+        return false;
+    }
+
+    // ART has two layouts: Runtime::instrumentation_ is embedded on older
+    // releases and held through a pointer on newer ART APEX builds. Mirror
+    // rustFrida's instruction probe, then validate the discovered object.
+    for (size_t i = 0; i < 30; ++i) {
+        const uint32_t insn = *reinterpret_cast<const uint32_t *>(
+            boot_image_deopt + i * sizeof(uint32_t));
+        const uint32_t masked = insn & 0xFF800000u;
+        if (masked == 0x91000000u || masked == 0x91400000u) {
+            const uint32_t rd = insn & 0x1Fu;
+            const uint32_t rn = (insn >> 5) & 0x1Fu;
+            const size_t imm12 = (insn >> 10) & 0xFFFu;
+            const size_t shift = (insn >> 22) & 0x3u;
+            const size_t offset = shift == 1 ? (imm12 << 12) : imm12;
+            // Embedded Runtime::instrumentation_ uses the receiver register
+            // chosen by the compiler; unlike the pointer form, it need not be
+            // based in x0.
+            if (rd == 31 || rn == 31 || offset < 0x100 || offset > 0x400) continue;
+            if (!IsReadable(runtime + offset, sizeof(uintptr_t))) continue;
+            layout->runtime_offset = offset;
+            layout->pointer_mode = false;
+            return true;
+        }
+        if ((insn & 0xFFC00000u) == 0xF9400000u) {
+            const uint32_t rt = insn & 0x1Fu;
+            const uint32_t rn = (insn >> 5) & 0x1Fu;
+            const size_t imm12 = (insn >> 10) & 0xFFFu;
+            const size_t offset = imm12 * sizeof(uintptr_t);
+            if (rt == 0 || rn != 0 || offset < 0x100 || offset > 0x400) continue;
+            if (!IsReadable(runtime + offset, sizeof(uintptr_t))) continue;
+            const auto instrumentation = *reinterpret_cast<const uintptr_t *>(runtime + offset);
+            if (!instrumentation || !IsReadable(instrumentation, sizeof(uintptr_t))) continue;
+            layout->runtime_offset = offset;
+            layout->pointer_mode = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ResolveInstrumentation(JNIEnv *env, uintptr_t *instrumentation) {
+    if (!instrumentation) return false;
+    uintptr_t runtime = 0;
+    if (!ResolveRuntime(env, &runtime)) return false;
+    InstrumentationLayout layout;
+    if (!ProbeInstrumentationLayout(runtime, &layout)) return false;
+    auto address = runtime + layout.runtime_offset;
+    if (layout.pointer_mode) {
+        address = *reinterpret_cast<const uintptr_t *>(address) & kPacStripMask;
+    }
+    if (!address || !IsReadable(address, sizeof(uintptr_t))) return false;
+    *instrumentation = address;
+    return true;
+}
+
+bool InferAccessFlagsOffset(JNIEnv *env, jobject executable, uintptr_t art_method,
+                            size_t method_size, size_t *access_flags_offset) {
+    jint modifiers = 0;
+    if (!ReadExecutableModifiers(env, executable, &modifiers) ||
+        !IsReadable(art_method, method_size)) {
+        return false;
+    }
+
+    constexpr uint32_t kJavaModifierMask = 0x0000FFFFu;
+    const uint32_t expected = static_cast<uint32_t>(modifiers) & kJavaModifierMask;
+    size_t fallback = std::numeric_limits<size_t>::max();
+    for (size_t offset = sizeof(uint32_t); offset + sizeof(uint32_t) <= method_size;
+         offset += sizeof(uint32_t)) {
+        const auto flags = *reinterpret_cast<const uint32_t *>(art_method + offset);
+        if ((flags & kJavaModifierMask) != expected) continue;
+        if (offset == 4) {
+            *access_flags_offset = offset;
+            return true;
+        }
+        fallback = offset;
+    }
+    if (fallback != std::numeric_limits<size_t>::max()) {
+        *access_flags_offset = fallback;
+        return true;
+    }
+    return false;
+}
+
+bool InferFridaAccessFlagsOffset(uintptr_t art_method, size_t *access_flags_offset) {
+    if (!art_method || !access_flags_offset || !IsReadable(art_method, 64)) return false;
+
+    // Source: rustFrida jni_core.rs::probe_art_method_spec_frida. Process's
+    // getElapsedCpuTime() is public|static|final|native (0x0119); the listed
+    // ART noise bits are ignored while scanning the live ArtMethod.
+    constexpr uint32_t kExpectedFlags = 0x0119u;
+    constexpr uint32_t kNoiseMask = kAccFastInterpreterToInterpreterInvoke |
+                                     kAccPublicApi | kAccNterpInvokeFastPath;
+    constexpr uint32_t kRelevantMask = ~kNoiseMask;
+    for (size_t offset = 0; offset < 64; offset += sizeof(uint32_t)) {
+        const auto flags = *reinterpret_cast<const volatile uint32_t *>(art_method + offset);
+        if ((flags & kRelevantMask) == kExpectedFlags) {
+            *access_flags_offset = offset;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool InferNativeDataOffset(uintptr_t art_method, size_t *data_offset) {
+    if (!art_method || !data_offset || !IsReadable(art_method, 64)) return false;
+    uintptr_t runtime_start = 0;
+    uintptr_t runtime_end = 0;
+    if (!FindModuleRange("libandroid_runtime.so", &runtime_start, &runtime_end)) return false;
+    // Source: rustFrida jni_core.rs::probe_art_method_spec_frida scans every
+    // 4-byte slot even though data_ is pointer-sized.
+    for (size_t offset = 0; offset + sizeof(uint64_t) <= 64; offset += sizeof(uint32_t)) {
+        const uintptr_t candidate = *reinterpret_cast<const uintptr_t *>(art_method + offset);
+        const uintptr_t stripped = candidate & kPacStripMask;
+        if (stripped >= runtime_start && stripped < runtime_end &&
+            IsMappedExecutable(candidate)) {
+            *data_offset = offset;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ProbeLegacyEntryCandidates(uintptr_t art_method, size_t *entry_offset) {
+    if (!art_method || !entry_offset || art_method < 0x1000 ||
+        !IsReadable(art_method, 40)) {
+        return false;
+    }
+
+    const auto read_u64 = [](uintptr_t address) -> uintptr_t {
+        if (!IsReadable(address, sizeof(uintptr_t))) return 0;
+        return *reinterpret_cast<const volatile uintptr_t *>(address);
+    };
+    const auto read_u32 = [](uintptr_t address) -> uint32_t {
+        if (!IsReadable(address, sizeof(uint32_t))) return 0;
+        return *reinterpret_cast<const volatile uint32_t *>(address);
+    };
+    const auto value_24 = read_u64(art_method + 24);
+    const auto value_32 = read_u64(art_method + 32);
+    const bool code_24 = IsMappedExecutable(value_24);
+    const bool code_32 = IsMappedExecutable(value_32);
+    if (code_24 && !code_32) {
+        *entry_offset = 24;
+        return true;
+    }
+    if (code_32 && !code_24) {
+        *entry_offset = 32;
+        return true;
+    }
+    if (code_24 && code_32) {
+        // Source: rustFrida jni_core.rs::probe_entry_point_offset_legacy.
+        // When both candidates look executable, the adjacent dex index probe
+        // selects the field that belongs to the current ArtMethod.
+        const auto current_dex_index = read_u32(art_method + 12);
+        const auto next_at_32 = read_u32(art_method + 32 + 12);
+        *entry_offset = next_at_32 == current_dex_index + 1 ? 24 : 32;
+        return true;
+    }
+    return false;
+}
+
+size_t InferLegacyEntryOffset(JNIEnv *env, uintptr_t target_art_method) {
+    // Source: rustFrida jni_core.rs::probe_entry_point_offset_legacy. Vector's
+    // normal JNI API has no raw-clone thread, so the Object.hashCode probe is
+    // safe here whenever the primary candidates do not identify the field.
+    if (target_art_method < 0x1000 || !IsReadable(target_art_method, 40)) {
+        LOGW("WxShadow ART legacy layout probe: invalid ArtMethod {}, using entry offset 24",
+             reinterpret_cast<void *>(target_art_method));
+        return 24;
+    }
+
+    size_t entry_offset = 0;
+    if (ProbeLegacyEntryCandidates(target_art_method, &entry_offset)) {
+        LOGI("WxShadow ART legacy layout probe: ArtMethod {} entry offset {}",
+             reinterpret_cast<void *>(target_art_method), entry_offset);
+        return entry_offset;
+    }
+
+    if (env) {
+        auto object_class = env->FindClass("java/lang/Object");
+        if (object_class && !env->ExceptionCheck()) {
+            auto hash_code = env->GetMethodID(object_class, "hashCode", "()I");
+            if (hash_code && !env->ExceptionCheck()) {
+                auto reflected = env->ToReflectedMethod(object_class, hash_code, JNI_FALSE);
+                if (reflected && !env->ExceptionCheck()) {
+                    const auto known_method = DecodeReflectedArtMethod(env, reflected);
+                    if (ProbeLegacyEntryCandidates(known_method, &entry_offset)) {
+                        env->DeleteLocalRef(reflected);
+                        env->DeleteLocalRef(object_class);
+                        LOGI("WxShadow ART legacy layout probe: Object.hashCode entry offset {}",
+                             entry_offset);
+                        return entry_offset;
+                    }
+                }
+                if (reflected) env->DeleteLocalRef(reflected);
+            }
+            env->ExceptionClear();
+            env->DeleteLocalRef(object_class);
+        } else {
+            env->ExceptionClear();
+            if (object_class) env->DeleteLocalRef(object_class);
+        }
+    }
+
+    LOGW("WxShadow ART legacy layout probe: no executable candidate, using entry offset 24");
+    return 24;
+}
+
+jobject FindKnownNativeMethod(JNIEnv *env, uintptr_t *art_method) {
+    if (!env || !art_method) return nullptr;
+    auto process = env->FindClass("android/os/Process");
+    if (!process) {
+        env->ExceptionClear();
+        return nullptr;
+    }
+    auto method = env->GetStaticMethodID(process, "getElapsedCpuTime", "()J");
+    if (!method) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(process);
+        return nullptr;
+    }
+    auto reflected = env->ToReflectedMethod(process, method, JNI_TRUE);
+    if (!reflected) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(process);
+        return nullptr;
+    }
+    *art_method = DecodeReflectedArtMethod(env, reflected);
+    env->DeleteLocalRef(process);
+    return reflected;
+}
+
+std::string ClassName(JNIEnv *env, jobject clazz) {
+    if (!clazz) return {};
+    auto class_class = env->FindClass("java/lang/Class");
+    if (!class_class) return {};
+    auto get_name = env->GetMethodID(class_class, "getName", "()Ljava/lang/String;");
+    if (!get_name) {
+        env->DeleteLocalRef(class_class);
+        return {};
+    }
+    auto name = reinterpret_cast<jstring>(env->CallObjectMethod(clazz, get_name));
+    if (!name || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(class_class);
+        return {};
+    }
+    const char *utf = env->GetStringUTFChars(name, nullptr);
+    std::string result = utf ? utf : "";
+    if (utf) env->ReleaseStringUTFChars(name, utf);
+    env->DeleteLocalRef(name);
+    env->DeleteLocalRef(class_class);
+    return result;
+}
+
+ValueKind KindFromClass(JNIEnv *env, jobject clazz) {
+    const auto name = ClassName(env, clazz);
+    if (name == "void") return ValueKind::Void;
+    if (name == "boolean") return ValueKind::Boolean;
+    if (name == "byte") return ValueKind::Byte;
+    if (name == "char") return ValueKind::Char;
+    if (name == "short") return ValueKind::Short;
+    if (name == "int") return ValueKind::Int;
+    if (name == "long") return ValueKind::Long;
+    if (name == "float") return ValueKind::Float;
+    if (name == "double") return ValueKind::Double;
+    return ValueKind::Object;
+}
+
+void ThrowIllegalArgument(JNIEnv *env, const char *message) {
+    auto cls = env->FindClass("java/lang/IllegalArgumentException");
+    if (cls) {
+        env->ThrowNew(cls, message);
+        env->DeleteLocalRef(cls);
+    }
+}
+
+void ThrowInvocationTarget(JNIEnv *env, jthrowable cause) {
+    auto cls = env->FindClass("java/lang/reflect/InvocationTargetException");
+    if (!cls) return;
+    auto ctor = env->GetMethodID(cls, "<init>", "(Ljava/lang/Throwable;)V");
+    if (ctor) {
+        auto wrapper = env->NewObject(cls, ctor, cause);
+        if (wrapper) env->Throw(static_cast<jthrowable>(wrapper));
+        if (wrapper) env->DeleteLocalRef(wrapper);
+    }
+    env->DeleteLocalRef(cls);
+}
+
+void SyncOriginalCloneForJni(const MethodState &state) {
+    if (!state.original_art_method || !state.original_clone ||
+        !IsReadable(state.original_art_method, state.method_size) ||
+        !IsReadable(state.original_clone, state.method_size)) {
+        return;
+    }
+
+    // Source: AOSP art/runtime/reflection.cc::InvokeWithJValues reads
+    // ArtMethod::GetInterfaceMethodIfProxy() metadata before invoking, and
+    // art/runtime/art_method.cc::GetObsoleteDexCache()/GetNonObsoleteMethod()
+    // require a real, current ArtMethod layout. A malloc clone can outlive GC or
+    // runtime updates to declaring_class_/access_flags_/data_. Keep the fields
+    // that ART consults before Invoke() in sync for the JNI fallback path.
+    *reinterpret_cast<volatile uint32_t *>(state.original_clone) =
+        *reinterpret_cast<volatile const uint32_t *>(state.original_art_method);
+
+    if (state.access_flags_offset + sizeof(uint32_t) <= state.method_size) {
+        *reinterpret_cast<volatile uint32_t *>(state.original_clone +
+                                               state.access_flags_offset) =
+            *reinterpret_cast<volatile const uint32_t *>(state.original_art_method +
+                                                        state.access_flags_offset);
+    }
+
+    if (!state.native_entry_hook &&
+        state.data_offset + sizeof(uintptr_t) <= state.method_size) {
+        *reinterpret_cast<volatile uintptr_t *>(state.original_clone +
+                                                state.data_offset) =
+            *reinterpret_cast<volatile const uintptr_t *>(state.original_art_method +
+                                                         state.data_offset);
+    }
+}
+
+jvalue ReadArgument(JNIEnv *env, jobject value, ValueKind kind, bool *ok) {
+    jvalue result{};
+    *ok = true;
+    if (kind == ValueKind::Object) {
+        result.l = value;
+        return result;
+    }
+    if (!value) {
+        ThrowIllegalArgument(env, "null primitive argument");
+        *ok = false;
+        return result;
+    }
+    const auto number = env->FindClass("java/lang/Number");
+    const auto character = env->FindClass("java/lang/Character");
+    const auto boolean = env->FindClass("java/lang/Boolean");
+    if (!number || !character || !boolean || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        if (number) env->DeleteLocalRef(number);
+        if (character) env->DeleteLocalRef(character);
+        if (boolean) env->DeleteLocalRef(boolean);
+        *ok = false;
+        return result;
+    }
+    if (kind == ValueKind::Boolean) {
+        auto mid = env->GetMethodID(boolean, "booleanValue", "()Z");
+        if (!env->IsInstanceOf(value, boolean) || !mid) {
+            ThrowIllegalArgument(env, "Expected Boolean");
+            *ok = false;
+        } else {
+            result.z = env->CallBooleanMethod(value, mid);
+        }
+    } else if (kind == ValueKind::Char) {
+        auto mid = env->GetMethodID(character, "charValue", "()C");
+        if (!env->IsInstanceOf(value, character) || !mid) {
+            ThrowIllegalArgument(env, "Expected Character");
+            *ok = false;
+        } else {
+            result.c = env->CallCharMethod(value, mid);
+        }
+    } else {
+        if (!env->IsInstanceOf(value, number)) {
+            ThrowIllegalArgument(env, "Expected Number");
+            *ok = false;
+        } else {
+            switch (kind) {
+            case ValueKind::Byte:
+                result.b = env->CallByteMethod(value, env->GetMethodID(number, "byteValue", "()B"));
+                break;
+            case ValueKind::Short:
+                result.s = env->CallShortMethod(value, env->GetMethodID(number, "shortValue", "()S"));
+                break;
+            case ValueKind::Int:
+                result.i = env->CallIntMethod(value, env->GetMethodID(number, "intValue", "()I"));
+                break;
+            case ValueKind::Long:
+                result.j = env->CallLongMethod(value, env->GetMethodID(number, "longValue", "()J"));
+                break;
+            case ValueKind::Float:
+                result.f = env->CallFloatMethod(value, env->GetMethodID(number, "floatValue", "()F"));
+                break;
+            case ValueKind::Double:
+                result.d = env->CallDoubleMethod(value, env->GetMethodID(number, "doubleValue", "()D"));
+                break;
+            default:
+                break;
+            }
+        }
+    }
+    env->DeleteLocalRef(number);
+    env->DeleteLocalRef(character);
+    env->DeleteLocalRef(boolean);
+    if (env->ExceptionCheck()) *ok = false;
+    return result;
+}
+
+jobject BoxReturn(JNIEnv *env, ValueKind kind, const jvalue &value) {
+    const char *clazz_name = nullptr;
+    const char *sig = nullptr;
+    switch (kind) {
+    case ValueKind::Boolean: clazz_name = "java/lang/Boolean"; sig = "(Z)Ljava/lang/Boolean;"; break;
+    case ValueKind::Byte: clazz_name = "java/lang/Byte"; sig = "(B)Ljava/lang/Byte;"; break;
+    case ValueKind::Char: clazz_name = "java/lang/Character"; sig = "(C)Ljava/lang/Character;"; break;
+    case ValueKind::Short: clazz_name = "java/lang/Short"; sig = "(S)Ljava/lang/Short;"; break;
+    case ValueKind::Int: clazz_name = "java/lang/Integer"; sig = "(I)Ljava/lang/Integer;"; break;
+    case ValueKind::Long: clazz_name = "java/lang/Long"; sig = "(J)Ljava/lang/Long;"; break;
+    case ValueKind::Float: clazz_name = "java/lang/Float"; sig = "(F)Ljava/lang/Float;"; break;
+    case ValueKind::Double: clazz_name = "java/lang/Double"; sig = "(D)Ljava/lang/Double;"; break;
+    case ValueKind::Object: return value.l;
+    case ValueKind::Void: return nullptr;
+    }
+    auto clazz = env->FindClass(clazz_name);
+    if (!clazz) return nullptr;
+    auto value_of = env->GetStaticMethodID(clazz, "valueOf", sig);
+    jobject result = nullptr;
+    if (value_of) {
+        jvalue argument{};
+        switch (kind) {
+        case ValueKind::Boolean: argument.z = value.z; break;
+        case ValueKind::Byte: argument.b = value.b; break;
+        case ValueKind::Char: argument.c = value.c; break;
+        case ValueKind::Short: argument.s = value.s; break;
+        case ValueKind::Int: argument.i = value.i; break;
+        case ValueKind::Long: argument.j = value.j; break;
+        case ValueKind::Float: argument.f = value.f; break;
+        case ValueKind::Double: argument.d = value.d; break;
+        default: break;
+        }
+        result = env->CallStaticObjectMethodA(clazz, value_of, &argument);
+    }
+    env->DeleteLocalRef(clazz);
+    return result;
+}
+
+extern "C" int art_router_stack_check(uint64_t replacement) {
+    if (hook_managed_reentry_guard_active() != 0) return 0;
+    return ShouldReplaceForManagedStack(static_cast<uintptr_t>(replacement)) ? 1 : 0;
+}
+bool LooksLikeCalleeSaveMethodArray(uintptr_t runtime, uintptr_t suspend_offset) {
+    if (suspend_offset < 5 * sizeof(uintptr_t)) return false;
+    const auto first = runtime + suspend_offset - 5 * sizeof(uintptr_t);
+    uintptr_t previous = 0;
+    for (size_t i = 0; i < 6; ++i) {
+        if (!IsReadable(first + i * sizeof(uintptr_t), sizeof(uintptr_t))) return false;
+        const auto method = *reinterpret_cast<volatile const uintptr_t *>(
+            first + i * sizeof(uintptr_t)) & kPacStripMask;
+        if (method == 0 || (method & 0x3u) != 0 || method == previous) return false;
+        previous = method;
+    }
+    return true;
+}
+
+uintptr_t ResolveCalleeSaveSuspendMethod() {
+    uintptr_t runtime = 0;
+    if (!ResolveRuntime(g_init_env, &runtime)) return 0;
+
+    // Source reference: rustFrida java_fast_api.rs::resolve_callee_save_suspend_method.
+    constexpr uint32_t kCalleeSaveEverythingForSuspendCheck = 5;
+    constexpr const char *kCandidates[] = {
+        "_ZN3art7Runtime19GetCalleeSaveMethodENS_14CalleeSaveTypeE",
+        "_ZN3art7Runtime28GetCalleeSaveMethodUncheckedENS_14CalleeSaveTypeE",
+        "_ZNK3art7Runtime19GetCalleeSaveMethodENS_14CalleeSaveTypeE",
+        "_ZNK3art7Runtime28GetCalleeSaveMethodENS_14CalleeSaveTypeE",
+        "_ZN3art7Runtime19GetCalleeSaveMethodENS0_14CalleeSaveTypeE",
+        "_ZNK3art7Runtime19GetCalleeSaveMethodENS0_14CalleeSaveTypeE",
+    };
+    using GetCalleeSaveMethodFn = uintptr_t (*)(uintptr_t, uint32_t);
+    for (const auto *name : kCandidates) {
+        auto symbol = ResolveArtSymbol(name);
+        if (!symbol) continue;
+        const auto method = reinterpret_cast<GetCalleeSaveMethodFn>(symbol)(
+            runtime, kCalleeSaveEverythingForSuspendCheck) & kPacStripMask;
+        if (method != 0 && IsReadable(method, sizeof(uintptr_t))) {
+            LOGI("WxShadow ART callee-save suspend method via {}: {}", name,
+                 reinterpret_cast<void *>(method));
+            return method;
+        }
+    }
+
+    // Source reference: rustFrida ART_CALLEE_SAVE_PROFILES, API 31-36.
+    // This is a source-defined profile, not a guessed vendor layout.
+    char sdk_value[PROP_VALUE_MAX] = {};
+    const int sdk = __system_property_get("ro.build.version.sdk", sdk_value) > 0
+                        ? atoi(sdk_value)
+                        : 0;
+    constexpr uintptr_t kApi31CalleeSaveSuspendOffset = 0x28;
+    if (sdk >= 31 && sdk <= 36 &&
+        LooksLikeCalleeSaveMethodArray(runtime, kApi31CalleeSaveSuspendOffset)) {
+        const auto method = *reinterpret_cast<volatile const uintptr_t *>(
+            runtime + kApi31CalleeSaveSuspendOffset) & kPacStripMask;
+        LOGI("WxShadow ART callee-save suspend method via profile api31-36: {}",
+             reinterpret_cast<void *>(method));
+        return method;
+    }
+    LOGW("WxShadow ART callee-save suspend method unavailable");
+    return 0;
+}
+
+uintptr_t ResolveQuickTestSuspendEntrypoint() {
+    uintptr_t thread = 0;
+    if (g_thread_current) thread = g_thread_current() & kPacStripMask;
+    if (!thread && g_init_env && IsReadable(reinterpret_cast<uintptr_t>(g_init_env) +
+                                             sizeof(uintptr_t), sizeof(uintptr_t))) {
+        thread = *reinterpret_cast<volatile const uintptr_t *>(
+            reinterpret_cast<uintptr_t>(g_init_env) + sizeof(uintptr_t)) & kPacStripMask;
+    }
+    if (!thread) return 0;
+
+    // Source reference: rustFrida java_fast_api.rs::quick_entrypoint.
+    constexpr size_t kQuickEntrypointCount = 174;
+    constexpr size_t kQuickTestSuspendIndex = 105;
+    constexpr size_t kQuickJniMethodStartIndex = 45;
+    constexpr size_t kQuickJniMethodEndIndex = 46;
+    constexpr size_t kQuickScanLimit = 16384;
+    constexpr size_t kMinLibartPointers = 40;
+    uintptr_t art_start = 0;
+    uintptr_t art_end = 0;
+    if (!FindModuleRange("libart.so", &art_start, &art_end)) return 0;
+    const auto in_art = [art_start, art_end](uintptr_t value) {
+        const auto address = value & kPacStripMask;
+        return address >= art_start && address < art_end;
+    };
+
+    const size_t block_size = kQuickEntrypointCount * sizeof(uintptr_t);
+    const size_t max_offset = kQuickScanLimit - block_size;
+    for (size_t offset = 0; offset <= max_offset; offset += sizeof(uintptr_t)) {
+        if (!IsReadable(thread + offset, block_size)) continue;
+        const auto base = thread + offset;
+        const auto start = *reinterpret_cast<volatile const uintptr_t *>(
+            base + kQuickJniMethodStartIndex * sizeof(uintptr_t));
+        const auto end = *reinterpret_cast<volatile const uintptr_t *>(
+            base + kQuickJniMethodEndIndex * sizeof(uintptr_t));
+        if (!in_art(start) || !in_art(end) || offset < 2 * sizeof(uintptr_t)) continue;
+        if (!in_art(*reinterpret_cast<volatile const uintptr_t *>(base - 2 * sizeof(uintptr_t))) ||
+            !in_art(*reinterpret_cast<volatile const uintptr_t *>(base - sizeof(uintptr_t)))) {
+            continue;
+        }
+        size_t libart_pointers = 0;
+        for (size_t i = 0; i < kQuickEntrypointCount; ++i) {
+            if (in_art(*reinterpret_cast<volatile const uintptr_t *>(
+                    base + i * sizeof(uintptr_t)))) {
+                ++libart_pointers;
+            }
+        }
+        if (libart_pointers < kMinLibartPointers) continue;
+        const auto entry = *reinterpret_cast<volatile const uintptr_t *>(
+            base + kQuickTestSuspendIndex * sizeof(uintptr_t)) & kPacStripMask;
+        if (entry != 0) {
+            LOGI("WxShadow ART quick test-suspend entrypoint: {} (Thread+{})",
+                 reinterpret_cast<void *>(entry), offset);
+            return entry;
+        }
+    }
+    LOGW("WxShadow ART quick test-suspend entrypoint unavailable");
+    return 0;
+}
+
+extern "C" void *art_quick_callee_save_suspend_method() {
+    static std::once_flag once;
+    static uintptr_t method = 0;
+    std::call_once(once, [] { method = ResolveCalleeSaveSuspendMethod(); });
+    return reinterpret_cast<void *>(method);
+}
+
+extern "C" void *art_quick_test_suspend_entrypoint() {
+    std::call_once(g_quick_entrypoints_once,
+                   [] { g_quick_test_suspend_entrypoint = ResolveQuickTestSuspendEntrypoint(); });
+    return reinterpret_cast<void *>(g_quick_test_suspend_entrypoint);
+}
+
+alignas(16) std::array<uint8_t, 64> g_dummy_oat_header{};
+
+struct SigchainAction {
+    bool (*sc_sigaction)(int, siginfo_t *, void *);
+    sigset_t sc_mask;
+    uint64_t sc_flags;
+};
+
+int Arm64LoadUnsignedBaseRegister(uint32_t instruction) {
+    // Source reference: rustFrida art_controller.rs::arm64_load_unsigned_base_reg.
+    if ((instruction & 0x3b400000u) != 0x39400000u) return -1;
+    const int rn = static_cast<int>((instruction >> 5) & 0x1fu);
+    return rn < 31 ? rn : -1;
+}
+
+bool TryHandleImplicitSuspend(int signal, siginfo_t *info, void *raw_context) {
+    if (signal != SIGSEGV || !info || !raw_context) return false;
+    const auto entry = g_implicit_suspend_entrypoint.load(std::memory_order_relaxed);
+    const auto trigger_offset =
+        g_implicit_suspend_trigger_offset.load(std::memory_order_relaxed);
+    if (!entry || trigger_offset == UINTPTR_MAX) return false;
+
+    auto *context = reinterpret_cast<ucontext_t *>(raw_context);
+    auto &machine = context->uc_mcontext;
+    const auto pc = static_cast<uintptr_t>(machine.pc) & kPacStripMask;
+    if (!pc || (pc & 3u) != 0) return false;
+    uintptr_t poll_pc = 0;
+    const auto instruction = *reinterpret_cast<volatile const uint32_t *>(pc);
+    if (instruction == 0xf94002b5u) {
+        poll_pc = pc;
+    } else {
+        const auto next = *reinterpret_cast<volatile const uint32_t *>(pc + 4);
+        if (next != 0xf94002b5u) return false;
+        poll_pc = pc + 4;
+    }
+
+    uintptr_t thread = 0;
+    if (g_thread_current) thread = g_thread_current() & kPacStripMask;
+    if (!thread) thread = static_cast<uintptr_t>(machine.regs[19]) & kPacStripMask;
+    if (thread && (thread & 7u) == 0) {
+        const auto trigger = thread + trigger_offset;
+        *reinterpret_cast<volatile uintptr_t *>(trigger) = trigger;
+        machine.regs[19] = thread;
+    }
+    machine.regs[30] = poll_pc + 4;
+    machine.pc = entry;
+    return true;
+}
+
+bool TryHandleNullOatHeader(int signal, siginfo_t *info, void *raw_context) {
+    if (signal != SIGSEGV || !info || !raw_context) return false;
+    const auto fault = reinterpret_cast<uintptr_t>(info->si_addr);
+    if (fault >= g_dummy_oat_header.size()) return false;
+
+    auto *context = reinterpret_cast<ucontext_t *>(raw_context);
+    auto &machine = context->uc_mcontext;
+    const auto pc = static_cast<uintptr_t>(machine.pc) & kPacStripMask;
+    if (pc && (pc & 3u) == 0) {
+        const auto instruction = *reinterpret_cast<volatile const uint32_t *>(pc);
+        const int base = Arm64LoadUnsignedBaseRegister(instruction);
+        if (base >= 0 && machine.regs[base] == 0) {
+            machine.regs[base] = reinterpret_cast<uintptr_t>(g_dummy_oat_header.data());
+            return true;
+        }
+    }
+    if (fault == 0x18 && machine.regs[10] == 0) {
+        machine.regs[10] = reinterpret_cast<uintptr_t>(g_dummy_oat_header.data());
+        return true;
+    }
+    return false;
+}
+
+extern "C" bool ArtSigchainHandler(int signal, siginfo_t *info, void *context) {
+    return TryHandleImplicitSuspend(signal, info, context) ||
+           TryHandleNullOatHeader(signal, info, context);
+}
+
+void ChainPreviousSigsegvHandler(int signal, siginfo_t *info, void *context) {
+    const auto &previous = g_previous_sigsegv_action;
+    if ((previous.sa_flags & SA_SIGINFO) != 0) {
+        const auto handler = previous.sa_sigaction;
+        if (handler && reinterpret_cast<uintptr_t>(handler) !=
+                           reinterpret_cast<uintptr_t>(SIG_DFL) &&
+                       reinterpret_cast<uintptr_t>(handler) !=
+                           reinterpret_cast<uintptr_t>(SIG_IGN)) {
+            handler(signal, info, context);
+            return;
+        }
+    } else {
+        const auto handler = previous.sa_handler;
+        if (handler == SIG_IGN) return;
+        if (handler != SIG_DFL && handler != nullptr) {
+            handler(signal);
+            return;
+        }
+    }
+    ::signal(signal, SIG_DFL);
+    ::raise(signal);
+}
+
+extern "C" void ArtBionicSigsegvHandler(int signal, siginfo_t *info, void *context) {
+    if (ArtSigchainHandler(signal, info, context)) return;
+    ChainPreviousSigsegvHandler(signal, info, context);
+}
+
+bool InitializeSignalGuards() {
+    // Source reference: rustFrida install_managed_implicit_suspend_guard and
+    // install_walkstack_sigsegv_guard. Vector has no Recomp backend, so only
+    // original quick-code PCs and NULL OAT-header recovery are handled.
+    if (g_thread_layout.valid) {
+        auto implicit = reinterpret_cast<uintptr_t>(
+            ResolveArtSymbol("art_quick_implicit_suspend")) & kPacStripMask;
+        if (!implicit || !IsMappedExecutable(implicit) || !IsInArtModule(implicit)) {
+            // Source reference: rustFrida java_fast_api.rs::
+            // resolve_suspend_poll_entrypoint. Some ART builds expose only the
+            // callee-save test-suspend entrypoint, which is still a valid poll
+            // target for the same fault redirection path.
+            implicit = reinterpret_cast<uintptr_t>(art_quick_test_suspend_entrypoint()) &
+                       kPacStripMask;
+            if (implicit && IsMappedExecutable(implicit) && IsInArtModule(implicit)) {
+                LOGI("WxShadow ART implicit suspend using test-suspend fallback entry={}",
+                     reinterpret_cast<void *>(implicit));
+            } else {
+                implicit = 0;
+            }
+        }
+        if (implicit && IsMappedExecutable(implicit) && IsInArtModule(implicit)) {
+            g_implicit_suspend_entrypoint.store(implicit, std::memory_order_relaxed);
+            g_implicit_suspend_trigger_offset.store(
+                g_thread_layout.suspend_trigger_offset, std::memory_order_relaxed);
+            LOGI("WxShadow ART implicit suspend configured entry={} trigger_offset={}",
+                 reinterpret_cast<void *>(implicit),
+                 g_thread_layout.suspend_trigger_offset);
+        }
+    }
+
+    if (g_sigchain_guard_installed.exchange(true, std::memory_order_acq_rel)) return true;
+    void *handle = dlopen("libsigchain.so", RTLD_NOW | RTLD_LOCAL);
+    void *add_symbol = handle ? dlsym(handle, "AddSpecialSignalHandlerFn")
+                              : dlsym(RTLD_DEFAULT, "AddSpecialSignalHandlerFn");
+    if (!add_symbol) {
+        // Source reference: rustFrida art_controller.rs::
+        // install_walkstack_sigsegv_guard falls back to bionic sigaction when
+        // libsigchain is unavailable, while preserving the previous handler.
+        struct sigaction bionic_action {};
+        bionic_action.sa_sigaction = ArtBionicSigsegvHandler;
+        bionic_action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        sigemptyset(&bionic_action.sa_mask);
+        if (::sigaction(SIGSEGV, &bionic_action, &g_previous_sigsegv_action) != 0) {
+            g_sigchain_guard_installed.store(false, std::memory_order_release);
+            LOGW("WxShadow ART SIGSEGV guard unavailable: libsigchain and bionic sigaction failed");
+            return false;
+        }
+        g_bionic_sigsegv_guard_installed.store(true, std::memory_order_release);
+        LOGI("WxShadow ART SIGSEGV guard ready via bionic sigaction fallback");
+        return true;
+    }
+
+    SigchainAction action{};
+    action.sc_sigaction = ArtSigchainHandler;
+    sigemptyset(&action.sc_mask);
+    action.sc_flags = 0;
+    using AddSpecialSignalHandlerFn = void (*)(int, SigchainAction *);
+    reinterpret_cast<AddSpecialSignalHandlerFn>(add_symbol)(SIGSEGV, &action);
+
+    void *front_symbol = handle ? dlsym(handle, "EnsureFrontOfChain")
+                                : dlsym(RTLD_DEFAULT, "EnsureFrontOfChain");
+    if (front_symbol) {
+        using EnsureFrontOfChainFn = void (*)(int);
+        reinterpret_cast<EnsureFrontOfChainFn>(front_symbol)(SIGSEGV);
+    }
+    LOGI("WxShadow ART SIGSEGV guard ready via libsigchain");
+    return true;
+}
+
+extern "C" uint64_t art_quick_top_quick_frame_offset() {
+    return g_thread_layout.valid ? g_thread_layout.managed_stack_offset : UINT64_MAX;
+}
+
+bool InitializeImpl(JNIEnv *env) {
+    if (g_initialized) return true;
+    g_init_env = env;
+    // Resolve the reflection field before probing any method IDs. Android 11+
+    // may return an odd/opaque jmethodID, while older releases expose the
+    // ArtMethod pointer directly.
+    std::call_once(g_art_method_field_once, [env] { ResolveArtMethodField(env); });
+    auto object_class = env->FindClass("java/lang/Object");
+    if (!object_class) return false;
+    auto to_string = env->GetMethodID(object_class, "toString", "()Ljava/lang/String;");
+    if (!to_string) {
+        env->DeleteLocalRef(object_class);
+        return false;
+    }
+    auto reflected = env->ToReflectedMethod(object_class, to_string, JNI_FALSE);
+    const auto target = DecodeReflectedArtMethod(env, reflected);
+    if (reflected) env->DeleteLocalRef(reflected);
+    if (target == 0) {
+        env->DeleteLocalRef(object_class);
+        return false;
+    }
+    // ArtMethod spacing is only the initial readable window. The final
+    // data_/entry_point_ offsets come from the known-native Frida probe or its
+    // source-defined legacy fallback, matching rustFrida jni_core.rs.
+    g_layout.method_size = std::max<size_t>(InferMethodSize(env, target), 40);
+    uintptr_t native_target = 0;
+    auto native_reflected = FindKnownNativeMethod(env, &native_target);
+    bool native_layout_found = false;
+    bool access_flags_found = false;
+    if (native_target != 0) {
+        size_t data_offset = 0;
+        if (InferNativeDataOffset(native_target, &data_offset)) {
+            g_layout.data_offset = data_offset;
+            g_layout.entry_offset = data_offset + sizeof(uintptr_t);
+            g_layout.method_size = std::max(g_layout.method_size,
+                                            g_layout.entry_offset + sizeof(uintptr_t));
+            native_layout_found = true;
+        }
+    }
+    if (native_target != 0) {
+        size_t access_flags_offset = 4;
+        if (InferFridaAccessFlagsOffset(native_target, &access_flags_offset)) {
+            g_layout.access_flags_offset = access_flags_offset;
+            access_flags_found = true;
+        }
+    }
+    if (native_reflected) {
+        if (!access_flags_found) {
+            size_t access_flags_offset = 4;
+            if (InferAccessFlagsOffset(env, native_reflected, native_target,
+                                       g_layout.method_size, &access_flags_offset)) {
+                g_layout.access_flags_offset = access_flags_offset;
+                access_flags_found = true;
+            }
+        }
+        env->DeleteLocalRef(native_reflected);
+    }
+
+    if (!native_layout_found || !access_flags_found) {
+        // Source: rustFrida jni_core.rs::probe_art_method_spec fallback. Keep
+        // the source-defined candidate offsets and Object.hashCode secondary
+        // probe instead of selecting an arbitrary executable ArtMethod field.
+        const auto legacy_entry = InferLegacyEntryOffset(env, target);
+        if (legacy_entry < sizeof(uintptr_t)) {
+            LOGE("WxShadow ART backend: legacy ArtMethod entry probe returned invalid offset {}",
+                 legacy_entry);
+            env->DeleteLocalRef(object_class);
+            return false;
+        }
+        g_layout.access_flags_offset = 4;
+        g_layout.data_offset = legacy_entry - sizeof(uintptr_t);
+        g_layout.entry_offset = legacy_entry;
+        const size_t legacy_size = GetAndroidApiLevel() <= 21
+                                        ? legacy_entry + 32
+                                        : legacy_entry + sizeof(uintptr_t);
+        g_layout.method_size = std::max(g_layout.method_size, legacy_size);
+        native_layout_found = true;
+        access_flags_found = true;
+        LOGW("WxShadow ART backend: using rustFrida legacy ArtMethod layout fallback data={} entry={} size={}",
+             g_layout.data_offset, g_layout.entry_offset, g_layout.method_size);
+    }
+    if (g_layout.method_size < 16) {
+        LOGE("WxShadow ART backend: ArtMethod layout probe returned undersized method ({})",
+             g_layout.method_size);
+        env->DeleteLocalRef(object_class);
+        return false;
+    }
+    g_layout.method_size = std::max(
+        g_layout.method_size,
+        std::max(g_layout.entry_offset + sizeof(uintptr_t),
+                 g_layout.access_flags_offset + sizeof(uint32_t)));
+    g_layout.jni_trampoline = FindJniTrampoline(env, native_target);
+    if (!g_layout.jni_trampoline) {
+        LOGE("WxShadow ART backend: cannot resolve JNI trampoline from symbols/ClassLinker/known native");
+        env->DeleteLocalRef(object_class);
+        return false;
+    }
+    env->DeleteLocalRef(object_class);
+
+    ExecPoolRange existing_hook_pool{};
+    if (hook_engine_get_exec_ranges(&existing_hook_pool, 1) > 0 &&
+        existing_hook_pool.base != 0 && existing_hook_pool.size != 0) {
+        g_exec_pool = reinterpret_cast<void *>(existing_hook_pool.base);
+        LOGI("WxShadow ART backend: reusing existing hook engine pool base={} size={}",
+             g_exec_pool, existing_hook_pool.size);
+    } else {
+        const uintptr_t libart_hint = FindLibartExecutableBase();
+        g_exec_pool = hook_mmap_near(reinterpret_cast<void *>(libart_hint), kInitialPoolSize);
+        LOGI("WxShadow ART trace: initial exec pool mmap near libart={} base={} size={} pid={}",
+             reinterpret_cast<void *>(libart_hint), g_exec_pool, kInitialPoolSize, getpid());
+        if (g_exec_pool == MAP_FAILED) {
+            g_exec_pool = nullptr;
+            LOGE("WxShadow ART backend: executable pool allocation failed");
+            return false;
+        }
+        SetHookExecPoolVmaName(g_exec_pool, kInitialPoolSize);
+        if (hook_engine_init(g_exec_pool, kInitialPoolSize) != 0) {
+            munmap(g_exec_pool, kInitialPoolSize);
+            g_exec_pool = nullptr;
+            LOGE("WxShadow ART backend: hook_engine_init failed");
+            return false;
+        }
+    }
+    // Source reference: rustFrida art_method/bridge.rs::find_thread_current and
+    // art_thread.rs::probe_art_thread_spec. Failure leaves routing available
+    // with the same fail-open stack-check semantics used by rustFrida.
+    g_thread_current = reinterpret_cast<ThreadCurrentFn>(
+        ResolveArtSymbol("_ZN3art6Thread7CurrentEv"));
+    const bool thread_layout_found = ProbeArtThreadLayout(env);
+    if (!g_thread_current) {
+        LOGW("WxShadow ART stack guard: art::Thread::Current unavailable");
+    }
+    g_art_stealth_mode = SelectArtStealthMode();
+    hook_set_stealth_mode(ArtStealthFlag());
+    DiscoverClassLinkerTrampolines(env);
+    // Source reference: rustFrida art_controller.rs Layer 1 skips shared
+    // generic-JNI and Nterp unless Java.setStealth(1/2) explicitly selected a
+    // stealth mode before ART hooks are installed. Vector's auto mode only
+    // opts per-method patching into wxshadow; it does not imply process-wide
+    // hot-stub routing.
+    const bool use_shared_jni_nterp_layer1 = UseSharedJniNterpLayer1();
+    const bool shared_jni_ready = use_shared_jni_nterp_layer1 && InitializeSharedLibartRouter(
+        "quick_generic_jni_trampoline", "art_quick_generic_jni_trampoline", env,
+        &g_jni_router);
+    const bool shared_nterp_ready =
+        use_shared_jni_nterp_layer1 && InitializeSharedNterpRouter(env);
+    const bool shared_nterp_clinit_ready =
+        use_shared_jni_nterp_layer1 && InitializeSharedNterpWithClinitRouter(env);
+    if (!use_shared_jni_nterp_layer1) {
+        LOGI("WxShadow ART controller: shared JNI/Nterp Layer1 skipped stealth={} auto={} "
+             "source={} value={}",
+             ArtStealthModeName(g_art_stealth_mode), g_art_stealth_auto_selected,
+             g_art_stealth_source.c_str(), g_art_stealth_value.c_str());
+    }
+    const bool shared_interpreter_ready = InitializeSharedLibartRouter(
+        "quick_to_interpreter_bridge", "art_quick_to_interpreter_bridge", env,
+        &g_interpreter_bridge_router);
+    const bool shared_resolution_ready = InitializeSharedLibartRouter(
+        "quick_resolution_trampoline", "art_quick_resolution_trampoline", env,
+        &g_resolution_router);
+    const size_t do_call_count = InitializeDoCallLayer();
+    const size_t gc_hook_count = InitializeGcSyncLayer();
+    const bool oat_header_ready = InitializeOatHeaderLayer();
+    const int oat_inline_patched =
+        oat_header_ready ? hook_patch_inlined_oat_header_checks(g_oat_header_hook_target) : 0;
+    if (oat_header_ready) {
+        if (oat_inline_patched < 0) {
+            LOGW("WxShadow ART inlined OAT header patch failed: {}", oat_inline_patched);
+        } else {
+            LOGI("WxShadow ART inlined OAT header patch ready: count={}", oat_inline_patched);
+        }
+    }
+    const bool signal_guard_ready = InitializeSignalGuards();
+    g_initialized = true;
+    LOGI("WxShadow ART backend ready: stealth={} ArtMethod size={} flags={} data={} entry={} jni={} "
+         "thread_current={} thread_layout={} shared_jni_nterp_layer1={} "
+         "shared_nterp={} shared_nterp_clinit={} "
+         "shared_jni={} shared_interpreter={} shared_resolution={} do_call={} gc_sync={} "
+         "oat_header={} oat_inline_patch={} signal_guard={}",
+         ArtStealthModeName(g_art_stealth_mode), g_layout.method_size,
+         g_layout.access_flags_offset, g_layout.data_offset, g_layout.entry_offset,
+         g_layout.jni_trampoline, reinterpret_cast<void *>(g_thread_current), thread_layout_found,
+         use_shared_jni_nterp_layer1, shared_nterp_ready, shared_nterp_clinit_ready,
+         shared_jni_ready, shared_interpreter_ready, shared_resolution_ready,
+         do_call_count, gc_hook_count, oat_header_ready, oat_inline_patched, signal_guard_ready);
+    return true;
+}
+
+#endif  // defined(__aarch64__)
+
+}  // namespace
+
+MethodState::~MethodState() {
+#if defined(__aarch64__)
+    UnregisterActiveState(this);
+    // JNI references are owned by the process-lifetime HookItem registry. The
+    // registry intentionally keeps hooks alive, so no destructor-time JNI call
+    // is needed here.
+    if (native_entry_hook) {
+        if (native_entry_installed && native_entry_target) {
+            hook_remove(reinterpret_cast<void *>(native_entry_target));
+        }
+    } else if (quick_trampoline) {
+        hook_art_router_table_remove(original_art_method);
+        if (owns_router_hook) {
+            if (router_target) hook_remove(reinterpret_cast<void *>(router_target));
+            else if (original_entry) hook_remove(reinterpret_cast<void *>(original_entry));
+        }
+    }
+    if (original_entry_mutated && original_art_method &&
+        entry_offset + sizeof(uintptr_t) <= method_size &&
+        IsReadable(original_art_method, entry_offset + sizeof(uintptr_t))) {
+        // Source: rustFrida java_hook_api/uninstall.rs restores the original
+        // ArtMethod fields after removing the router-table replacement.
+        *reinterpret_cast<volatile uintptr_t *>(original_art_method + entry_offset) =
+            original_entry;
+        hook_flush_cache(reinterpret_cast<void *>(original_art_method + entry_offset),
+                         sizeof(uintptr_t));
+        LOGD("WxShadow ART shared entry restored: method={} entry={}",
+             reinterpret_cast<void *>(original_art_method),
+             reinterpret_cast<void *>(original_entry));
+    }
+    // The native replacement thunk is tracked separately from the inline
+    // router. It is not a function hook entry, so remove_redirect() releases
+    // its executable-pool record without touching ArtMethod memory.
+    if (original_art_method) hook_remove_redirect(original_art_method);
+    if (original_clone) free(reinterpret_cast<void *>(original_clone));
+    if (replacement) free(reinterpret_cast<void *>(replacement));
+#endif
+}
+
+bool Initialize(JNIEnv *env) {
+#if defined(__aarch64__)
+    if (!env) return false;
+    std::call_once(g_init_once, [env] { g_initialized = InitializeImpl(env); });
+    return g_initialized;
+#else
+    (void)env;
+    return false;
+#endif
+}
+
+bool IsAvailable() {
+#if defined(__aarch64__)
+    return g_initialized;
+#else
+    return false;
+#endif
+}
+
+uintptr_t DecodeArtMethod(JNIEnv *env, jobject reflected_method) {
+#if defined(__aarch64__)
+    return DecodeReflectedArtMethod(env, reflected_method);
+#else
+    (void)env;
+    (void)reflected_method;
+    return 0;
+#endif
+}
+
+std::unique_ptr<MethodState> Install(JNIEnv *env, jobject reflected_method,
+                                     NativeHookCallback callback, uintptr_t key) {
+#if !defined(__aarch64__)
+    (void)env; (void)reflected_method; (void)callback; (void)key;
+    return nullptr;
+#else
+    if (!env || !reflected_method || !callback || !Initialize(env)) return nullptr;
+    std::lock_guard lock(g_install_mutex);
+
+    auto state = std::make_unique<MethodState>();
+    state->original_art_method = DecodeReflectedArtMethod(env, reflected_method);
+    if (!state->original_art_method ||
+        !IsReadable(state->original_art_method, g_layout.method_size)) {
+        return nullptr;
+    }
+    state->method_size = g_layout.method_size;
+    state->access_flags_offset = g_layout.access_flags_offset;
+    state->data_offset = g_layout.data_offset;
+    state->entry_offset = g_layout.entry_offset;
+    if (state->access_flags_offset + sizeof(uint32_t) > state->method_size ||
+        state->data_offset + sizeof(uintptr_t) > state->method_size ||
+        state->entry_offset + sizeof(uintptr_t) > state->method_size) {
+        LOGE("WxShadow ART install rejected invalid layout: size={} flags={} data={} entry={}",
+             state->method_size, state->access_flags_offset, state->data_offset,
+             state->entry_offset);
+        return nullptr;
+    }
+    const uint32_t original_flags = *reinterpret_cast<const uint32_t *>(
+        state->original_art_method + state->access_flags_offset);
+    const uintptr_t original_data = *reinterpret_cast<const uintptr_t *>(
+        state->original_art_method + state->data_offset);
+    state->original_entry = *reinterpret_cast<uintptr_t *>(
+        state->original_art_method + state->entry_offset);
+    if (!IsMappedExecutable(state->original_entry)) {
+        LOGI("WxShadow ART route skipped for non-executable entry: method={} entry={}",
+             reinterpret_cast<void *>(state->original_art_method),
+             reinterpret_cast<void *>(state->original_entry));
+        return nullptr;
+    }
+
+    // Reference: rustFrida install.rs::is_registered_native_entry_candidate and
+    // the NativeEntry branch. A normal registered JNI method is hooked at data_,
+    // not through the ART quick router. CriticalNative has a different ABI and
+    // remains on LSPlant until its dedicated callback marshaller is imported.
+    const bool data_is_executable = IsMappedExecutable(original_data);
+    const bool data_is_in_art = IsInArtModule(original_data & kPacStripMask);
+    const auto native_route = ClassifyNativeRoute(
+        original_flags, original_data, data_is_executable, data_is_in_art);
+    const bool is_native_method = native_route != NativeRouteKind::NotNative;
+    const bool registered_native = native_route == NativeRouteKind::RegisteredNative;
+    const bool critical_native = is_native_method &&
+                                 (original_flags & kAccCriticalNative) != 0;
+    if (native_route == NativeRouteKind::UnsupportedNative) {
+        LOGI("WxShadow ART native route deferred to LSPlant: method={} data={} entry={} registered={} critical={}",
+             reinterpret_cast<void *>(state->original_art_method),
+             reinterpret_cast<void *>(original_data),
+             reinterpret_cast<void *>(state->original_entry), registered_native,
+             critical_native);
+        return nullptr;
+    }
+    if (registered_native) {
+        void *resolved_native = resolve_art_trampoline(
+            reinterpret_cast<void *>(original_data), nullptr);
+        if (!resolved_native) resolved_native = reinterpret_cast<void *>(original_data);
+        if (!IsMappedExecutable(reinterpret_cast<uintptr_t>(resolved_native))) return nullptr;
+        state->native_entry_hook = true;
+        state->native_entry_target = reinterpret_cast<uintptr_t>(resolved_native);
+        state->callback = callback;
+        state->callback_user_data = reinterpret_cast<void *>(key);
+    }
+
+    // rustFrida's route_has_independent_code covers compiled AOT/JIT entries
+    // and unregistered/shared native entries. Ordinary non-native shared
+    // entries instead contribute only a table entry to the process-wide
+    // interpreter/resolution router after any required internal downgrade.
+    void *resolved_entry = resolve_art_trampoline(
+        reinterpret_cast<void *>(state->original_entry), env);
+    if (!resolved_entry) resolved_entry = reinterpret_cast<void *>(state->original_entry);
+    const auto resolved_entry_address =
+        reinterpret_cast<uintptr_t>(resolved_entry) & kPacStripMask;
+    const auto original_entry_address = state->original_entry & kPacStripMask;
+    // Source: rustFrida art_method/resolution.rs::is_art_quick_entrypoint and
+    // java_hook_api/install.rs::shared_native_art_entry. A native method whose
+    // data_ is not an independently registered executable still needs the
+    // Layer 3 replacement route when its entry is an ART-internal/shared
+    // entry. It must not be folded into the ordinary non-native shared-stub
+    // downgrade path.
+    const auto shared_router_for_entry = [](uintptr_t entry) -> const SharedNterpRouter * {
+        if (IsSharedRouterEntry(entry, g_nterp_router)) return &g_nterp_router;
+        if (IsSharedRouterEntry(entry, g_nterp_clinit_router)) return &g_nterp_clinit_router;
+        if (IsSharedRouterEntry(entry, g_jni_router)) return &g_jni_router;
+        if (IsSharedRouterEntry(entry, g_interpreter_bridge_router)) {
+            return &g_interpreter_bridge_router;
+        }
+        if (IsSharedRouterEntry(entry, g_resolution_router)) return &g_resolution_router;
+        return nullptr;
+    };
+    const bool has_independent_code =
+        !IsInArtModule(original_entry_address) &&
+        shared_router_for_entry(original_entry_address) == nullptr;
+    const bool shared_native_art_entry = is_native_method &&
+                                         !has_independent_code &&
+                                         !registered_native;
+    const bool route_has_independent_code = has_independent_code ||
+                                            shared_native_art_entry;
+    const SharedNterpRouter *shared_router = nullptr;
+    bool downgrade_shared_entry = false;
+    if (!state->native_entry_hook && !route_has_independent_code) {
+        // Source: rustFrida install_support.rs::is_already_routed and the
+        // normal Java hook call with allow_internal_entry_downgrade=true.
+        // Exact entries already covered by a process-wide router stay intact.
+        // An unclassified libart entry is internally downgraded to the
+        // interpreter bridge after the clone/replacement copies are prepared.
+        shared_router = shared_router_for_entry(original_entry_address);
+        if (!shared_router) {
+            shared_router = shared_router_for_entry(resolved_entry_address);
+        }
+        if (!shared_router && g_interpreter_bridge_router.source != 0 &&
+            g_interpreter_bridge_router.trampoline != 0) {
+            shared_router = &g_interpreter_bridge_router;
+            downgrade_shared_entry = true;
+        }
+    }
+    const bool uses_shared_router = shared_router != nullptr;
+    if (!state->native_entry_hook && !route_has_independent_code && !uses_shared_router) {
+        LOGI("WxShadow ART route skipped for unclassified shared libart entry: method={} source={} target={} native={}",
+             reinterpret_cast<void *>(state->original_art_method),
+             reinterpret_cast<void *>(state->original_entry), resolved_entry,
+             is_native_method);
+        return nullptr;
+    }
+
+    auto executable_class = env->FindClass("java/lang/reflect/Executable");
+    if (!executable_class || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        if (executable_class) env->DeleteLocalRef(executable_class);
+        return nullptr;
+    }
+    auto get_modifiers = env->GetMethodID(executable_class, "getModifiers", "()I");
+    auto get_declaring_class = env->GetMethodID(
+        executable_class, "getDeclaringClass", "()Ljava/lang/Class;");
+    auto get_params = env->GetMethodID(executable_class, "getParameterTypes", "()[Ljava/lang/Class;");
+    if (!get_modifiers || !get_declaring_class || !get_params || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(executable_class);
+        return nullptr;
+    }
+    const jint modifiers = env->CallIntMethod(reflected_method, get_modifiers);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(executable_class);
+        return nullptr;
+    }
+    state->is_static = (modifiers & kAccStatic) != 0;
+    auto params = reinterpret_cast<jobjectArray>(env->CallObjectMethod(reflected_method, get_params));
+    if (!params || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(executable_class);
+        return nullptr;
+    }
+    const auto count = env->GetArrayLength(params);
+    state->parameter_kinds.reserve(static_cast<size_t>(count));
+    for (jsize i = 0; i < count; ++i) {
+        auto type = env->GetObjectArrayElement(params, i);
+        if (!type || env->ExceptionCheck()) {
+            env->ExceptionClear();
+            if (type) env->DeleteLocalRef(type);
+            env->DeleteLocalRef(params);
+            env->DeleteLocalRef(executable_class);
+            return nullptr;
+        }
+        state->parameter_kinds.push_back(KindFromClass(env, type));
+        env->DeleteLocalRef(type);
+    }
+    env->DeleteLocalRef(params);
+
+    auto method_class = env->GetObjectClass(reflected_method);
+    if (!method_class || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        if (method_class) env->DeleteLocalRef(method_class);
+        env->DeleteLocalRef(executable_class);
+        return nullptr;
+    }
+    auto get_return_type = env->GetMethodID(method_class, "getReturnType", "()Ljava/lang/Class;");
+    if (get_return_type) {
+        auto return_class = env->CallObjectMethod(reflected_method, get_return_type);
+        if (return_class && !env->ExceptionCheck()) {
+            state->return_kind = KindFromClass(env, return_class);
+            env->DeleteLocalRef(return_class);
+        } else {
+            if (return_class) env->DeleteLocalRef(return_class);
+            env->ExceptionClear();
+            state->return_kind = ValueKind::Void;
+        }
+    } else {
+        // java.lang.reflect.Constructor has no getReturnType(). Its native
+        // callback must use the JNI void return convention.
+        env->ExceptionClear();
+        state->return_kind = ValueKind::Void;
+    }
+    env->DeleteLocalRef(method_class);
+    auto declaring_class = env->CallObjectMethod(reflected_method, get_declaring_class);
+    if (!declaring_class || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        if (declaring_class) env->DeleteLocalRef(declaring_class);
+        env->DeleteLocalRef(executable_class);
+        return nullptr;
+    }
+    state->declaring_class = env->NewGlobalRef(declaring_class);
+    env->DeleteLocalRef(declaring_class);
+    env->DeleteLocalRef(executable_class);
+    if (!state->declaring_class) return nullptr;
+
+    state->original_clone = reinterpret_cast<uintptr_t>(malloc(state->method_size));
+    if (!state->original_clone || !IsReadable(state->original_art_method, state->method_size)) return nullptr;
+    memcpy(reinterpret_cast<void *>(state->original_clone),
+           reinterpret_cast<const void *>(state->original_art_method), state->method_size);
+    if (state->native_entry_hook) {
+        LOGD("WxShadow ART registered-native route prepared: method={} target={}",
+             reinterpret_cast<void *>(state->original_art_method),
+             reinterpret_cast<void *>(state->native_entry_target));
+        return state;
+    }
+    state->replacement = reinterpret_cast<uintptr_t>(malloc(state->method_size));
+    if (!state->replacement) return nullptr;
+    memcpy(reinterpret_cast<void *>(state->replacement),
+           reinterpret_cast<const void *>(state->original_art_method), state->method_size);
+
+    // Keep original_clone/replacement based on the pre-downgrade ArtMethod,
+    // matching rustFrida's install order. The live ArtMethod entry is changed
+    // only after both copies exist, and MethodState::~MethodState restores it
+    // if any later install or activation step fails.
+    if (downgrade_shared_entry &&
+        !DowngradeMethodEntryToInterpreterBridge(*state)) {
+        LOGW("WxShadow ART shared-entry downgrade unavailable: method={} "
+             "bridge_source={} trampoline={}",
+             reinterpret_cast<void *>(state->original_art_method),
+             reinterpret_cast<void *>(g_interpreter_bridge_router.source),
+             reinterpret_cast<void *>(g_interpreter_bridge_router.trampoline));
+        return nullptr;
+    }
+
+    // Multiple ArtMethods can point at the same compiled entrypoint.
+    // The C engine returns the existing router in that case; remember whether
+    // this state owns the inline hook so failure cleanup cannot remove a route
+    // still used by another method.
+    const bool router_preexisting = !uses_shared_router &&
+                                    hook_get_trampoline(resolved_entry) != nullptr;
+
+    const uint32_t replacement_flags =
+        (original_flags & ~(kAccCriticalNative | kAccFastNative | kAccNterpFastPath)) |
+        kAccNative | CompileDontBotherFlag();
+    *reinterpret_cast<uint32_t *>(state->replacement + state->access_flags_offset) = replacement_flags;
+
+    // The engine key must be the real ArtMethod pointer for stack-walk
+    // sentinels and router lookup; callback userdata remains the raw JNI id
+    // used by Vector's HookItem registry.
+    void *thunk = hook_create_native_trampoline(state->original_art_method, callback,
+                                                 reinterpret_cast<void *>(key), 0);
+    if (!thunk) return nullptr;
+    *reinterpret_cast<uintptr_t *>(state->replacement + state->data_offset) =
+        reinterpret_cast<uintptr_t>(thunk);
+    *reinterpret_cast<uintptr_t *>(state->replacement + state->entry_offset) =
+        reinterpret_cast<uintptr_t>(g_layout.jni_trampoline);
+    hook_flush_cache(reinterpret_cast<void *>(state->replacement), state->method_size);
+
+    if (uses_shared_router) {
+        state->quick_trampoline = shared_router->trampoline;
+        state->router_target = shared_router->target;
+        state->owns_router_hook = false;
+        LOGD("WxShadow ART method registered for shared router: method={} target={}",
+             reinterpret_cast<void *>(state->original_art_method),
+             reinterpret_cast<void *>(state->router_target));
+        if (downgrade_shared_entry) {
+            LOGI("WxShadow ART dynamic shared router active: method={} entry={} "
+                 "target_art_method_entry_external=false",
+                 reinterpret_cast<void *>(state->original_art_method),
+                 reinterpret_cast<void *>(g_interpreter_bridge_router.source));
+        }
+    } else {
+        void *hooked_target = nullptr;
+        state->quick_trampoline = reinterpret_cast<uintptr_t>(hook_install_art_router(
+            reinterpret_cast<void *>(state->original_entry),
+            static_cast<uint32_t>(state->entry_offset), ArtStealthFlag(), env, &hooked_target,
+            0, 0, 0, 0));
+        if (!state->quick_trampoline) return nullptr;
+        state->router_target = reinterpret_cast<uintptr_t>(
+            hooked_target ? hooked_target : reinterpret_cast<void *>(state->original_entry));
+        state->owns_router_hook = !router_preexisting;
+        LOGD("WxShadow ART per-method router installed: source={} target={}",
+             reinterpret_cast<void *>(state->original_entry),
+             reinterpret_cast<void *>(state->router_target));
+    }
+    return state;
+#endif
+}
+
+bool Activate(MethodState &state) {
+#if defined(__aarch64__)
+    // Publish complete callback state atomically with respect to concurrent
+    // installs; the router table itself has no internal writer lock.
+    std::lock_guard lock(g_install_mutex);
+    if (state.native_entry_hook) {
+        if (!state.native_entry_target || !state.callback || !state.original_clone) return false;
+        void *trampoline = hook_replace(
+            reinterpret_cast<void *>(state.native_entry_target), state.callback,
+            state.callback_user_data, ArtStealthFlag());
+        if (!trampoline) return false;
+        state.quick_trampoline = reinterpret_cast<uintptr_t>(trampoline);
+        state.native_entry_installed = true;
+        *reinterpret_cast<uintptr_t *>(state.original_clone + state.data_offset) =
+            state.quick_trampoline;
+        *reinterpret_cast<uintptr_t *>(state.original_clone + state.entry_offset) =
+            reinterpret_cast<uintptr_t>(g_layout.jni_trampoline);
+        hook_flush_cache(reinterpret_cast<void *>(state.original_clone), state.method_size);
+        LOGD("WxShadow ART registered-native entry installed: method={} target={} trampoline={}",
+             reinterpret_cast<void *>(state.original_art_method),
+             reinterpret_cast<void *>(state.native_entry_target), trampoline);
+        return true;
+    }
+    if (state.original_art_method == 0 || state.replacement == 0 ||
+        hook_art_router_table_add(state.original_art_method, state.replacement) != 0) {
+        return false;
+    }
+    RegisterActiveState(&state);
+    return true;
+#else
+    (void)state;
+    return false;
+#endif
+}
+
+jobject InvokeOriginal(JNIEnv *env, const MethodState &state, jobject receiver,
+                       jobjectArray args) {
+#if !defined(__aarch64__)
+    (void)env; (void)state; (void)receiver; (void)args;
+    return nullptr;
+#else
+    if (!env || !state.original_clone || !state.declaring_class) return nullptr;
+    if (!state.is_static && !receiver) {
+        env->ThrowNew(env->FindClass("java/lang/NullPointerException"), "null receiver");
+        return nullptr;
+    }
+    const jsize count = args ? env->GetArrayLength(args) : 0;
+    if (count != static_cast<jsize>(state.parameter_kinds.size())) {
+        ThrowIllegalArgument(env, "args.length does not match parameter count");
+        return nullptr;
+    }
+    std::vector<jvalue> values(static_cast<size_t>(count));
+    std::vector<jobject> object_args;
+    object_args.reserve(static_cast<size_t>(count));
+    for (jsize i = 0; i < count; ++i) {
+        auto value = env->GetObjectArrayElement(args, i);
+        bool ok = false;
+        values[static_cast<size_t>(i)] = ReadArgument(env, value, state.parameter_kinds[i], &ok);
+        if (state.parameter_kinds[i] == ValueKind::Object && value) {
+            object_args.push_back(value);
+        } else if (value) {
+            env->DeleteLocalRef(value);
+        }
+        if (!ok || env->ExceptionCheck()) {
+            for (auto object : object_args) env->DeleteLocalRef(object);
+            return nullptr;
+        }
+    }
+
+    struct LocalRefGuard {
+        JNIEnv *env;
+        std::vector<jobject> &refs;
+        ~LocalRefGuard() {
+            for (auto ref : refs) {
+                if (ref) env->DeleteLocalRef(ref);
+            }
+        }
+    } object_ref_guard{env, object_args};
+
+    // Source: rustFrida callback/original_call.rs avoids JNI for the normal
+    // quick callback path and invokes the relocated quick trampoline directly.
+    // Vector's current Java callback enters here from the JNI replacement, so
+    // prefer the live ArtMethod plus the engine's one-shot orig_bypass. This
+    // keeps ART's pre-invoke metadata reads on the real ArtMethod while the
+    // router still tail-calls the original quick trampoline instead of
+    // re-entering this callback. Registered native-entry hooks still use the
+    // clone because their original target is the replaced JNI function pointer.
+    struct OriginalBypassGuard {
+        uintptr_t method = 0;
+        bool active = false;
+        ~OriginalBypassGuard() {
+            if (active) (void)orig_bypass_consume_current_thread(method);
+        }
+    } original_bypass{state.original_art_method, false};
+    bool use_live_original = false;
+    if (!state.native_entry_hook && state.original_art_method != 0 &&
+        state.quick_trampoline != 0) {
+        original_bypass.active =
+            orig_bypass_set_current_thread(state.original_art_method,
+                                           state.quick_trampoline) == 0;
+        use_live_original = original_bypass.active;
+    }
+
+    if (!use_live_original) {
+        SyncOriginalCloneForJni(state);
+    }
+
+    jvalue result{};
+    auto method = reinterpret_cast<jmethodID>(
+        use_live_original ? state.original_art_method : state.original_clone);
+    if (state.is_static) {
+        switch (state.return_kind) {
+        case ValueKind::Boolean: result.z = env->CallStaticBooleanMethodA((jclass)state.declaring_class, method, values.data()); break;
+        case ValueKind::Byte: result.b = env->CallStaticByteMethodA((jclass)state.declaring_class, method, values.data()); break;
+        case ValueKind::Char: result.c = env->CallStaticCharMethodA((jclass)state.declaring_class, method, values.data()); break;
+        case ValueKind::Short: result.s = env->CallStaticShortMethodA((jclass)state.declaring_class, method, values.data()); break;
+        case ValueKind::Int: result.i = env->CallStaticIntMethodA((jclass)state.declaring_class, method, values.data()); break;
+        case ValueKind::Long: result.j = env->CallStaticLongMethodA((jclass)state.declaring_class, method, values.data()); break;
+        case ValueKind::Float: result.f = env->CallStaticFloatMethodA((jclass)state.declaring_class, method, values.data()); break;
+        case ValueKind::Double: result.d = env->CallStaticDoubleMethodA((jclass)state.declaring_class, method, values.data()); break;
+        case ValueKind::Object: result.l = env->CallStaticObjectMethodA((jclass)state.declaring_class, method, values.data()); break;
+        case ValueKind::Void: env->CallStaticVoidMethodA((jclass)state.declaring_class, method, values.data()); break;
+        }
+    } else {
+        switch (state.return_kind) {
+        case ValueKind::Boolean: result.z = env->CallNonvirtualBooleanMethodA(receiver, (jclass)state.declaring_class, method, values.data()); break;
+        case ValueKind::Byte: result.b = env->CallNonvirtualByteMethodA(receiver, (jclass)state.declaring_class, method, values.data()); break;
+        case ValueKind::Char: result.c = env->CallNonvirtualCharMethodA(receiver, (jclass)state.declaring_class, method, values.data()); break;
+        case ValueKind::Short: result.s = env->CallNonvirtualShortMethodA(receiver, (jclass)state.declaring_class, method, values.data()); break;
+        case ValueKind::Int: result.i = env->CallNonvirtualIntMethodA(receiver, (jclass)state.declaring_class, method, values.data()); break;
+        case ValueKind::Long: result.j = env->CallNonvirtualLongMethodA(receiver, (jclass)state.declaring_class, method, values.data()); break;
+        case ValueKind::Float: result.f = env->CallNonvirtualFloatMethodA(receiver, (jclass)state.declaring_class, method, values.data()); break;
+        case ValueKind::Double: result.d = env->CallNonvirtualDoubleMethodA(receiver, (jclass)state.declaring_class, method, values.data()); break;
+        case ValueKind::Object: result.l = env->CallNonvirtualObjectMethodA(receiver, (jclass)state.declaring_class, method, values.data()); break;
+        case ValueKind::Void: env->CallNonvirtualVoidMethodA(receiver, (jclass)state.declaring_class, method, values.data()); break;
+        }
+    }
+    if (auto exception = env->ExceptionOccurred()) {
+        env->ExceptionClear();
+        ThrowInvocationTarget(env, exception);
+        env->DeleteLocalRef(exception);
+        return nullptr;
+    }
+    return BoxReturn(env, state.return_kind, result);
+#endif
+}
+
+bool Deoptimize(JNIEnv *env, const MethodState &state) {
+#if defined(__aarch64__)
+    if (!env || !state.original_art_method) return false;
+    auto enable = ResolveArtSymbol(
+        "_ZN3art15instrumentation15Instrumentation20EnableDeoptimizationEv");
+    auto deopt = ResolveArtSymbol(
+        "_ZN3art15instrumentation15Instrumentation10DeoptimizeEPNS_9ArtMethodE");
+    uintptr_t instrumentation = 0;
+    if (!deopt || !ResolveInstrumentation(env, &instrumentation)) return false;
+    if (enable) {
+        using EnableFn = void (*)(uintptr_t);
+        reinterpret_cast<EnableFn>(enable)(instrumentation);
+    }
+    using DeoptFn = void (*)(uintptr_t, uintptr_t);
+    reinterpret_cast<DeoptFn>(deopt)(instrumentation, state.original_art_method);
+    return true;
+#else
+    (void)env;
+    (void)state;
+    return false;
+#endif
+}
+
+}  // namespace vector::native::art

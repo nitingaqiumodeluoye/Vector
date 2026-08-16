@@ -129,7 +129,7 @@ interface IManagerService {
 
     /**
      * The libxposed API level this framework implements, verbatim from
-     * {@code IXposedService.LIB_API}.
+     * {@code IWbService.LIB_API}.
      *
      * <p>The one version number here that is not this framework's own, which is why it says
      * libxposed and the three above say framework. The contrast is the point: a reader who sees the

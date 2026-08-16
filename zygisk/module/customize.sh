@@ -104,6 +104,10 @@ for file in module.prop action.sh service.sh uninstall.sh sepolicy.rule framewor
     extract "$ZIPFILE" "$file" "$MODPATH"
 done
 
+# Remove artifacts from older Vector releases that shipped the dex2oat wrapper.
+rm -rf "$MODPATH/bin"
+rm -f "$MODPATH/system.prop"
+
 ui_print "- Extracting Zygisk libraries"
 mkdir -p "$MODPATH/zygisk"
 
@@ -121,38 +125,8 @@ if [ "$IS64BIT" = true ]; then
     mv "$MODPATH/zygisk/libzygisk.so" "$MODPATH/zygisk/${ABI64}.so"
 fi
 
-if [ "$API" -ge 29 ]; then
-    ui_print "- Extracting dex2oat binaries"
-    mkdir -p "$MODPATH/bin"
-
-    # Extract 32-bit binaries when present
-    if [ "$IS64BIT" = true ]; then
-        extract_if_present "$ZIPFILE" "bin/$ABI32/dex2oat" "$MODPATH/bin" true
-        extract_if_present "$ZIPFILE" "bin/$ABI32/liboat_hook.so" "$MODPATH/bin" true
-    else
-        extract "$ZIPFILE" "bin/$ABI32/dex2oat" "$MODPATH/bin" true
-        extract "$ZIPFILE" "bin/$ABI32/liboat_hook.so" "$MODPATH/bin" true
-    fi
-    [ -f "$MODPATH/bin/dex2oat" ] && mv "$MODPATH/bin/dex2oat" "$MODPATH/bin/dex2oat32"
-    [ -f "$MODPATH/bin/liboat_hook.so" ] && mv "$MODPATH/bin/liboat_hook.so" "$MODPATH/bin/liboat_hook32.so"
-
-    # Extract 64-bit binaries
-    if [ "$IS64BIT" = true ]; then
-        extract "$ZIPFILE" "bin/$ABI64/dex2oat" "$MODPATH/bin" true
-        extract "$ZIPFILE" "bin/$ABI64/liboat_hook.so" "$MODPATH/bin" true
-        mv "$MODPATH/bin/dex2oat" "$MODPATH/bin/dex2oat64"
-        mv "$MODPATH/bin/liboat_hook.so" "$MODPATH/bin/liboat_hook64.so"
-    fi
-
-    ui_print "- Patching binaries for anti-detection"
-    DEV_PATH=$(tr -dc 'a-z0-9' </dev/urandom | head -c 32)
-    # Patch only if the file successfully exists
-    [ -f "$MODPATH/daemon.apk" ] && sed -i "s/5291374ceda0aef7c5d86cd2a4f6a3ac/$DEV_PATH/g" "$MODPATH/daemon.apk"
-    [ -f "$MODPATH/bin/dex2oat32" ] && sed -i "s/5291374ceda0aef7c5d86cd2a4f6a3ac/$DEV_PATH/" "$MODPATH/bin/dex2oat32"
-    [ -f "$MODPATH/bin/dex2oat64" ] && sed -i "s/5291374ceda0aef7c5d86cd2a4f6a3ac/$DEV_PATH/" "$MODPATH/bin/dex2oat64"
-else
-    extract "$ZIPFILE" 'system.prop' "$MODPATH"
-fi
+DEV_PATH=$(tr -dc 'a-z0-9' </dev/urandom | head -c 32)
+[ -f "$MODPATH/daemon.apk" ] && sed -i "s/5291374ceda0aef7c5d86cd2a4f6a3ac/$DEV_PATH/g" "$MODPATH/daemon.apk"
 
 ui_print "- Setting permissions"
 set_perm_recursive "$MODPATH" 0 0 0755 0644

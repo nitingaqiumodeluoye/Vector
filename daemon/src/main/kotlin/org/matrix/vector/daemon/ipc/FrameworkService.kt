@@ -6,7 +6,7 @@ import android.os.ParcelFileDescriptor
 import android.os.Process
 import android.os.RemoteException
 import android.util.Log
-import io.github.libxposed.service.HookedProcess
+import de.wwb.android.wbosed.service.HookedProcess
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong

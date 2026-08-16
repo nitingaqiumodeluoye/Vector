@@ -1,14 +1,14 @@
 package org.matrix.vector.impl.hookers
 
-import io.github.libxposed.api.XposedInterface
+import de.wwb.android.wbosed.api.WbInterface
 import org.matrix.vector.util.Utils
 
 /**
  * Intercepts uncaught exceptions in the framework to provide diagnostic logging before the process
  * completely terminates.
  */
-object CrashDumpHooker : XposedInterface.Hooker {
-    override fun intercept(chain: XposedInterface.Chain): Any? {
+object CrashDumpHooker : WbInterface.Hooker {
+    override fun intercept(chain: WbInterface.Chain): Any? {
         try {
             val throwable = chain.args.firstOrNull() as? Throwable
             if (throwable != null) {

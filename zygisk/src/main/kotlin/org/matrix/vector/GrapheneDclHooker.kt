@@ -1,9 +1,9 @@
 package org.matrix.vector
 
 import android.content.pm.ApplicationInfo
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
-import de.robv.android.xposed.XposedHelpers
+import de.wwb.android.wbosed.XC_MethodHook
+import de.wwb.android.wbosed.XposedBridge
+import de.wwb.android.wbosed.XposedHelpers
 import org.matrix.vector.util.Utils
 
 /**

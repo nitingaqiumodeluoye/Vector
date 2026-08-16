@@ -1,12 +1,12 @@
 package android.content.res;
 
 import static org.matrix.vector.nativebridge.ResourcesHook.rewriteXmlReferencesNative;
-import static de.robv.android.xposed.XposedHelpers.decrementMethodDepth;
-import static de.robv.android.xposed.XposedHelpers.findAndHookMethod;
-import static de.robv.android.xposed.XposedHelpers.getBooleanField;
-import static de.robv.android.xposed.XposedHelpers.getLongField;
-import static de.robv.android.xposed.XposedHelpers.getObjectField;
-import static de.robv.android.xposed.XposedHelpers.incrementMethodDepth;
+import static de.wwb.android.wbosed.XposedHelpers.decrementMethodDepth;
+import static de.wwb.android.wbosed.XposedHelpers.findAndHookMethod;
+import static de.wwb.android.wbosed.XposedHelpers.getBooleanField;
+import static de.wwb.android.wbosed.XposedHelpers.getLongField;
+import static de.wwb.android.wbosed.XposedHelpers.getObjectField;
+import static de.wwb.android.wbosed.XposedHelpers.incrementMethodDepth;
 
 import android.content.Context;
 import android.content.pm.PackageParser;
@@ -38,17 +38,17 @@ import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.WeakHashMap;
 
-import de.robv.android.xposed.IXposedHookZygoteInit;
-import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XC_MethodHook.MethodHookParam;
-import de.robv.android.xposed.XposedBridge;
-import de.robv.android.xposed.XposedBridge.CopyOnWriteSortedSet;
-import de.robv.android.xposed.XposedInit;
-import de.robv.android.xposed.callbacks.XC_LayoutInflated;
-import de.robv.android.xposed.callbacks.XC_LayoutInflated.LayoutInflatedParam;
-import de.robv.android.xposed.callbacks.XCallback;
-import xposed.dummy.XResourcesSuperClass;
-import xposed.dummy.XTypedArraySuperClass;
+import de.wwb.android.wbosed.IXposedHookZygoteInit;
+import de.wwb.android.wbosed.XC_MethodHook;
+import de.wwb.android.wbosed.XC_MethodHook.MethodHookParam;
+import de.wwb.android.wbosed.XposedBridge;
+import de.wwb.android.wbosed.XposedBridge.CopyOnWriteSortedSet;
+import de.wwb.android.wbosed.XposedInit;
+import de.wwb.android.wbosed.callbacks.XC_LayoutInflated;
+import de.wwb.android.wbosed.callbacks.XC_LayoutInflated.LayoutInflatedParam;
+import de.wwb.android.wbosed.callbacks.XCallback;
+import wbosed.dummy.XResourcesSuperClass;
+import wbosed.dummy.XTypedArraySuperClass;
 
 /**
  * {@link android.content.res.Resources} subclass that allows replacing individual resources.
@@ -113,7 +113,7 @@ public class XResources extends XResourcesSuperClass {
 	 * `ThreadLocal` overriding `initialValue`, would each add a class that names `XResources`, and
 	 * this class may not be named by classes it does not control.
 	 *
-	 * The reason is its super class. {@link xposed.dummy.XResourcesSuperClass} is in no dex; it is
+     * The reason is its super class. {@link wbosed.dummy.XResourcesSuperClass} is in no dex; it is
 	 * generated at runtime, because it has to inherit from whichever `Resources` subclass the
 	 * platform actually provides. A type whose super class does not yet exist cannot be resolved,
 	 * and a resolution failure is remembered: the runtime marks the class erroneous and re-throws

@@ -14,9 +14,7 @@ import java.net.URL
 import java.nio.ByteBuffer
 import java.util.Collections
 import java.util.Enumeration
-import java.util.jar.JarFile
 import java.util.stream.Collectors
-import java.util.zip.ZipEntry
 import org.matrix.vector.nativebridge.HookBridge
 
 /**
@@ -100,18 +98,10 @@ class VectorModuleClassLoader : ByteBufferDexClassLoader {
         for (file in nativeLibraryDirs) {
             val path = file.path
             if (path.contains(ZIP_SEPARATOR)) {
-                val split = path.split(ZIP_SEPARATOR, limit = 2)
-                try {
-                    JarFile(split[0]).use { jarFile ->
-                        val entryName = "${split[1]}/$fileName"
-                        val entry = jarFile.getEntry(entryName)
-                        if (entry != null && entry.method == ZipEntry.STORED) {
-                            return "${split[0]}$ZIP_SEPARATOR$entryName"
-                        }
-                    }
-                } catch (e: IOException) {
-                    Log.e(TAG, "Cannot open ${split[0]}", e)
-                }
+                // rustFrida-aligned mode: modules are DEX/script inputs, not native-library
+                // providers. Returning an apk!/lib entry makes linker mmap the foreign module
+                // base.apk into the target process.
+                continue
             } else if (file.isDirectory) {
                 val entryPath = File(file, fileName).path
                 try {
@@ -149,7 +139,7 @@ class VectorModuleClassLoader : ByteBufferDexClassLoader {
 
         /**
          * What the legacy API is called *here*, which is not what it is called in source: the
-         * daemon rewrites `de.robv.android.xposed`, `AndroidAppHelper` and the `XResources` family
+         * daemon rewrites `de.wwb.android.wbosed`, `AndroidAppHelper` and the `XResources` family
          * in the framework dex and in every module dex when dex obfuscation is on, so the names a
          * module asks this loader for are a different random string on every boot. Matching the
          * literal package would leave the 102 rule unenforced on exactly the builds that have
@@ -160,7 +150,7 @@ class VectorModuleClassLoader : ByteBufferDexClassLoader {
                 .onFailure { Log.w(TAG, "Cannot resolve the legacy API prefixes", it) }
                 .getOrElse {
                     arrayOf(
-                        "de.robv.android.xposed.",
+                        "de.wwb.android.wbosed.",
                         "android.app.AndroidApp",
                         "android.content.res.XRes",
                         "android.content.res.XModule",

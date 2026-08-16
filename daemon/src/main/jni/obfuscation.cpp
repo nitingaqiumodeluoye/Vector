@@ -23,9 +23,10 @@ namespace {
 std::once_flag init_flag;
 
 std::map<std::string, std::string> signatures = {
-    {"Lde/robv/android/xposed/", ""},         {"Landroid/app/AndroidApp", ""},
+    {"Lde/wwb/android/wbosed/", ""},         {"Landroid/app/AndroidApp", ""},
     {"Landroid/content/res/XRes", ""},        {"Landroid/content/res/XModule", ""},
-    {"Lio/github/libxposed/api/Xposed", ""},  {"Lorg/matrix/vector/core/", ""},
+    {"Lde/wwb/android/wbosed/api/Wb", ""},  {"Lde/wwb/android/wbosed/api/error/", ""},
+    {"Lde/wwb/android/wbosed/service/", ""},  {"Lorg/matrix/vector/core/", ""},
     {"Lorg/matrix/vector/nativebridge/", ""}, {"Lorg/matrix/vector/service/", ""},
 };
 
@@ -44,6 +45,14 @@ static std::string to_java(const std::string &signature) {
     std::string java(signature, 1);
     std::replace(java.begin(), java.end(), '/', '.');
     return java;
+}
+
+static bool shouldExportSignature(const std::string &signature) {
+    // The target process stores the exported map in native/Java heap memory. Launch's self-memory
+    // scan looks for the public libxposed package names there, so keep these runtime-only rewrite
+    // rules internal to the daemon. Framework and module DEX buffers are still rewritten by
+    // obfuscateDexBuffer() using the full table above.
+    return signature.rfind("Lde/wwb/android/wbosed/", 0) != 0;
 }
 
 static void ensureInitialized(JNIEnv *env) {
@@ -157,6 +166,7 @@ Java_org_matrix_vector_daemon_utils_ObfuscationManager_getSignatures(
     std::call_once(jni_map_flag, [&]() {
         std::map<std::string, std::string> signatures_java;
         for (const auto &i : signatures) {
+            if (!shouldExportSignature(i.first)) continue;
             signatures_java[to_java(i.first)] = to_java(i.second);
         }
         signatures_jni = stringMapToJavaHashMap(env, signatures_java);

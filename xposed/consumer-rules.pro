@@ -1,5 +1,5 @@
 # Preserve the libxposed public API surface for module developers
--keep class io.github.libxposed.** { *; }
+-keep class de.wwb.android.wbosed.api.** { *; }
 
 # The libxposed annotations are compile-only metadata and are not packaged
 -dontwarn io.github.libxposed.annotation.**

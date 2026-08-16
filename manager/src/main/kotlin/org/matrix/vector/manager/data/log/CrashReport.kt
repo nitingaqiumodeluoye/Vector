@@ -100,7 +100,7 @@ private val OUR_PACKAGES =
         // an older build wrote still arrive under the old name and are still ours.
         "org.lsposed.lspd",
         "de.robv.android.xposed",
-        "io.github.libxposed",
+        "de.wwb.android.wbosed",
     )
 
 private val FRAME = Regex("""^\s*at (.+?)(?:\(([^)]*)\))?$""")

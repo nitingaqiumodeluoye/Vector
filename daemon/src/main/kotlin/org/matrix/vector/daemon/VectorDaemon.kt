@@ -24,7 +24,6 @@ import kotlinx.coroutines.runBlocking
 import org.matrix.vector.daemon.data.ConfigCache
 import org.matrix.vector.daemon.data.FileSystem
 import org.matrix.vector.daemon.env.CliSocketServer
-import org.matrix.vector.daemon.env.Dex2OatServer
 import org.matrix.vector.daemon.env.LogcatMonitor
 import org.matrix.vector.daemon.ipc.BRIDGE_TRANSACTION_CODE
 import org.matrix.vector.daemon.ipc.ManagerService
@@ -84,7 +83,6 @@ object VectorDaemon {
 
     // Start Environmental Daemons
     LogcatMonitor.start()
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) Dex2OatServer.start()
     CliSocketServer.start()
 
     // Preload Framework DEX in the background

@@ -5,7 +5,7 @@ import android.os.Bundle
 import android.os.ParcelFileDescriptor
 import android.os.RemoteException
 import android.util.Log
-import io.github.libxposed.service.IXposedService
+import de.wwb.android.wbosed.service.IWbService
 import java.io.Serializable
 import java.util.concurrent.ConcurrentHashMap
 import org.matrix.vector.ipc.IModuleService
@@ -33,9 +33,9 @@ class InjectedModuleService(private val packageName: String) : IModuleService.St
   private val callbacks = ConcurrentHashMap<String, MutableSet<Subscriber>>()
 
   override fun getFrameworkProperties(): Long {
-    var prop = IXposedService.PROP_CAP_SYSTEM or IXposedService.PROP_CAP_REMOTE
+    var prop = IWbService.PROP_CAP_SYSTEM or IWbService.PROP_CAP_REMOTE
     if (ConfigCache.state.isDexObfuscateEnabled) {
-      prop = prop or IXposedService.PROP_RT_API_PROTECTION
+      prop = prop or IWbService.PROP_RT_API_PROTECTION
     }
     return prop
   }
@@ -60,7 +60,7 @@ class InjectedModuleService(private val packageName: String) : IModuleService.St
   }
 
   override fun openRemoteFile(path: String): ParcelFileDescriptor? {
-    // XposedInterface#openRemoteFile documents FileNotFoundException for a missing *or* forbidden
+    // WbInterface#openRemoteFile documents FileNotFoundException for a missing *or* forbidden
     // path. Returning null lets VectorContext raise exactly that; throwing here surfaced a
     // RemoteException for a missing file and an IllegalArgumentException for a rejected path.
     val userId = Binder.getCallingUid() / PER_USER_RANGE

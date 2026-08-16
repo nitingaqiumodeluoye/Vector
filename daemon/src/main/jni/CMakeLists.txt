@@ -6,7 +6,6 @@ set(CMAKE_CXX_STANDARD 23)
 add_subdirectory(${VECTOR_ROOT}/external external)
 
 set(SOURCES
-        dex2oat.cpp
         logcat.cpp
         obfuscation.cpp
         )

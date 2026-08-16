@@ -3,9 +3,9 @@ package org.matrix.vector.impl
 import android.content.SharedPreferences
 import android.content.pm.ApplicationInfo
 import android.os.ParcelFileDescriptor
-import io.github.libxposed.api.XposedInterface
-import io.github.libxposed.api.XposedInterface.ExceptionMode
-import io.github.libxposed.api.XposedModuleInterface.*
+import de.wwb.android.wbosed.api.WbInterface
+import de.wwb.android.wbosed.api.WbInterface.ExceptionMode
+import de.wwb.android.wbosed.api.WbModuleInterface.*
 import java.io.FileNotFoundException
 import java.lang.reflect.Constructor
 import java.lang.reflect.Executable
@@ -62,7 +62,7 @@ class VectorContext(
     private val service: IModuleService,
     // What ExceptionMode.DEFAULT resolves to for this module, from module.prop.
     private val defaultExceptionMode: ExceptionMode = ExceptionMode.PROTECTIVE,
-) : XposedInterface {
+) : WbInterface {
 
     private val remotePrefs = ConcurrentHashMap<String, SharedPreferences>()
     @Volatile private var frozen = false
@@ -85,11 +85,11 @@ class VectorContext(
         return service.getFrameworkProperties()
     }
 
-    override fun hook(origin: Executable): XposedInterface.HookBuilder {
+    override fun hook(origin: Executable): WbInterface.HookBuilder {
         return VectorHookBuilder(origin, packageName, { frozen }, defaultExceptionMode)
     }
 
-    override fun hookClassInitializer(origin: Class<*>): XposedInterface.HookBuilder {
+    override fun hookClassInitializer(origin: Class<*>): WbInterface.HookBuilder {
         val clinit =
             findStaticInitializer(origin)
                 ?: throw IllegalArgumentException("Class ${origin.name} has no static initializer")
@@ -152,11 +152,11 @@ class VectorContext(
         return HookBridge.deoptimizeMethod(executable)
     }
 
-    override fun getInvoker(method: Method): XposedInterface.Invoker<*, Method> {
+    override fun getInvoker(method: Method): WbInterface.Invoker<*, Method> {
         return VectorMethodInvoker(method)
     }
 
-    override fun <T : Any> getInvoker(constructor: Constructor<T>): XposedInterface.CtorInvoker<T> {
+    override fun <T : Any> getInvoker(constructor: Constructor<T>): WbInterface.CtorInvoker<T> {
         return VectorCtorInvoker(constructor)
     }
 

@@ -46,7 +46,7 @@ constexpr auto kExactTags = std::array{"APatchD"sv, "Dobby"sv,  "KernelSU"sv, "L
                                        "LSPlt"sv,   "Magisk"sv, "SELinux"sv,  "TEESimulator"sv};
 
 // Partial matches for dynamic components like Zygisk modules or Vector/LSPosed components.
-constexpr auto kPrefixTags = std::array{"LSPosed"sv, "Vector"sv, "dex2oat"sv, "zygisk"sv};
+constexpr auto kPrefixTags = std::array{"LSPosed"sv, "Vector"sv, "zygisk"sv};
 
 // RAII Wrapper for File Descriptors to ensure files are closed during JNI rotation.
 struct UniqueFd {

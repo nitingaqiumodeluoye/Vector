@@ -1,14 +1,20 @@
 #include "core/native_api.h"
 
 #include <sys/mman.h>
+#include <sys/prctl.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <functional>
 #include <list>
 #include <memory>
 #include <mutex>
 
 #include "common/logging.h"
+#include "art_hook/hook_engine.h"
 #include "elf/elf_image.h"
 #include "elf/symbol_cache.h"
 
@@ -89,6 +95,18 @@ std::list<NativeOnModuleLoaded> g_module_loaded_callbacks;
 // List of native library filenames that are registered as modules.
 std::list<std::string> g_module_native_libs;
 
+constexpr size_t kModuleHookExecPoolSize = 128 * 1024;
+constexpr char kInitialHookExecVmaName[] = "wwb_hook_exec";
+std::mutex g_module_hook_engine_mutex;
+void *g_module_hook_exec_pool = nullptr;
+
+#ifndef PR_SET_VMA
+#define PR_SET_VMA 0x53564d41
+#endif
+#ifndef PR_SET_VMA_ANON_NAME
+#define PR_SET_VMA_ANON_NAME 0
+#endif
+
 // A smart pointer to a memory page that will hold the NativeAPIEntries struct.
 std::unique_ptr<void, std::function<void(void *)>> g_api_page(
     mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0), [](void *ptr) {
@@ -96,7 +114,131 @@ std::unique_ptr<void, std::function<void(void *)>> g_api_page(
             munmap(ptr, 4096);
         }
     });
+
+bool IsWxshadowHookEngineReady() {
+#if defined(__aarch64__)
+    ExecPoolRange range{};
+    return hook_engine_get_exec_ranges(&range, 1) > 0 && range.base != 0 && range.size != 0;
+#else
+    return false;
+#endif
+}
+
+void SetInitialHookExecVmaName(void *base, size_t size) {
+    // Source reference: rustFrida agent/src/quickjs_loader.rs::ExecMemory::new_near
+    // names the initial hook-engine exec_mem as "wwb_hook_exec". Extension pools are named
+    // "wwb_hook_pool" in quickjs-hook/src/hook_engine_mem.c::create_pool_near_range_sized.
+    if (!base || base == MAP_FAILED || size == 0) return;
+    errno = 0;
+    int ret = prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, reinterpret_cast<unsigned long>(base), size,
+                    reinterpret_cast<unsigned long>(kInitialHookExecVmaName));
+    if (ret != 0) {
+        LOGW("Native module wxshadow hook pool VMA name failed: base={} size={} name={} errno={}",
+             base, size, kInitialHookExecVmaName, errno);
+    }
+}
+
+uintptr_t FindLibartExecutableBase() {
+    // Source reference: rustFrida agent/src/quickjs_loader.rs::find_libart_base
+    // uses the r-xp libart.so mapping as hook_mmap_near() hint.
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) return 0;
+    char line[512];
+    uintptr_t base = 0;
+    while (fgets(line, sizeof(line), maps)) {
+        unsigned long map_start = 0;
+        if (sscanf(line, "%lx-", &map_start) != 1) continue;
+        if (strstr(line, "libart.so") && strstr(line, "r-xp")) {
+            base = static_cast<uintptr_t>(map_start);
+            break;
+        }
+    }
+    fclose(maps);
+    return base;
+}
+
+bool EnsureModuleWxshadowHookEngine() {
+#if defined(__aarch64__)
+    std::lock_guard lock(g_module_hook_engine_mutex);
+    if (IsWxshadowHookEngineReady()) {
+        return true;
+    }
+
+    const uintptr_t libart_hint = FindLibartExecutableBase();
+    void *pool = hook_mmap_near(reinterpret_cast<void *>(libart_hint),
+                                kModuleHookExecPoolSize);
+    if (pool == MAP_FAILED) {
+        PLOGE("Failed to allocate native module wxshadow hook pool near libart");
+        return false;
+    }
+    SetInitialHookExecVmaName(pool, kModuleHookExecPoolSize);
+
+    // Source reference: rustFrida agent/src/quickjs_loader.rs::init_hook_runtime
+    // passes an externally owned RWX exec_mem region into hook_engine_init().
+    if (hook_engine_init(pool, kModuleHookExecPoolSize) != HOOK_OK) {
+        LOGE("Failed to initialize native module wxshadow hook engine");
+        munmap(pool, kModuleHookExecPoolSize);
+        return false;
+    }
+
+    g_module_hook_exec_pool = pool;
+    LOGI("Native module wxshadow hook engine initialized: pool={} size={}", g_module_hook_exec_pool,
+         kModuleHookExecPoolSize);
+    return true;
+#else
+    return false;
+#endif
+}
+
+int HookModuleInlineWxshadow(void *original, void *replace, void **backup) {
+#if defined(__aarch64__)
+    if (!original || !replace || !backup) return HOOK_ERROR_INVALID_PARAM;
+    *backup = nullptr;
+
+    if (!EnsureModuleWxshadowHookEngine()) return HOOK_ERROR_NOT_INITIALIZED;
+
+    // Source reference: rustFrida quickjs-hook/src/hook_engine_inline.c::hook_install.
+    // NativeAPI's ABI is raw replacement + backup trampoline, so this maps to
+    // hook_install(), not hook_replace() (HookContext callback ABI).
+    void *trampoline = hook_install(original, replace, 1);
+    if (!trampoline) {
+        LOGE("Native module wxshadow inline hook failed: target={} replacement={}", original,
+             replace);
+        return HOOK_ERROR_WXSHADOW_FAILED;
+    }
+
+    *backup = trampoline;
+    return HOOK_OK;
+#else
+    (void)original;
+    (void)replace;
+    (void)backup;
+    return HOOK_ERROR_NOT_INITIALIZED;
+#endif
+}
+
+int UnhookModuleInlineWxshadow(void *original) {
+#if defined(__aarch64__)
+    if (!original) return HOOK_ERROR_INVALID_PARAM;
+    if (!EnsureModuleWxshadowHookEngine()) return HOOK_ERROR_NOT_INITIALIZED;
+
+    // Source reference: rustFrida quickjs-hook/src/jsapi/hook_api/mod.rs::remove_single_hook
+    // removes native inline hooks through hook_remove().
+    return hook_remove(original);
+#else
+    (void)original;
+    return HOOK_ERROR_NOT_INITIALIZED;
+#endif
+}
 }  // namespace
+
+int HookInlineWxshadow(void *original, void *replace, void **backup) {
+    return HookModuleInlineWxshadow(original, replace, backup);
+}
+
+int UnhookInlineWxshadow(void *original) {
+    return UnhookModuleInlineWxshadow(original);
+}
 
 // The read-only, statically available Native API entry points for modules.
 const NativeAPIEntries *g_native_api_entries = nullptr;
@@ -112,8 +254,8 @@ void InitializeApiEntries() {
     }
     auto *entries = new (g_api_page.get()) NativeAPIEntries{
         .version = 2,
-        .hookFunc = &HookInline,
-        .unhookFunc = &UnhookInline,
+        .hookFunc = &HookInlineWxshadow,
+        .unhookFunc = &UnhookInlineWxshadow,
     };
     if (mprotect(g_api_page.get(), 4096, PROT_READ) != 0) {
         PLOGE("Failed to mprotect API page to read-only");

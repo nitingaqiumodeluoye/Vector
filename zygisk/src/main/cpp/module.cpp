@@ -5,14 +5,144 @@
 #include <elf/elf_image.h>
 #include <elf/symbol_cache.h>
 #include <jni/jni_bridge.h>
+#include <jni/jni_hooks.h>
+#include <pthread.h>
+#include <sys/prctl.h>
 #include <sys/system_properties.h>
 #include <unistd.h>
+
+#include <cerrno>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
 
 #include <zygisk.hpp>
 
 #include "ipc_bridge.h"
 
 namespace vector::native::module {
+
+#ifndef PR_SET_VMA
+#define PR_SET_VMA 0x53564d41
+#endif
+#ifndef PR_SET_VMA_ANON_NAME
+#define PR_SET_VMA_ANON_NAME 0
+#endif
+
+static constexpr const char *kZygiskVmaName = "wwb_zygisk";
+static constexpr useconds_t kLateVmaNameDelaysUs[] = {
+    10 * 1000,
+    50 * 1000,
+    200 * 1000,
+    1000 * 1000,
+    3000 * 1000,
+};
+
+// rustFrida reference:
+// - loader/helpers/bootstrapper.c frida_bootstrap names its temporary executable mapping
+//   "wwb_loader" with PR_SET_VMA_ANON_NAME.
+// - loader/helpers/rustfrida-loader.c rustfrida_set_vma_name applies the same naming to
+//   agent mappings derived from the "wwb_so" memfd.
+// Vector is loaded by the Zygisk runtime before our code runs, so we cannot turn this VMA into
+// a memfd here. We can still name the already-loaded anonymous RX segment that contains this
+// module's code, matching rustFrida's wwb_* VMA naming style.
+static void NameOwnZygiskRxVma() {
+    const auto own_pc = reinterpret_cast<uintptr_t>(&NameOwnZygiskRxVma);
+
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) {
+        LOGW("[vma-name] failed to open /proc/self/maps");
+        return;
+    }
+
+    char line[512];
+    while (fgets(line, sizeof(line), maps)) {
+        unsigned long start = 0;
+        unsigned long end = 0;
+        unsigned long offset = 0;
+        unsigned long inode = 0;
+        char perms[5] = {};
+        char dev[32] = {};
+
+        if (sscanf(line, "%lx-%lx %4s %lx %31s %lu", &start, &end, perms, &offset, dev,
+                   &inode) != 6) {
+            continue;
+        }
+
+        if (own_pc < static_cast<uintptr_t>(start) || own_pc >= static_cast<uintptr_t>(end)) {
+            continue;
+        }
+
+        if (perms[2] != 'x') {
+            LOGW("[vma-name] own pc is not in executable VMA: {}", line);
+            break;
+        }
+
+        if (strcmp(dev, "00:00") != 0 || inode != 0) {
+            LOGD("[vma-name] own zygisk RX VMA is not anonymous; skip naming: {}", line);
+            break;
+        }
+
+        const unsigned long size = end - start;
+        errno = 0;
+        const int ret = prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, start, size,
+                              reinterpret_cast<unsigned long>(kZygiskVmaName));
+        if (ret == 0) {
+            LOGI("[vma-name] named own zygisk RX VMA '{}' range={:x}-{:x}", kZygiskVmaName,
+                 start, end);
+        } else {
+            LOGW("[vma-name] failed to name own zygisk RX VMA '{}' range={:x}-{:x} errno={}",
+                 kZygiskVmaName, start, end, errno);
+        }
+        break;
+    }
+
+    fclose(maps);
+}
+
+static void *LateNameOwnZygiskRxVmaWorker(void *) {
+    NameOwnZygiskRxVma();
+
+    for (useconds_t delay_us : kLateVmaNameDelaysUs) {
+        usleep(delay_us);
+        NameOwnZygiskRxVma();
+    }
+
+    return nullptr;
+}
+
+static void ScheduleLateNameOwnZygiskRxVma() {
+    pthread_t thread{};
+    errno = 0;
+    const int ret = pthread_create(&thread, nullptr, LateNameOwnZygiskRxVmaWorker, nullptr);
+    if (ret == 0) {
+        pthread_detach(thread);
+        LOGD("[vma-name] scheduled late own zygisk RX VMA naming");
+    } else {
+        LOGW("[vma-name] failed to schedule late own zygisk RX VMA naming errno={}", ret);
+    }
+}
+
+// Snapshot anonymous executable mappings at injection boundaries. These maps have no
+// pathname/inode, so recording them around each native stage is the only reliable way
+// to distinguish Vector allocation from a later app/library initializer.
+static void TraceAnonymousExecMaps(const char *stage) {
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) {
+        LOGW("[exec-map-native] stage={} failed to open /proc/self/maps", stage);
+        return;
+    }
+    char line[512];
+    size_t count = 0;
+    while (fgets(line, sizeof(line), maps)) {
+        if (strstr(line, " r-xp 00000000 00:00 0")) {
+            ++count;
+            LOGI("[exec-map-native] stage={} map={}", stage, line);
+        }
+    }
+    fclose(maps);
+    LOGI("[exec-map-native] stage={} pid={} count={}", stage, getpid(), count);
+}
 
 // --- Process UID Constants ---
 // Values used to identify special Android processes to avoid injection.
@@ -131,7 +261,7 @@ private:
         .art_symbol_prefix_resolver =
             [](auto symbol) { return ElfSymbolCache::GetArt()->getSymbPrefixFirstAddress(symbol); },
         .generated_class_name = "Vector_",
-        .generated_source_name = "Dobby",
+        .generated_source_name = "WxShadow",
     };
 
     // State managed within the class instance for each forked process.
@@ -228,6 +358,8 @@ void VectorModule::onLoad(zygisk::Api *api, JNIEnv *env) {
     this->api_ = api;
     this->env_ = env;
 
+    NameOwnZygiskRxVma();
+
     // Create two singlton instances for classes Context and ConfigBridge
     instance_.reset(this);
     ConfigImpl::Init();
@@ -235,9 +367,13 @@ void VectorModule::onLoad(zygisk::Api *api, JNIEnv *env) {
 }
 
 void VectorModule::preAppSpecialize(zygisk::AppSpecializeArgs *args) {
+    NameOwnZygiskRxVma();
+
     // Reset state for this new process fork.
     should_inject_ = false;
     is_manager_app_ = false;
+    jni::SetManagerProcess(false);
+    jni::SetLsplantInitialized(false);
 
     // --- Manager App Special Handling ---
     // We identify our manager app by a special UID and
@@ -247,6 +383,7 @@ void VectorModule::preAppSpecialize(zygisk::AppSpecializeArgs *args) {
         if (nice_name_str.get() == std::string(kManagerPackageName)) {
             LOGI("Manager app detected. Granting internet permissions.");
             is_manager_app_ = true;
+            jni::SetManagerProcess(true);
 
             // Add GID_INET to the GID list.
             int original_gids_count = env_->GetArrayLength(args->gids);
@@ -288,39 +425,52 @@ void VectorModule::preAppSpecialize(zygisk::AppSpecializeArgs *args) {
     // --- Injection Decision Logic ---
     // Determine if the current process is a valid target for injection.
     lsplant::JUTFString nice_name_str(env_, args->nice_name);
+    const bool is_child_zygote = args->is_child_zygote && *args->is_child_zygote;
+    const uid_t app_id = args->uid % PER_USER_RANGE;
+
+    LOGI("preAppSpecialize candidate '{}' uid={} app_id={} child_zygote={} has_app_data_dir={}",
+         nice_name_str.get(), args->uid, app_id, is_child_zygote,
+         args->app_data_dir != nullptr);
 
     // An app without a data directory cannot be a target.
     if (!args->app_data_dir) {
-        LOGD("Skipping injection for '{}': no app_data_dir.", nice_name_str.get());
+        LOGI("Skipping injection for '{}': no app_data_dir.", nice_name_str.get());
         return;
     }
 
-    // Child Zygotes are specialized zygotes for apps like WebView and are not targets.
-    if (args->is_child_zygote && *args->is_child_zygote) {
-        LOGD("Skipping injection for '{}': is a child zygote.", nice_name_str.get());
-        return;
+    // rustFrida-style package targeting should not require users to name implementation
+    // processes. Some protected apps create app-zygote/child-zygote processes whose final
+    // process names are still package-scoped. Do not reject them here; let the daemon's scope
+    // decision in postAppSpecialize decide whether a binder is returned.
+    if (is_child_zygote) {
+        LOGI("Allowing child zygote candidate '{}' to continue to daemon scope check.",
+             nice_name_str.get());
     }
 
     // Skip isolated processes, which are heavily sandboxed.
-    const uid_t app_id = args->uid % PER_USER_RANGE;
     if ((app_id >= FIRST_ISOLATED_UID && app_id <= LAST_ISOLATED_UID) ||
         (app_id >= FIRST_APP_ZYGOTE_ISOLATED_UID && app_id <= LAST_APP_ZYGOTE_ISOLATED_UID) ||
         app_id == SHARED_RELRO_UID) {
-        LOGV("Skipping injection for '{}': is an isolated process (UID: {}).", nice_name_str.get(),
+        LOGI("Skipping injection for '{}': is an isolated process (UID: {}).", nice_name_str.get(),
              app_id);
         return;
     }
 
     // If we passed all checks, mark this process for injection.
     should_inject_ = true;
-    LOGV("Process '{}' (UID: {}) is marked for injection.", nice_name_str.get(), args->uid);
+    LOGI("Process '{}' (UID: {}) is marked for injection.", nice_name_str.get(), args->uid);
 }
 
 void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     if (!should_inject_) {
+        lsplant::JUTFString nice_name_str(env_, args->nice_name);
+        LOGI("postAppSpecialize skipped for '{}': not marked for injection.",
+             nice_name_str.get());
         SetAllowUnload(true);  // Not a target, allow module to be unloaded.
         return;
     }
+
+    NameOwnZygiskRxVma();
 
     if (is_manager_app_) {
         args->nice_name = env_->NewStringUTF(kManagerPackageName);
@@ -329,6 +479,7 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     // --- Framework Injection ---
     lsplant::JUTFString nice_name_str(env_, args->nice_name);
     LOGD("Asking the daemon about '{}'.", nice_name_str.get());
+    TraceAnonymousExecMaps("postAppSpecialize:entry");
 
     auto &ipc_bridge = IPCBridge::GetInstance();
     auto binder = ipc_bridge.RequestAppBinder(env_, args->nice_name);
@@ -336,38 +487,59 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
         // Usually because nothing has it in scope, but the daemon may also not be up yet or have
         // registered this process already. Only it knows which, and it logs the reason itself.
         LOGD("Not injecting '{}': the daemon has no binder for it.", nice_name_str.get());
+        NameOwnZygiskRxVma();
         SetAllowUnload(true);
         return;
     }
+    NameOwnZygiskRxVma();
+    TraceAnonymousExecMaps("postAppSpecialize:after-binder");
 
     // Fetch resources from the manager service.
     auto [dex_fd, dex_size] = ipc_bridge.FetchFrameworkDex(env_, binder.get());
     if (dex_fd < 0) {
         LOGE("Failed to fetch framework DEX for '{}'.", nice_name_str.get());
+        NameOwnZygiskRxVma();
         SetAllowUnload(true);
         return;
     }
 
     auto obfs_map = ipc_bridge.FetchObfuscationMap(env_, binder.get());
     ConfigBridge::GetInstance()->obfuscation_map(std::move(obfs_map));
+    TraceAnonymousExecMaps("postAppSpecialize:after-fetch");
 
     {
         PreloadedDex dex(dex_fd, dex_size);
         this->LoadDex(env_, std::move(dex));
     }
     close(dex_fd);  // The FD is duplicated by mmap, we can close it now.
+    TraceAnonymousExecMaps("postAppSpecialize:after-load-dex");
 
-    // Initialize ART hooks via the native library.
-    this->InitArtHooker(env_, init_info_);
+    // rustFrida keeps pre-attach Java.ready gate hooks out of the raw-clone path and lets a
+    // post-resume Java worker discover the app ClassLoader instead
+    // (quickjs-hook/src/jsapi/java/java_boot.js Java._installGateHook and reflect.rs
+    // reprobe_classloader_once_with_env). For third-party app processes, avoid initializing
+    // LSPlant here: LSPlant::Init inline-hooks ART internals and is visible to libart CRC checks
+    // before any module hook requests arrive. The Java side will use a no-ART deferred bootstrap.
+    const bool use_art_bootstrap = is_manager_app_;
+    if (use_art_bootstrap) {
+        this->InitArtHooker(env_, init_info_);
+    } else {
+        LOGI("App process selected: LSPlant bootstrap disabled; using no-ART deferred bootstrap");
+    }
     // Initialize JNI hooks via the native library.
     this->InitHooks(env_);
+    TraceAnonymousExecMaps("postAppSpecialize:after-init-hooks");
     // Find the Java entrypoint.
     this->SetupEntryClass(env_);
+    TraceAnonymousExecMaps("postAppSpecialize:after-entry-class");
 
     // Hand off control to the Java side of the framework.
+    TraceAnonymousExecMaps("postAppSpecialize:before-fork-common");
     bool entered = this->FindAndCall(
-        env_, "forkCommon", "(ZZLjava/lang/String;Ljava/lang/String;Landroid/os/IBinder;)V",
-        JNI_FALSE, JNI_FALSE, args->nice_name, args->app_data_dir, binder.get(), is_manager_app_);
+        env_, "forkCommon", "(ZZLjava/lang/String;Ljava/lang/String;Landroid/os/IBinder;Z)V",
+        JNI_FALSE, JNI_FALSE, args->nice_name, args->app_data_dir, binder.get(),
+        use_art_bootstrap ? JNI_TRUE : JNI_FALSE);
+    TraceAnonymousExecMaps("postAppSpecialize:after-fork-common");
 
     if (entered) {
         LOGV("Injected Vector framework into '{}'.", nice_name_str.get());
@@ -378,9 +550,21 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     // Unconditionally: the ART and JNI hooks were installed before the entry ran, and their
     // trampolines point into this library. Letting it be unloaded now would leave them dangling.
     SetAllowUnload(false);
+    NameOwnZygiskRxVma();
+    ScheduleLateNameOwnZygiskRxVma();
 }
 
 void VectorModule::preServerSpecialize(zygisk::ServerSpecializeArgs *args) {
+    NameOwnZygiskRxVma();
+
+    // Reset process-local backend state just like app specialization does.
+    // system_server currently initializes LSPlant explicitly below, but keeping
+    // inherited zygote state out avoids stale fallback decisions.
+    should_inject_ = false;
+    is_manager_app_ = false;
+    jni::SetManagerProcess(false);
+    jni::SetLsplantInitialized(false);
+
     // The system server is always a target for injection.
     should_inject_ = true;
     LOGI("System server process detected. Marking for injection.");
@@ -460,9 +644,9 @@ void VectorModule::postServerSpecialize(const zygisk::ServerSpecializeArgs *args
 
     auto system_name = lsplant::ScopedLocalRef(env_, env_->NewStringUTF("system"));
     bool entered = this->FindAndCall(
-        env_, "forkCommon", "(ZZLjava/lang/String;Ljava/lang/String;Landroid/os/IBinder;)V",
+        env_, "forkCommon", "(ZZLjava/lang/String;Ljava/lang/String;Landroid/os/IBinder;Z)V",
         JNI_TRUE, is_late_inject, system_name.get(), nullptr, manager_binder.get(),
-        is_manager_app_);
+        JNI_TRUE);
 
     if (entered) {
         LOGI("Injected Vector framework into system_server.");

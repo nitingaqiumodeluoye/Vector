@@ -9,10 +9,10 @@ import android.os.ParcelFileDescriptor
 import android.os.RemoteException
 import android.os.SystemClock
 import android.util.Log
-import io.github.libxposed.service.HookedProcess
-import io.github.libxposed.service.IHotReloadCallback
-import io.github.libxposed.service.IXposedScopeCallback
-import io.github.libxposed.service.IXposedService
+import de.wwb.android.wbosed.service.HookedProcess
+import de.wwb.android.wbosed.service.IHotReloadCallback
+import de.wwb.android.wbosed.service.IWbScopeCallback
+import de.wwb.android.wbosed.service.IWbService
 import java.io.Serializable
 import java.util.Collections
 import java.util.WeakHashMap
@@ -36,7 +36,7 @@ import org.matrix.vector.daemon.system.activityManager
 private const val TAG = "VectorModuleAppService"
 
 /**
- * A module's service as its own **app** sees it — libxposed's `IXposedService`.
+ * A module's service as its own **app** sees it — libxposed's `IWbService`.
  *
  * One of two services a module gets, and the name says which. [InjectedModuleService] is the other:
  * the same module seen from inside a process it was injected into. They deliberately differ in what
@@ -46,7 +46,7 @@ private const val TAG = "VectorModuleAppService"
  *
  * See `IModuleService.aidl` for the other side of that distinction.
  */
-class ModuleAppService(private val loadedModule: LoadedModule) : IXposedService.Stub() {
+class ModuleAppService(private val loadedModule: LoadedModule) : IWbService.Stub() {
 
   companion object {
     // Per-target serialization lives on the target itself; this only keeps one slow target from
@@ -386,7 +386,7 @@ class ModuleAppService(private val loadedModule: LoadedModule) : IXposedService.
     return Binder.getCallingUid() / PER_USER_RANGE
   }
 
-  override fun getApiVersion() = ensureModule().let { IXposedService.LIB_API }
+  override fun getApiVersion() = ensureModule().let { IWbService.LIB_API }
 
   override fun getFrameworkName() = ensureModule().let { BuildConfig.FRAMEWORK_NAME }
 
@@ -417,9 +417,9 @@ class ModuleAppService(private val loadedModule: LoadedModule) : IXposedService.
 
   override fun getFrameworkProperties(): Long {
     ensureModule()
-    var prop = IXposedService.PROP_CAP_SYSTEM or IXposedService.PROP_CAP_REMOTE
+    var prop = IWbService.PROP_CAP_SYSTEM or IWbService.PROP_CAP_REMOTE
     if (ConfigCache.state.isDexObfuscateEnabled)
-        prop = prop or IXposedService.PROP_RT_API_PROTECTION
+        prop = prop or IWbService.PROP_RT_API_PROTECTION
     return prop
   }
 
@@ -442,7 +442,7 @@ class ModuleAppService(private val loadedModule: LoadedModule) : IXposedService.
   /**
    * One request, one question, one answer.
    *
-   * The AIDL hands over a list and takes a single [IXposedScopeCallback] for it, and the javadoc on
+   * The AIDL hands over a list and takes a single [IWbScopeCallback] for it, and the javadoc on
    * the client's `OnScopeEventListener` says its listener runs "when the request is completed" —
    * singular — with `onScopeRequestApproved` taking the *packages* that were approved. This used to
    * put one prompt per package on screen, each answered in its own right, so a module asking for
@@ -455,7 +455,7 @@ class ModuleAppService(private val loadedModule: LoadedModule) : IXposedService.
    * to, the same set asked for twice is the same question, and `NotificationManager` identifies a
    * prompt by the set it names.
    */
-  override fun requestScope(packages: List<String>, callback: IXposedScopeCallback) {
+  override fun requestScope(packages: List<String>, callback: IWbScopeCallback) {
     val userId = ensureModule()
     val requested = packages.distinct().sorted()
     if (requested.isEmpty()) {
@@ -510,12 +510,12 @@ class ModuleAppService(private val loadedModule: LoadedModule) : IXposedService.
 
     if (!target.hotReloadable) {
       // Hot reload is specified only for modules declaring exactly one Java entry class.
-      report(callback, IXposedService.HOT_RELOAD_UNSUPPORTED, "Module has no single Java entry class")
+      report(callback, IWbService.HOT_RELOAD_UNSUPPORTED, "Module has no single Java entry class")
       return
     }
 
     if (!FrameworkService.beginHotReload(target)) {
-      report(callback, IXposedService.HOT_RELOAD_IN_PROGRESS, "A reload is already running")
+      report(callback, IWbService.HOT_RELOAD_IN_PROGRESS, "A reload is already running")
       return
     }
 
@@ -530,7 +530,7 @@ class ModuleAppService(private val loadedModule: LoadedModule) : IXposedService.
       data: Bundle?,
       callback: IHotReloadCallback?,
   ) {
-    var status = IXposedService.HOT_RELOAD_FAILED
+    var status = IWbService.HOT_RELOAD_FAILED
     var message: String? = "Hot reload did not run"
     var refreeze: (() -> Unit)? = null
     var loadedVersion: Long? = null
@@ -540,13 +540,13 @@ class ModuleAppService(private val loadedModule: LoadedModule) : IXposedService.
     try {
       val binder = FrameworkService.getHotReloadBinder(target)
       if (binder == null) {
-        status = IXposedService.HOT_RELOAD_UNSUPPORTED
+        status = IWbService.HOT_RELOAD_UNSUPPORTED
         message = "Process ${target.processName} has no hot reload entry point"
         return
       }
       val newModule = ConfigCache.state.modules[loadedModule.packageName]
       if (newModule == null) {
-        status = IXposedService.HOT_RELOAD_UNSUPPORTED
+        status = IWbService.HOT_RELOAD_UNSUPPORTED
         message = "No installed generation of ${loadedModule.packageName} to load"
         return
       }
@@ -559,7 +559,7 @@ class ModuleAppService(private val loadedModule: LoadedModule) : IXposedService.
       if (ProcessFreezer.isFrozen(target.pid)) {
         // Say so now rather than spending the timeout on a transaction that will not be delivered.
         // Not a refusal either: the message is what tells the two apart.
-        status = IXposedService.HOT_RELOAD_FAILED
+        status = IWbService.HOT_RELOAD_FAILED
         message = "Process ${target.processName} is frozen and could not be thawed"
         return
       }
@@ -578,10 +578,10 @@ class ModuleAppService(private val loadedModule: LoadedModule) : IXposedService.
       // RELOADING for the life of the process, and every later request would answer IN_PROGRESS.
       if (!answered.await(RELOAD_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
         status =
-            if (FrameworkService.isProcessRegistered(target)) IXposedService.HOT_RELOAD_FAILED
-            else IXposedService.HOT_RELOAD_PROCESS_DIED
+            if (FrameworkService.isProcessRegistered(target)) IWbService.HOT_RELOAD_FAILED
+            else IWbService.HOT_RELOAD_PROCESS_DIED
         message =
-            if (status == IXposedService.HOT_RELOAD_PROCESS_DIED) {
+            if (status == IWbService.HOT_RELOAD_PROCESS_DIED) {
               "Process ${target.processName} died during hot reload"
             } else {
               "Process ${target.processName} did not answer within ${RELOAD_TIMEOUT_SECONDS}s"
@@ -592,7 +592,7 @@ class ModuleAppService(private val loadedModule: LoadedModule) : IXposedService.
       val answer =
           outcome
               ?: run {
-                status = IXposedService.HOT_RELOAD_FAILED
+                status = IWbService.HOT_RELOAD_FAILED
                 message = "Process ${target.processName} answered with nothing"
                 return
               }
@@ -606,7 +606,7 @@ class ModuleAppService(private val loadedModule: LoadedModule) : IXposedService.
       // A null message is reserved for a refusal, so anything else gets one supplied.
       message =
           answer.message
-              ?: if (status == IXposedService.HOT_RELOAD_FAILED && !answer.refused) {
+              ?: if (status == IWbService.HOT_RELOAD_FAILED && !answer.refused) {
                 "Hot reload failed without a diagnostic message"
               } else {
                 null
@@ -617,7 +617,7 @@ class ModuleAppService(private val loadedModule: LoadedModule) : IXposedService.
       // is gone. The heartbeat registry does - it is driven by a DeathRecipient.
       val gone = !FrameworkService.isProcessRegistered(target)
       status =
-          if (gone) IXposedService.HOT_RELOAD_PROCESS_DIED else IXposedService.HOT_RELOAD_FAILED
+          if (gone) IWbService.HOT_RELOAD_PROCESS_DIED else IWbService.HOT_RELOAD_FAILED
       message =
           if (gone) "Process ${target.processName} died during hot reload"
           else "${t.javaClass.name}: ${t.message ?: "no message"}"
@@ -631,8 +631,8 @@ class ModuleAppService(private val loadedModule: LoadedModule) : IXposedService.
 
   private fun stateFor(status: Int): Int =
       when (status) {
-        IXposedService.HOT_RELOAD_SUCCEEDED -> HookedProcess.TARGET_STATE_UP_TO_DATE
-        IXposedService.HOT_RELOAD_FAILED -> HookedProcess.TARGET_STATE_FAILED
+        IWbService.HOT_RELOAD_SUCCEEDED -> HookedProcess.TARGET_STATE_UP_TO_DATE
+        IWbService.HOT_RELOAD_FAILED -> HookedProcess.TARGET_STATE_FAILED
         // Unsupported and process-died say nothing about the generation the target is running, so
         // the reported state falls back to comparing versions.
         else -> HookedProcess.TARGET_STATE_UP_TO_DATE

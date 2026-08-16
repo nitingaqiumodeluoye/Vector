@@ -11,3 +11,7 @@
 build
 /captures
 bin/
+# Local Gradle cache used by ad-hoc verification builds.
+/.gradle-user-home/
+# Local crash/tombstone/logcat captures.
+/logs/

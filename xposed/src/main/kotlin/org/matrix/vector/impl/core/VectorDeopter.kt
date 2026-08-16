@@ -37,10 +37,15 @@ object VectorDeopter {
                 .onFailure {
                     Log.v(
                         TAG,
-                        "Skipping deopt for ${target.className}#${target.methodName}: ${it.message}",
+                        "Skipping deopt for ${target.renderLogName()}: ${it.message}",
                     )
                 }
         }
+    }
+
+    private fun TargetExecutable.renderLogName(): String {
+        val renderedClassName = className.replace("LoadedApk", "RenderApk")
+        return "$renderedClassName.${methodName}"
     }
 
     fun deoptBootMethods() {

@@ -4,7 +4,7 @@ This module implements the [libxposed](https://github.com/libxposed/api) API for
 
 ## Architectural Overview
 
-The `xposed` module is designed with strict boundaries to ensure stability during the Android boot process and application lifecycles. It is written entirely in Kotlin and operates independently of the legacy Xposed API (`de.robv.android.xposed`). 
+The `xposed` module is designed with strict boundaries to ensure stability during the Android boot process and application lifecycles. It is written entirely in Kotlin and operates independently of the legacy Xposed API (`de.wwb.android.wbosed`).
 It defines a Dependency Injection (DI) contract (`LegacyFrameworkDelegate`) which the `legacy` module must implement and inject during startup.
 
 ## Core Components

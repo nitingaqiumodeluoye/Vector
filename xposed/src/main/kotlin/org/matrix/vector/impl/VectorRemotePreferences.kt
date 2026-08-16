@@ -4,7 +4,7 @@ import android.content.SharedPreferences
 import android.os.Bundle
 import android.os.RemoteException
 import android.util.ArraySet
-import io.github.libxposed.api.error.XposedFrameworkError
+import de.wwb.android.wbosed.api.error.WbFrameworkError
 import java.util.TreeMap
 import java.util.concurrent.ConcurrentHashMap
 import org.matrix.vector.ipc.IModuleService
@@ -82,7 +82,7 @@ internal class VectorRemotePreferences(service: IModuleService, group: String) :
             }
         } catch (e: RemoteException) {
             Log.e("VectorContext", "Failed to request remote preferences for group: $group", e)
-            throw XposedFrameworkError("Remote preferences IPC failure", e)
+            throw WbFrameworkError("Remote preferences IPC failure", e)
         }
     }
 

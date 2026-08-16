@@ -3,13 +3,13 @@ package org.matrix.vector.impl.core
 import android.os.Build
 import android.os.Bundle
 import android.os.Process
-import io.github.libxposed.api.XposedInterface
-import io.github.libxposed.api.XposedInterface.ExceptionMode
-import io.github.libxposed.api.XposedModule
-import io.github.libxposed.api.XposedModuleInterface.HotReloadedParam
-import io.github.libxposed.api.XposedModuleInterface.HotReloadingParam
-import io.github.libxposed.api.XposedModuleInterface.ModuleLoadedParam
-import io.github.libxposed.service.IXposedService
+import de.wwb.android.wbosed.api.WbInterface
+import de.wwb.android.wbosed.api.WbInterface.ExceptionMode
+import de.wwb.android.wbosed.api.WbModule
+import de.wwb.android.wbosed.api.WbModuleInterface.HotReloadedParam
+import de.wwb.android.wbosed.api.WbModuleInterface.HotReloadingParam
+import de.wwb.android.wbosed.api.WbModuleInterface.ModuleLoadedParam
+import de.wwb.android.wbosed.service.IWbService
 import java.io.File
 import java.lang.ref.WeakReference
 import java.util.concurrent.ConcurrentHashMap
@@ -21,7 +21,7 @@ import org.matrix.vector.impl.VectorContext
 import org.matrix.vector.impl.VectorLifecycleManager
 import org.matrix.vector.impl.hooks.VectorHookBuilder
 import org.matrix.vector.impl.utils.VectorModuleClassLoader
-import org.matrix.vector.nativebridge.NativeAPI
+import org.matrix.vector.nativebridge.HookBridge
 
 /**
  * Responsible for loading modules into the target process. Handles ClassLoader isolation and
@@ -31,18 +31,40 @@ object VectorModuleManager {
 
     private const val TAG = "VectorModuleManager"
 
+    private fun traceAnonymousExecMaps(stage: String, modulePackageName: String) {
+        runCatching {
+                val mappings =
+                    File("/proc/self/maps").useLines { lines ->
+                        lines
+                            .filter { it.contains(" r-xp 00000000 00:00 0") }
+                            .toList()
+                    }
+                Log.d(
+                    TAG,
+                    "[exec-map-trace] stage=$stage module=$modulePackageName " +
+                        "pid=${Process.myPid()} count=${mappings.size}",
+                )
+                mappings.forEach { mapping ->
+                    Log.d(TAG, "[exec-map-trace] stage=$stage map=$mapping")
+                }
+            }
+            .onFailure { error ->
+                Log.e(TAG, "[exec-map-trace] stage=$stage failed", error)
+            }
+    }
+
     // Entries are weak on purpose: activeModules owns the only strong reference, and detach()
     // removes it. A reload holds a local strong list for the cycle instead.
     private class Generation(
         val classLoader: ClassLoader,
         val context: VectorContext,
-        entries: List<XposedModule>,
+        entries: List<WbModule>,
         val isSystemServer: Boolean,
         val processName: String,
     ) {
         private val entryRefs = entries.map { WeakReference(it) }
 
-        fun liveEntries(): List<XposedModule> =
+        fun liveEntries(): List<WbModule> =
             entryRefs.mapNotNull { it.get() }.filter { VectorLifecycleManager.isActive(it) }
     }
 
@@ -55,8 +77,10 @@ object VectorModuleManager {
      * Loads a module APK, instantiates its entry classes, and binds them to the Vector framework.
      */
     fun loadModule(module: LoadedModule, isSystemServer: Boolean, processName: String): Boolean {
+        traceAnonymousExecMaps("renderModule:before-build", module.packageName)
         val (generation, entries) =
             buildGeneration(module, isSystemServer, processName) ?: return false
+        traceAnonymousExecMaps("renderModule:after-build", module.packageName)
 
         entries.forEach { VectorLifecycleManager.activeModules.add(it) }
         generations[module.packageName] = generation
@@ -68,17 +92,18 @@ object VectorModuleManager {
                 override fun getProcessName(): String = processName
             }
         entries.forEach { entry ->
+            traceAnonymousExecMaps("onModuleLoaded:before:${entry.javaClass.name}", module.packageName)
             runCatching { entry.onModuleLoaded(param) }
                 .onFailure { e ->
                     Log.e(TAG, "Error in onModuleLoaded for ${entry.javaClass.name}", e)
                 }
+            traceAnonymousExecMaps("onModuleLoaded:after:${entry.javaClass.name}", module.packageName)
         }
 
-        // Native entry points are recorded by buildGeneration, which has to do it before the entry
-        // classes run. Recording them again here would put every library name in the list the dlopen
-        // hook walks twice over, and that list never shrinks.
+        // Module native_init entries are intentionally not executed. Native inline hooks are
+        // provided by Vector core's wxshadow engine; modules stay as DEX/script logic.
 
-        Log.d(TAG, "Loaded module ${module.packageName} successfully.")
+        Log.d(TAG, "Rendered module ${module.packageName} successfully.")
         return true
     }
 
@@ -87,31 +112,34 @@ object VectorModuleManager {
         module: LoadedModule,
         isSystemServer: Boolean,
         processName: String,
-    ): Pair<Generation, List<XposedModule>>? {
+    ): Pair<Generation, List<WbModule>>? {
         try {
-            Log.d(TAG, "Loading module ${module.packageName}")
+            Log.d(TAG, "Render module ${module.packageName}")
+            traceAnonymousExecMaps("buildGeneration:start", module.packageName)
 
-            // Construct the native library search path
-            val librarySearchPath = buildString {
-                // In system_server the in-APK entries below can only ever be refused: /data/app is
-                // apk_data_file, which that domain may read and map but never execute. The daemon
-                // stages a copy under a label we own for exactly this reason, and it has to come
-                // first, because findLibrary answers with the first candidate it can open.
-                if (isSystemServer) {
-                    module.code.nativeLibraryDir?.let {
-                        append(it).append(File.pathSeparator)
-                    }
-                }
-                val abis =
-                    if (Process.is64Bit()) Build.SUPPORTED_64_BIT_ABIS
-                    else Build.SUPPORTED_32_BIT_ABIS
-                for (abi in abis) {
-                    append(module.apkPath).append("!/lib/").append(abi).append(File.pathSeparator)
-                }
+            // rustFrida-aligned module model: module APKs provide DEX/script logic only.
+            // Native inline hook code lives in Vector's core wxshadow hook engine. Do not expose
+            // module.apkPath!/lib/<abi> to BaseDexClassLoader; otherwise a module calling
+            // System.loadLibrary() makes linker mmap the module base.apk into the target process,
+            // which is an observable foreign-code-container mapping.
+            val librarySearchPath = ""
+
+            // VectorModuleClassLoader directly links BaseDexClassLoader's hidden ByteBuffer
+            // constructor. The exemption must be installed before the first active reference to
+            // that class, because ART may link its super call before entering loadApk(). rustFrida
+            // performs the equivalent VMRuntime call while initializing its Java support; Vector
+            // narrows it to BaseDexClassLoader so unrelated hidden APIs remain denied.
+            check(
+                Build.VERSION.SDK_INT < Build.VERSION_CODES.P ||
+                    HookBridge.exemptModuleClassLoaderHiddenApi()
+            ) {
+                "Unable to enable the in-memory module ClassLoader constructor"
             }
+            traceAnonymousExecMaps("buildGeneration:after-hidden-api", module.packageName)
 
             // Create the isolated ClassLoader for the module
-            val initLoader = XposedModule::class.java.classLoader
+            val initLoader = WbModule::class.java.classLoader
+            traceAnonymousExecMaps("renderApk:before", module.packageName)
             val moduleClassLoader =
                 VectorModuleClassLoader.loadApk(
                     module.apkPath,
@@ -120,10 +148,11 @@ object VectorModuleManager {
                     initLoader,
                     blockLegacyApi = module.code.targetApiVersion >= 102,
                 )
+            traceAnonymousExecMaps("renderApk:after", module.packageName)
 
             // Security/Integrity Check: Ensure the module isn't bundling its own API classes
             if (
-                moduleClassLoader.loadClass(XposedModule::class.java.name).classLoader !==
+                moduleClassLoader.loadClass(WbModule::class.java.name).classLoader !==
                     initLoader
             ) {
                 Log.e(TAG, "The Xposed API classes are compiled into ${module.packageName}")
@@ -141,34 +170,39 @@ object VectorModuleManager {
                         else ExceptionMode.PROTECTIVE,
                 )
 
-            // Register any native JNI entrypoints declared by the module. This has to happen before
-            // the entry classes run: a module is free to load its libraries from its constructor or
-            // from onModuleLoaded, and an entrypoint recorded afterwards is one the dlopen hook has
-            // already missed. The legacy loader has always done it in this order.
-            module.code.moduleLibraryNames.forEach { libraryName ->
-                NativeAPI.recordNativeEntrypoint(libraryName)
+            if (module.code.moduleLibraryNames.isNotEmpty()) {
+                Log.w(
+                    TAG,
+                    "Ignoring native_init entries for ${module.packageName}: " +
+                        "module native libraries are disabled; use Vector core native hook APIs.",
+                )
             }
 
             // Instantiate the module entry classes
-            val entries = mutableListOf<XposedModule>()
+            val entries = mutableListOf<WbModule>()
             for (className in module.code.moduleClassNames) {
                 runCatching {
+                        traceAnonymousExecMaps("renderClass:before:$className", module.packageName)
                         val moduleClass = moduleClassLoader.loadClass(className)
-                        Log.v(TAG, "Loading class $moduleClass")
+                        traceAnonymousExecMaps("renderClass:after:$className", module.packageName)
+                        Log.v(TAG, "Render class $moduleClass")
 
-                        if (!XposedModule::class.java.isAssignableFrom(moduleClass)) {
-                            Log.e(TAG, "Class does not extend XposedModule, skipping.")
+                        if (!WbModule::class.java.isAssignableFrom(moduleClass)) {
+                            Log.e(TAG, "Class does not extend WbModule, skipping.")
                             return@runCatching
                         }
 
                         val constructor = moduleClass.getDeclaredConstructor()
                         constructor.isAccessible = true
-                        val moduleInstance = constructor.newInstance() as XposedModule
+                        traceAnonymousExecMaps("constructor:before:$className", module.packageName)
+                        val moduleInstance = constructor.newInstance() as WbModule
+                        traceAnonymousExecMaps("constructor:after:$className", module.packageName)
 
                         // detach() is per entry: only the instance that calls it stops.
                         moduleInstance.attachFramework(vectorContext) {
                             VectorLifecycleManager.detach(moduleInstance)
                         }
+                        traceAnonymousExecMaps("attachFramework:after:$className", module.packageName)
 
                         entries.add(moduleInstance)
                     }
@@ -176,7 +210,7 @@ object VectorModuleManager {
             }
 
             // A generation with nothing in it is not a generation. Every entry class can fail to
-            // instantiate - a constructor that throws, a class that does not extend XposedModule -
+            // instantiate - a constructor that throws, a class that does not extend WbModule -
             // and each of those is logged and skipped above, which used to leave an empty list that
             // every caller then treated as success: the initial load reported the module loaded,
             // and a hot reload committed the empty generation, never called onHotReloaded, never
@@ -192,7 +226,7 @@ object VectorModuleManager {
                 Generation(moduleClassLoader, vectorContext, entries, isSystemServer, processName)
             return generation to entries
         } catch (e: Throwable) {
-            Log.e(TAG, "Fatal error loading module ${module.packageName}", e)
+            Log.e(TAG, "Fatal error rendering module ${module.packageName}", e)
             return null
         }
     }
@@ -207,7 +241,7 @@ object VectorModuleManager {
         val lock = reloadLocks.computeIfAbsent(packageName) { ReentrantLock() }
         if (!lock.tryLock()) {
             return outcome(
-                IXposedService.HOT_RELOAD_IN_PROGRESS,
+                IWbService.HOT_RELOAD_IN_PROGRESS,
                 "A reload of $packageName is already running in this process",
             )
         }
@@ -301,7 +335,7 @@ object VectorModuleManager {
 
                 override fun getSavedInstanceState(): Any? = savedState
 
-                override fun getOldHookHandles(): List<XposedInterface.HookHandle> = oldHandles
+                override fun getOldHookHandles(): List<WbInterface.HookHandle> = oldHandles
             }
 
         // Committed before the callback runs, because the interface releases the old generation
@@ -328,7 +362,7 @@ object VectorModuleManager {
         }
 
         Log.d(TAG, "Hot reloaded $packageName")
-        return outcome(IXposedService.HOT_RELOAD_SUCCEEDED, null, generationChanged = true)
+        return outcome(IWbService.HOT_RELOAD_SUCCEEDED, null, generationChanged = true)
     }
 
     /**
@@ -383,12 +417,12 @@ object VectorModuleManager {
         }
 
     private fun unsupported(message: String) =
-        outcome(IXposedService.HOT_RELOAD_UNSUPPORTED, message)
+        outcome(IWbService.HOT_RELOAD_UNSUPPORTED, message)
 
     private fun failed(message: String, generationChanged: Boolean = false) =
-        outcome(IXposedService.HOT_RELOAD_FAILED, message, generationChanged = generationChanged)
+        outcome(IWbService.HOT_RELOAD_FAILED, message, generationChanged = generationChanged)
 
-    private fun refusal() = outcome(IXposedService.HOT_RELOAD_FAILED, null, refused = true)
+    private fun refusal() = outcome(IWbService.HOT_RELOAD_FAILED, null, refused = true)
 
     private fun describe(t: Throwable) = "${t.javaClass.name}: ${t.message ?: "no message"}"
 }

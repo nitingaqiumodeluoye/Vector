@@ -103,7 +103,6 @@ androidComponents {
                     "assemble$variantCapped",
                     ":manager:package$variantCapped",
                     ":daemon:package$variantCapped",
-                    ":dex2oat:externalNativeBuild$variantCapped",
                 )
                 into(tempModuleDir)
                 from("${rootProject.projectDir}/README.md")
@@ -147,17 +146,6 @@ androidComponents {
                         )
                     ) {
                         include("**/libzygisk.so")
-                    }
-                }
-                into("bin") {
-                    from(
-                        project(":dex2oat")
-                            .layout
-                            .buildDirectory
-                            .dir("intermediates/cmake/$variantLowered/obj")
-                    ) {
-                        include("**/dex2oat")
-                        include("**/liboat_hook.so")
                     }
                 }
                 val dexOutPath =
@@ -272,9 +260,9 @@ val guardedTypes =
 val resourceOwners =
     listOf(
         "android.content.res.",
-        "de.robv.android.xposed.XposedInit",
-        "de.robv.android.xposed.callbacks.XC_InitPackageResources",
-        "de.robv.android.xposed.callbacks.XC_LayoutInflated",
+        "de.wwb.android.wbosed.XposedInit",
+        "de.wwb.android.wbosed.callbacks.XC_InitPackageResources",
+        "de.wwb.android.wbosed.callbacks.XC_LayoutInflated",
         "org.matrix.vector.legacy.LegacyDelegateImpl\$ResourceProxy",
     )
 

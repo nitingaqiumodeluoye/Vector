@@ -365,10 +365,9 @@ object ConfigCache {
         val pkgInfo = packageManager?.getPackageInfoWithComponents(appPkg, MATCH_ALL_FLAGS, userId)
         if (pkgInfo?.applicationInfo == null) return@forEach
 
-        val processNames = pkgInfo.fetchProcesses()
-        if (processNames.isEmpty()) return@forEach
-
         val appUid = pkgInfo.applicationInfo!!.uid
+        val processNames = mutableSetOf(appPkg)
+        processNames.addAll(pkgInfo.fetchProcesses())
 
         for (processName in processNames) {
           addToScope(processName, appUid, module)
@@ -405,7 +404,9 @@ object ConfigCache {
                   packageManager?.getPackageInfoWithComponents(
                       module.packageName, MATCH_ALL_FLAGS, userId) ?: return@forEach
               val moduleUid = pkgInfo.applicationInfo?.uid ?: return@forEach
-              pkgInfo.fetchProcesses().forEach { processName ->
+              val processNames = mutableSetOf(module.packageName)
+              processNames.addAll(pkgInfo.fetchProcesses())
+              processNames.forEach { processName ->
                 addToScope(processName, moduleUid, module)
               }
             }
@@ -457,7 +458,25 @@ object ConfigCache {
       Log.w(TAG, "Skip unexpected module queries for $processName")
       return emptyList()
     }
-    return state.scopes[ProcessScope(processName, uid)] ?: emptyList()
+    return modulesForProcess(state.scopes, processName, uid)
+  }
+
+  private fun modulesForProcess(
+      scopes: Map<ProcessScope, List<LoadedModule>>,
+      processName: String,
+      uid: Int
+  ): List<LoadedModule> {
+    scopes[ProcessScope(processName, uid)]?.let { return it }
+
+    val separator = processName.indexOf(':')
+    if (separator <= 0) return emptyList()
+
+    // Package scope is user-facing package scope, not a demand that the user names every concrete
+    // process. rustFrida follows the same direction when a package target is resolved through the
+    // manifest and normalized into a concrete process name. Keep the UID in the key so another
+    // package cannot borrow a shared process name and isolated processes remain out of scope.
+    val packageName = processName.substring(0, separator)
+    return scopes[ProcessScope(packageName, uid)] ?: emptyList()
   }
 
   fun getModuleByUid(uid: Int): LoadedModule? =
@@ -501,7 +520,7 @@ object ConfigCache {
 
             val cached = currentState.modules[pkgName]
             if (cached != null) {
-              stageNativeLibrariesFor(cached)
+              disableModuleNativeLibraries(cached)
               modules.add(cached)
               return@forEach
             }
@@ -543,33 +562,23 @@ object ConfigCache {
 
             FileSystem.loadModule(apkPath, state.isDexObfuscateEnabled).apkOrNull?.let {
               module.code = it
-              stageNativeLibrariesFor(module)
+              disableModuleNativeLibraries(module)
               modules.add(module)
               // We intentionally don't mutate state.modules here. Cache update will catch it.
             }
           }
         }
-    FileSystem.pruneStagedNativeLibraries(
-        state.miscPath, modules.mapTo(mutableSetOf()) { it.packageName })
+    // rustFrida keeps module native code out of target processes. Vector now follows the same
+    // model: module APKs are DEX/script inputs only, and native inline hooks are installed by the
+    // core wxshadow engine. Prune every previously staged module library copy so stale native code
+    // cannot be mapped by system_server later.
+    FileSystem.pruneStagedNativeLibraries(state.miscPath, emptySet())
     return modules
   }
 
-  /**
-   * Hands a module bound for system_server the copy of its native libraries it can actually map.
-   *
-   * Only that scope needs one. Every other process may execute straight out of /data/app, so the
-   * in-APK entries the loader already builds serve them, and staging for them would buy nothing but
-   * disk. A module that ships no library, or whose staging failed, keeps a null here and loads
-   * exactly as it did before.
-   */
-  private fun stageNativeLibrariesFor(module: LoadedModule) {
-    val file = module.code ?: return
-    // system_server asks for its modules early enough that the cache may not have been built yet,
-    // and this is the same reason getPrefsPath does not trust the field either.
-    setupMiscPath()
-    val misc = state.miscPath ?: return
-    file.nativeLibraryDir =
-        FileSystem.stageNativeLibraries(misc, module.packageName, module.apkPath)
+  /** Keeps legacy native-library metadata from becoming a runtime library search path. */
+  private fun disableModuleNativeLibraries(module: LoadedModule) {
+    module.code?.nativeLibraryDir = null
   }
 
   fun getModuleApkPath(info: ApplicationInfo): String? {
@@ -598,7 +607,7 @@ object ConfigCache {
 
   fun shouldSkipProcess(scope: ProcessScope): Boolean {
     ensureCacheReady()
-    return !state.scopes.containsKey(scope)
+    return modulesForProcess(state.scopes, scope.processName, scope.uid).isEmpty()
   }
 
   fun getPrefsPath(packageName: String, uid: Int): String {

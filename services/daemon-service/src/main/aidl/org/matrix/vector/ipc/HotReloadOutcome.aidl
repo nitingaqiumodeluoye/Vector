@@ -8,7 +8,7 @@ package org.matrix.vector.ipc;
  */
 parcelable HotReloadOutcome {
     /**
-     * One of {@code IXposedService.HOT_RELOAD_*}, passed through unchanged so that nothing between
+     * One of {@code IWbService.HOT_RELOAD_*}, passed through unchanged so that nothing between
      * the module and the module app has to re-encode it.
      */
     int status;

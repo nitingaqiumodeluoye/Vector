@@ -15,18 +15,23 @@ import java.io.IOException;
 import java.lang.reflect.Executable;
 import java.util.Map;
 
-import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XC_MethodReplacement;
-import de.robv.android.xposed.XposedBridge;
-import de.robv.android.xposed.XposedHelpers;
-import de.robv.android.xposed.XposedInit;
-import de.robv.android.xposed.callbacks.XC_LoadPackage;
+import de.wwb.android.wbosed.XC_MethodHook;
+import de.wwb.android.wbosed.XC_MethodReplacement;
+import de.wwb.android.wbosed.XposedBridge;
+import de.wwb.android.wbosed.XposedHelpers;
+import de.wwb.android.wbosed.XposedInit;
+import de.wwb.android.wbosed.callbacks.XC_LoadPackage;
 
 /**
  * Implementation of the explicit dependency injection contract.
  * Translates modern lifecycle events and hooks into legacy Xposed API operations.
  */
 public class LegacyDelegateImpl implements LegacyFrameworkDelegate {
+
+    @Override
+    public void loadLegacyModules() {
+        XposedInit.loadLegacyModules();
+    }
 
     @Override
     public void loadModules(Object activityThread) {

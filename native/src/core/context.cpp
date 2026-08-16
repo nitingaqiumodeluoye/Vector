@@ -34,66 +34,77 @@ Context::PreloadedDex::~PreloadedDex() {
 }
 
 void Context::InitArtHooker(JNIEnv *env, const lsplant::InitInfo &initInfo) {
-    if (!lsplant::Init(env, initInfo)) {
+    const bool initialized = lsplant::Init(env, initInfo);
+    jni::SetLsplantInitialized(initialized);
+    if (!initialized) {
         LOGE("Failed to initialize LSPlant hooking framework.");
     }
 }
 
 void Context::InitHooks(JNIEnv *env) {
-    // -------------------------------------------------------------------------
-    // DEX Privilege Elevation
-    // -------------------------------------------------------------------------
-    // We traverse the DexPathList of the injected ClassLoader to access the
-    // underlying 'mCookie' for every loaded DEX file.
-    // The cookie provides a handle to the native C++ DexFile object in ART memory.
+    if (jni::IsLsplantInitialized()) {
+        // -------------------------------------------------------------------------
+        // DEX Privilege Elevation
+        // -------------------------------------------------------------------------
+        // We traverse the DexPathList of the injected ClassLoader to access the
+        // underlying 'mCookie' for every loaded DEX file.
+        // The cookie provides a handle to the native C++ DexFile object in ART memory.
 
-    // Retrieve the DexPathList object (holds the array of DEX elements).
-    auto path_list = lsplant::JNI_GetObjectFieldOf(env, inject_class_loader_, "pathList",
-                                                   "Ldalvik/system/DexPathList;");
-    if (!path_list) {
-        LOGE("InitHooks: Failed to retrieve 'pathList' from the injected class loader.");
-        return;
-    }
-
-    // Retrieve the 'dexElements' array, which contains the actual DEX files and resources.
-    auto elements = lsplant::JNI_Cast<jobjectArray>(lsplant::JNI_GetObjectFieldOf(
-        env, path_list, "dexElements", "[Ldalvik/system/DexPathList$Element;"));
-    if (!elements) {
-        LOGE("InitHooks: Failed to retrieve 'dexElements' from DexPathList.");
-        return;
-    }
-
-    // Iterate over every element in the DexPathList to process individual DEX files.
-    for (auto &element : elements) {
-        if (element.get() == nullptr) continue;
-
-        // extract the DexFile Java object from the element.
-        auto java_dex_file =
-            lsplant::JNI_GetObjectFieldOf(env, element, "dexFile", "Ldalvik/system/DexFile;");
-        if (!java_dex_file) {
-            // Not all elements are guaranteed to have a valid DexFile
-            // (e.g., resource-only elements).
-            LOGW("InitHooks: Encountered a dexElement with no associated DexFile.");
-            continue;
+        // Retrieve the DexPathList object (holds the array of DEX elements).
+        auto path_list = lsplant::JNI_GetObjectFieldOf(env, inject_class_loader_, "pathList",
+                                                       "Ldalvik/system/DexPathList;");
+        if (!path_list) {
+            LOGE("InitHooks: Failed to retrieve 'pathList' from the injected class loader.");
+            return;
         }
 
-        // Retrieve the 'mCookie'. In ART, this field stores the pointer (as a long or object)
-        // to the internal native DexFile structure.
-        auto cookie =
-            lsplant::JNI_GetObjectFieldOf(env, java_dex_file, "mCookie", "Ljava/lang/Object;");
-        if (!cookie) {
-            LOGW("InitHooks: Could not retrieve 'mCookie' (native handle) from DexFile.");
-            continue;
+        // Retrieve the 'dexElements' array, which contains the actual DEX files and resources.
+        auto elements = lsplant::JNI_Cast<jobjectArray>(lsplant::JNI_GetObjectFieldOf(
+            env, path_list, "dexElements", "[Ldalvik/system/DexPathList$Element;"));
+        if (!elements) {
+            LOGE("InitHooks: Failed to retrieve 'dexElements' from DexPathList.");
+            return;
         }
 
-        // Attempt to modify the internal ART flags for this DEX file.
-        // This effectively whitelists the DEX file, treating it as if it were part of
-        // the BootClassPath, thereby bypassing Hidden API enforcement policies.
-        if (lsplant::MakeDexFileTrusted(env, cookie.get())) {
-            LOGD("InitHooks: Successfully elevated trust privileges for DexFile.");
-        } else {
-            LOGW("InitHooks: Failed to elevate trust privileges for DexFile.");
+        // Iterate over every element in the DexPathList to process individual DEX files.
+        for (auto &element : elements) {
+            if (element.get() == nullptr) continue;
+
+            // extract the DexFile Java object from the element.
+            auto java_dex_file =
+                lsplant::JNI_GetObjectFieldOf(env, element, "dexFile", "Ldalvik/system/DexFile;");
+            if (!java_dex_file) {
+                // Not all elements are guaranteed to have a valid DexFile
+                // (e.g., resource-only elements).
+                LOGW("InitHooks: Encountered a dexElement with no associated DexFile.");
+                continue;
+            }
+
+            // Retrieve the 'mCookie'. In ART, this field stores the pointer (as a long or object)
+            // to the internal native DexFile structure.
+            auto cookie =
+                lsplant::JNI_GetObjectFieldOf(env, java_dex_file, "mCookie", "Ljava/lang/Object;");
+            if (!cookie) {
+                LOGW("InitHooks: Could not retrieve 'mCookie' (native handle) from DexFile.");
+                continue;
+            }
+
+            // Attempt to modify the internal ART flags for this DEX file.
+            // This effectively whitelists the DEX file, treating it as if it were part of
+            // the BootClassPath, thereby bypassing Hidden API enforcement policies.
+            if (lsplant::MakeDexFileTrusted(env, cookie.get())) {
+                LOGD("InitHooks: Successfully elevated trust privileges for DexFile.");
+            } else {
+                LOGW("InitHooks: Failed to elevate trust privileges for DexFile.");
+            }
         }
+    } else {
+        // Keep the ordinary-app no-ART-bootstrap path aligned with rustFrida wxshadow:
+        // rustFrida does not call LSPlant DexFile trust here. It only attempts
+        // VMRuntime.setHiddenApiExemptions when Java reflection support is lazily initialized in
+        // quickjs-hook/src/jsapi/java/reflect.rs::cache_reflect_ids(), not during ordinary process
+        // bootstrap.
+        LOGI("InitHooks: LSPlant is not initialized; skipping DexFile trust elevation.");
     }
 
     // -------------------------------------------------------------------------

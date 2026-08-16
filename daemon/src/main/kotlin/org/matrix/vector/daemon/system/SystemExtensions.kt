@@ -146,6 +146,11 @@ fun IPackageManager.getPackageInfoWithComponents(
 fun PackageInfo.fetchProcesses(): Set<String> {
   val processNames = mutableSetOf<String>()
 
+  // Match rustFrida's package-name flow: a package target resolves through the manifest's
+  // application/activity process, so the framework must not require users to scope a concrete
+  // `package:process` name by hand.
+  applicationInfo?.processName?.takeIf { it.isNotBlank() }?.let { processNames.add(it) }
+
   val componentArrays = arrayOf(activities, receivers, providers)
   for (components in componentArrays) {
     components?.forEach { processNames.add(it.processName) }

@@ -118,7 +118,7 @@ fun Context.daemonPackageEventsFlow(): Flow<PackageEvent> = callbackFlow {
     // can forge one of these. That is acceptable for exactly one reason: a delivery makes the
     // manager drop a cache and ask the daemon for it again, and nothing else. Nothing is believed
     // on the strength of the payload — the collector does not even read which package an event
-    // names, and the "isXposedModule" flag the daemon also sends is deliberately never read here,
+    // names, and the "isWbModule" flag the daemon also sends is deliberately never read here,
     // because whether a package is a module is settled by inspecting its APK.
     val registered =
         runCatching {

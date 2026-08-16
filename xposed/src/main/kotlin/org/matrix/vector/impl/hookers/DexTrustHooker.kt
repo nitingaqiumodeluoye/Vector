@@ -1,15 +1,15 @@
 package org.matrix.vector.impl.hookers
 
 import android.os.Build
-import io.github.libxposed.api.XposedInterface
+import de.wwb.android.wbosed.api.WbInterface
 import org.matrix.vector.nativebridge.HookBridge
 
 /**
  * Intercepts DEX file parsing to dynamically mark our framework's ClassLoader as trusted. Prevents
  * ART from blocking reflective access by the hooking engine.
  */
-object DexTrustHooker : XposedInterface.Hooker {
-    override fun intercept(chain: XposedInterface.Chain): Any? {
+object DexTrustHooker : WbInterface.Hooker {
+    override fun intercept(chain: WbInterface.Chain): Any? {
         val result = chain.proceed()
 
         var classLoader = chain.args.filterIsInstance<ClassLoader>().firstOrNull()

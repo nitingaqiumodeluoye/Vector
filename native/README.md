@@ -15,7 +15,7 @@ This module defines the central abstractions and manages the runtime state. It's
 
 -   **`Context`**: An abstract base class that defines the injection lifecycle. It contains pure virtual methods like `LoadDex` and `SetupEntryClass`. The consumer of this library (e.g., the Zygisk module) must inherit from `Context` and provide the concrete implementations for these steps.
 -   **`ConfigBridge`**: A simple, native-side singleton that acts as a cache for configuration data (specifically, the obfuscation map) that is fetched and provided by the consumer.
--   **`native_api`**: Implements the native module support system. It works by hooking the system's `do_dlopen` function. When it detects a registered module library being loaded, it calls that library's `native_init` entry point, providing it with a set of [API](include/core/native_api.h)s for creating its own native hooks.
+-   **`native_api`**: Provides Vector core's internal wxshadow native hook helpers and a compatibility no-op for the old native-module registration API. In rustFrida-aligned mode, module APKs are DEX/script inputs only; third-party module `.so` files are not loaded from target processes.
 
 ### `elf` - Symbol Resolution
 
