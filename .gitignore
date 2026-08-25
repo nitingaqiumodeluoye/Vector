@@ -15,3 +15,16 @@ bin/
 /.gradle-user-home/
 # Local crash/tombstone/logcat captures.
 /logs/
+
+# Local hooking/debug diagnostic artifacts (hunter logcat/dmesg dumps).
+/artifacts/
+
+# Gradle wrapper distribution download cache.
+/wrapper/
+
+# JNA / native-platform native library caches pulled in by local tooling.
+/native/jansi/
+/native/native-platform-*/
+
+# Runtime lock files dropped next to the daemon by local runs.
+/daemon/9.6.1/
