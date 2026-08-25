@@ -5,6 +5,7 @@ project(native)
 set(CMAKE_CXX_STANDARD 23)
 
 add_subdirectory(${VECTOR_ROOT}/external external)
+add_subdirectory(${VECTOR_ROOT}/external/soLoader/src so_loader)
 
 file(GLOB_RECURSE NATIVE_SOURCES "src/*.cpp")
 set(ART_HOOK_SOURCES)
@@ -55,7 +56,10 @@ target_compile_options(${PROJECT_NAME} PRIVATE -Wpedantic ${IGNORED_WARNINGS})
 target_link_libraries(${PROJECT_NAME} PUBLIC
     dobby_static
     lsplant_static
+    elf_loader_core
     xz_static
+    android
+    dl
     log # Android logging library
     fmt-header-only
 )
