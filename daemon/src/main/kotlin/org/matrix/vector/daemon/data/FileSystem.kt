@@ -3,6 +3,7 @@ package org.matrix.vector.daemon.data
 import android.content.res.AssetManager
 import android.content.res.Resources
 import android.os.Binder
+import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.os.Process
 import android.os.RemoteException
@@ -70,7 +71,9 @@ object FileSystem {
   val modulePath: Path = basePath.resolve("modules")
   val socketPath: Path = basePath.resolve(".cli_sock")
   val daemonApkPath: Path = Paths.get(System.getProperty("java.class.path", ""))
-  val managerApkPath: Path = daemonApkPath.parent.resolve("manager.apk")
+  private val moduleDirPath: Path =
+      Paths.get(System.getProperty("vector.module.dir", daemonApkPath.parent?.toString() ?: "."))
+  val managerApkPath: Path = moduleDirPath.resolve("manager.apk")
   val configDirPath: Path = basePath.resolve("config")
   val dbPath: File = configDirPath.resolve("modules_config.db").toFile()
 
@@ -92,7 +95,7 @@ object FileSystem {
   }
 
   fun setupCli(): String {
-    val cliSource = daemonApkPath.parent.resolve("cli").toFile()
+    val cliSource = moduleDirPath.resolve("cli").toFile()
     val cliDest = basePath.resolve("cli").toFile()
     if (cliSource.exists()) {
       runCatching {
@@ -185,6 +188,41 @@ object FileSystem {
     return memory
   }
 
+  /** Copies one module ELF into sealed SharedMemory for Vector's anonymous ELF loader. */
+  private fun readNativeLibrary(inputStream: InputStream, size: Long): SharedMemory {
+    require(size in 1..Int.MAX_VALUE) { "Invalid native library size: $size" }
+    val memory = SharedMemory.create(null, size.toInt())
+    try {
+      val byteBuffer = memory.mapReadWrite()
+      try {
+        Channels.newChannel(inputStream).use { channel ->
+          while (byteBuffer.hasRemaining()) {
+            check(channel.read(byteBuffer) >= 0) { "Unexpected EOF while reading native library" }
+          }
+        }
+        Log.i(
+            TAG,
+            "Prepared native SharedMemory size=$size magic=%02x %02x %02x %02x"
+                .format(
+                    byteBuffer.get(0).toInt() and 0xff,
+                    byteBuffer.get(1).toInt() and 0xff,
+                    byteBuffer.get(2).toInt() and 0xff,
+                    byteBuffer.get(3).toInt() and 0xff))
+      } finally {
+        SharedMemory.unmap(byteBuffer)
+      }
+      // Native module ELF text can be mapped executable by Vector's soLoader from this sealed
+      // SharedMemory FD. Keep it non-writable; DEX SharedMemory above remains read-only.
+      check(memory.setProtect(OsConstants.PROT_READ or OsConstants.PROT_EXEC)) {
+        "Unable to seal native library memory as read/exec"
+      }
+      return memory
+    } catch (error: Throwable) {
+      memory.close()
+      throw error
+    }
+  }
+
   /**
    * The packages a module claims, when its module.prop fixes the scope. Null when it does not, so
    * a caller can tell "claims nothing" from "claims no restriction".
@@ -231,9 +269,8 @@ object FileSystem {
   /**
    * Parses the module APK and loads DEXes into SharedMemory.
    *
-   * native_init lists are retained as legacy metadata only. rustFrida keeps user/module native code
-   * out of target processes; Vector follows that model and installs native inline hooks from the
-   * core wxshadow engine instead.
+   * Native entry libraries are copied into sealed SharedMemory and later loaded only through
+   * Vector's anonymous ELF loader; the APK path is never exposed to Android's linker.
    */
   fun loadModule(apkPath: String, obfuscate: Boolean): ModuleLoad {
     val file = File(apkPath)
@@ -243,6 +280,7 @@ object FileSystem {
     val preLoadedDexes = mutableListOf<SharedMemory>()
     val moduleClassNames = mutableListOf<String>()
     val moduleLibraryNames = mutableListOf<String>()
+    val preLoadedNativeLibraries = mutableListOf<SharedMemory>()
     var isLegacy = false
     var exceptionPassthrough = false
     var targetApiVersion = 0
@@ -301,13 +339,13 @@ object FileSystem {
               "MODERN" -> {
                 isLegacy = false
                 readList("META-INF/xposed/java_init.list", moduleClassNames)
-                // Compatibility metadata only; never converted into a runtime library search path.
+                // The APK path is never exposed as a runtime linker search path.
                 readList("META-INF/xposed/native_init.list", moduleLibraryNames)
               }
               "LEGACY" -> {
                 isLegacy = true
                 readList("assets/xposed_init", moduleClassNames)
-                // Compatibility metadata only; never converted into a runtime library search path.
+                // The APK path is never exposed as a runtime linker search path.
                 readList("assets/native_init", moduleLibraryNames)
               }
               "UNSUPPORTED" -> {
@@ -318,6 +356,23 @@ object FileSystem {
             }
 
             if (moduleClassNames.isEmpty()) return ModuleLoad.Unusable
+
+            val abi = Build.SUPPORTED_64_BIT_ABIS.firstOrNull { it == "arm64-v8a" }
+            for (libraryName in moduleLibraryNames) {
+              require(
+                  libraryName.endsWith(".so") &&
+                      !libraryName.contains('/') &&
+                      !libraryName.contains('\\')
+              ) {
+                "Invalid native module library name: $libraryName"
+              }
+              if (abi == null) error("Vector soLoader currently requires arm64-v8a")
+              val entry = zip.getEntry("lib/$abi/$libraryName")
+                  ?: error("Native module library is missing from APK: $libraryName")
+              zip.getInputStream(entry).use {
+                preLoadedNativeLibraries.add(readNativeLibrary(it, entry.size))
+              }
+            }
 
             // Read DEX files
             var secondary = 1
@@ -330,6 +385,8 @@ object FileSystem {
           }
         }
         .onFailure {
+          preLoadedNativeLibraries.forEach { memory -> runCatching { memory.close() } }
+          preLoadedDexes.forEach { memory -> runCatching { memory.close() } }
           Log.e(TAG, "Failed to load module $apkPath", it)
           return ModuleLoad.Unusable
         }
@@ -351,6 +408,7 @@ object FileSystem {
       this.preLoadedDexes = preLoadedDexes
       this.moduleClassNames = moduleClassNames
       this.moduleLibraryNames = moduleLibraryNames
+      this.preLoadedNativeLibraries = preLoadedNativeLibraries
       this.legacy = isLegacy
       this.exceptionPassthrough = exceptionPassthrough
       this.targetApiVersion = targetApiVersion

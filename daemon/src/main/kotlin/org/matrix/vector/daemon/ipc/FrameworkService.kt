@@ -5,6 +5,8 @@ import android.os.Parcel
 import android.os.ParcelFileDescriptor
 import android.os.Process
 import android.os.RemoteException
+import android.os.SharedMemory
+import android.system.OsConstants
 import android.util.Log
 import de.wwb.android.wbosed.service.HookedProcess
 import java.util.concurrent.ConcurrentHashMap
@@ -13,6 +15,7 @@ import java.util.concurrent.atomic.AtomicLong
 import org.matrix.vector.ipc.LoadedModule
 import org.matrix.vector.ipc.IProcessChannel
 import org.matrix.vector.ipc.IFrameworkService
+import org.matrix.vector.ipc.ModuleCode
 import org.matrix.vector.daemon.data.ConfigCache
 import org.matrix.vector.daemon.data.FileSystem
 import org.matrix.vector.daemon.system.FIRST_APPLICATION_UID
@@ -22,6 +25,8 @@ import org.matrix.vector.daemon.utils.ObfuscationManager
 
 private const val TAG = "VectorFrameworkService"
 
+private fun elapsedUs(startNs: Long): Long = (System.nanoTime() - startNs) / 1_000L
+
 // Hardcoded transaction code from BridgeService
 const val BRIDGE_TRANSACTION_CODE =
     ('_'.code shl 24) or ('V'.code shl 16) or ('E'.code shl 8) or 'C'.code
@@ -29,6 +34,9 @@ const val DEX_TRANSACTION_CODE =
     ('_'.code shl 24) or ('D'.code shl 16) or ('E'.code shl 8) or 'X'.code
 const val OBFUSCATION_MAP_TRANSACTION_CODE =
     ('_'.code shl 24) or ('O'.code shl 16) or ('B'.code shl 8) or 'F'.code
+private const val FRAMEWORK_DESCRIPTOR = "org.matrix.vector.ipc.IFrameworkService"
+private const val GET_LEGACY_MODULES_TRANSACTION = IBinder.FIRST_CALL_TRANSACTION + 1
+private const val GET_MODULES_TRANSACTION = IBinder.FIRST_CALL_TRANSACTION + 2
 
 /**
  * What an injected process asks the framework for — this project's `IFrameworkService`.
@@ -223,6 +231,35 @@ object FrameworkService : IFrameworkService.Stub() {
 
   override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
     when (code) {
+      GET_LEGACY_MODULES_TRANSACTION -> {
+        data.enforceInterface(FRAMEWORK_DESCRIPTOR)
+        reply?.writeNoException()
+        val startNs = System.nanoTime()
+        val callerUid = getCallingUid()
+        val callerPid = getCallingPid()
+        Log.i(
+            TAG,
+            "[startup-trace] legacyModules transact begin uid=$callerUid pid=$callerPid",
+        )
+        val modules = getLegacyModules()
+        val queryUs = elapsedUs(startNs)
+        val writeStartNs = System.nanoTime()
+        reply?.writeTypedList(modules)
+        val writeUs = elapsedUs(writeStartNs)
+        Log.i(
+            TAG,
+            "[startup-trace] legacyModules transact end uid=$callerUid pid=$callerPid " +
+                "count=${modules.size} queryUs=$queryUs writeUs=$writeUs " +
+                "totalUs=${elapsedUs(startNs)}",
+        )
+        return true
+      }
+      GET_MODULES_TRANSACTION -> {
+        data.enforceInterface(FRAMEWORK_DESCRIPTOR)
+        reply?.writeNoException()
+        reply?.writeTypedList(getModules())
+        return true
+      }
       DEX_TRANSACTION_CODE -> {
         val shm = FileSystem.getPreloadDex(ConfigCache.state.isDexObfuscateEnabled) ?: return false
         reply?.writeNoException()
@@ -265,21 +302,172 @@ object FrameworkService : IFrameworkService.Stub() {
     return info
   }
 
-  private fun getAllModules(): List<LoadedModule> {
-    val info = ensureRegistered()
-    if (info.key.uid == Process.SYSTEM_UID && info.processName == "system") {
-      return ConfigCache.getModulesForSystemServer()
+  private fun magicOf(buffer: java.nio.ByteBuffer): String =
+      if (buffer.capacity() >= 4) {
+        "%02x %02x %02x %02x"
+            .format(
+                buffer.get(0).toInt() and 0xff,
+                buffer.get(1).toInt() and 0xff,
+                buffer.get(2).toInt() and 0xff,
+                buffer.get(3).toInt() and 0xff)
+      } else {
+        "<too-small:${buffer.capacity()}>"
+      }
+
+  private fun cloneSharedMemory(
+      memory: SharedMemory,
+      label: String? = null,
+      protectFlags: Int = OsConstants.PROT_READ,
+  ): SharedMemory {
+    val source = memory.mapReadOnly()
+    var clone: SharedMemory? = null
+    try {
+      val copy = SharedMemory.create(null, source.capacity())
+      clone = copy
+      val destination = copy.mapReadWrite()
+      try {
+        destination.put(source.duplicate())
+      } finally {
+        SharedMemory.unmap(destination)
+      }
+      check(copy.setProtect(protectFlags)) { "Unable to seal module SharedMemory clone" }
+      label?.let {
+        val check = copy.mapReadOnly()
+        try {
+          Log.i(
+              TAG,
+              "Cloned module SharedMemory $it size=${source.capacity()} " +
+                  "sourceMagic=${magicOf(source)} cloneMagic=${magicOf(check)}")
+        } finally {
+          SharedMemory.unmap(check)
+        }
+      }
+      clone = null
+      return copy
+    } finally {
+      SharedMemory.unmap(source)
+      clone?.close()
     }
-    if (ManagerService.isRunningManager(getCallingPid(), info.key.uid)) {
-      return emptyList()
-    }
-    return ConfigCache.getModulesForProcess(info.processName, info.key.uid)
   }
 
-  override fun getModules() =
-      getAllModules().filter { !it.code.legacy }.also { recordHotReloadTargets(ensureRegistered(), it) }
+  private fun cloneSharedMemoryList(
+      memories: List<SharedMemory>?,
+      labelPrefix: String? = null,
+      protectFlags: Int = OsConstants.PROT_READ,
+  ): List<SharedMemory> {
+    if (memories.isNullOrEmpty()) return emptyList()
+    val clones = ArrayList<SharedMemory>(memories.size)
+    try {
+      memories.forEachIndexed { index, memory ->
+        clones.add(cloneSharedMemory(memory, labelPrefix?.let { "$it[$index]" }, protectFlags))
+      }
+      return clones
+    } catch (error: Throwable) {
+      clones.forEach { memory -> runCatching { memory.close() } }
+      throw error
+    }
+  }
 
-  override fun getLegacyModules() = getAllModules().filter { it.code.legacy }
+  private fun cloneModuleForReply(module: LoadedModule): LoadedModule {
+    val code = module.code
+    val clonedCode =
+        ModuleCode().apply {
+          preLoadedDexes = cloneSharedMemoryList(code.preLoadedDexes)
+          moduleClassNames = code.moduleClassNames?.toList().orEmpty()
+          moduleLibraryNames = code.moduleLibraryNames?.toList().orEmpty()
+          preLoadedNativeLibraries =
+              cloneSharedMemoryList(
+                  code.preLoadedNativeLibraries,
+                  "${module.packageName}:native",
+                  OsConstants.PROT_READ or OsConstants.PROT_EXEC)
+          legacy = code.legacy
+          targetApiVersion = code.targetApiVersion
+          autoHotReload = code.autoHotReload
+          exceptionPassthrough = code.exceptionPassthrough
+          nativeLibraryDir = code.nativeLibraryDir
+        }
+    return LoadedModule().apply {
+      packageName = module.packageName
+      appId = module.appId
+      versionCode = module.versionCode
+      apkPath = module.apkPath
+      this.code = clonedCode
+      applicationInfo = module.applicationInfo
+      service = module.service
+    }
+  }
+
+  private fun cloneModulesForReply(modules: List<LoadedModule>): List<LoadedModule> =
+      modules.map { module ->
+        runCatching { cloneModuleForReply(module) }
+            .onFailure { Log.e(TAG, "Failed to clone module ${module.packageName} for IPC", it) }
+            .getOrThrow()
+      }
+
+  private fun getAllModules(): List<LoadedModule> {
+    val startNs = System.nanoTime()
+    val callerUid = getCallingUid()
+    val callerPid = getCallingPid()
+    val registerStartNs = System.nanoTime()
+    val info = ensureRegistered()
+    val registerUs = elapsedUs(registerStartNs)
+    if (info.key.uid == Process.SYSTEM_UID && info.processName == "system") {
+      val systemStartNs = System.nanoTime()
+      val modules = ConfigCache.getModulesForSystemServer()
+      Log.i(
+          TAG,
+          "[startup-trace] legacyModules getAll system_server uid=$callerUid pid=$callerPid " +
+              "registerUs=$registerUs systemConfigUs=${elapsedUs(systemStartNs)} " +
+              "count=${modules.size} totalUs=${elapsedUs(startNs)}")
+      return modules
+    }
+    val managerStartNs = System.nanoTime()
+    val isManager = ManagerService.isRunningManager(callerPid, info.key.uid)
+    val managerUs = elapsedUs(managerStartNs)
+    if (isManager) {
+      Log.i(
+          TAG,
+          "[startup-trace] legacyModules getAll manager uid=$callerUid pid=$callerPid " +
+              "registerUs=$registerUs managerCheckUs=$managerUs count=0 " +
+              "totalUs=${elapsedUs(startNs)}")
+      return emptyList()
+    }
+    val configStartNs = System.nanoTime()
+    val modules = ConfigCache.getModulesForProcess(info.processName, info.key.uid)
+    Log.i(
+        TAG,
+        "[startup-trace] legacyModules getAll process=${info.processName} " +
+            "uid=${info.key.uid} pid=${info.key.pid} registerUs=$registerUs " +
+            "managerCheckUs=$managerUs configUs=${elapsedUs(configStartNs)} " +
+            "count=${modules.size} totalUs=${elapsedUs(startNs)}")
+    return modules
+  }
+
+  override fun getModules(): List<LoadedModule> {
+    val info = ensureRegistered()
+    val modules = getAllModules().filter { !it.code.legacy }
+    recordHotReloadTargets(info, modules)
+    return cloneModulesForReply(modules)
+  }
+
+  override fun getLegacyModules(): List<LoadedModule> {
+    val startNs = System.nanoTime()
+    val allStartNs = System.nanoTime()
+    val allModules = getAllModules()
+    val allUs = elapsedUs(allStartNs)
+    val filterStartNs = System.nanoTime()
+    val legacyModules = allModules.filter { it.code.legacy }
+    val filterUs = elapsedUs(filterStartNs)
+    val cloneStartNs = System.nanoTime()
+    val result = cloneModulesForReply(legacyModules)
+    val cloneUs = elapsedUs(cloneStartNs)
+    Log.i(
+        TAG,
+        "[startup-trace] legacyModules query end allCount=${allModules.size} " +
+            "legacyCount=${legacyModules.size} resultCount=${result.size} allUs=$allUs " +
+            "filterUs=$filterUs cloneUs=$cloneUs totalUs=${elapsedUs(startNs)}")
+    return result
+  }
 
   override fun isLogMuted(): Boolean = !ManagerService.isVerboseLogEnabled()
 

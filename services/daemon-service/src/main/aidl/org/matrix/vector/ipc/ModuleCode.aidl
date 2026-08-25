@@ -25,11 +25,11 @@ parcelable ModuleCode {
      */
     List<String> moduleClassNames;
 
-    /**
-     * Legacy native_init metadata. Target processes ignore these entries in rustFrida-aligned
-     * mode; module APKs do not provide runtime native libraries.
-     */
+    /** Native entry library names, resolved from the APK and loaded only by Vector soLoader. */
     List<String> moduleLibraryNames;
+
+    /** Native ELF images in the same order as moduleLibraryNames, sealed for Vector soLoader. */
+    List<SharedMemory> preLoadedNativeLibraries;
 
     /** True for a module selected by {@code assets/xposed_init} rather than by targetApiVersion. */
     boolean legacy;
@@ -67,11 +67,8 @@ parcelable ModuleCode {
     boolean exceptionPassthrough;
 
     /**
-     * Legacy native-library staging path. Kept for parcel compatibility; target processes no
-     * longer use module-provided native libraries.
-     *
-     * <p>Null when the module ships none for this ABI, when staging failed, or when the module was
-     * never destined for system_server in the first place.</p>
+     * Legacy compatibility field. It is never used as a target-process native library search path
+     * and must not point into a module APK.
      */
     @nullable String nativeLibraryDir;
 }

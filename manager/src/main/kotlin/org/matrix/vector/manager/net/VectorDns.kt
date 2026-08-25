@@ -69,7 +69,10 @@ sealed interface DohStatus {
  * client would drop the connection pool and orphan the disk cache, so reading them here is what
  * lets a switch — or joining a VPN — take effect before the next process start.
  */
-class VectorDns(private val settings: SettingsRepository, bootstrapClient: OkHttpClient) : Dns {
+class VectorDns(
+    private val settings: SettingsRepository,
+    private val bootstrapClient: OkHttpClient,
+) : Dns {
 
     private val endpoint = "https://cloudflare-dns.com/dns-query".toHttpUrl()
 
@@ -86,15 +89,27 @@ class VectorDns(private val settings: SettingsRepository, bootstrapClient: OkHtt
      */
     @Volatile private var dohUnavailable = false
 
+    /**
+     * Whether the session has probed the DoH endpoint yet.
+     *
+     * The probe is the first lookup's budget guard: it runs once, with the short timeouts above,
+     * and its outcome either latches [dohUnavailable] (unreachable) or lets the real lookup go
+     * ahead. Without it, the very first name in the process would pay the full per-address timeout.
+     */
+    @Volatile private var dohProbed = false
+
     private val doh: DnsOverHttps by lazy {
         DnsOverHttps.Builder()
             .client(
                 bootstrapClient
                     .newBuilder()
                     // Fail fast. The default connect timeout is long enough that a blocked
-                    // endpoint reads as a hung app rather than as a fallback about to happen.
-                    .connectTimeout(3, TimeUnit.SECONDS)
-                    .callTimeout(5, TimeUnit.SECONDS)
+                    // endpoint reads as a hung app rather than as a fallback about to happen. The
+                    // first lookup additionally pays the full timeout, and it runs on the
+                    // OkHttp dispatcher for every first request in the app; shorter bounds here
+                    // are what keep that one payment a second or two instead of six.
+                    .connectTimeout(2, TimeUnit.SECONDS)
+                    .callTimeout(3, TimeUnit.SECONDS)
                     .build()
             )
             .url(endpoint)
@@ -132,6 +147,7 @@ class VectorDns(private val settings: SettingsRepository, bootstrapClient: OkHtt
      */
     fun retry() {
         dohUnavailable = false
+        dohProbed = false
         _status.value = DohStatus.Untested
     }
 
@@ -141,6 +157,42 @@ class VectorDns(private val settings: SettingsRepository, bootstrapClient: OkHtt
         } else if (!direct()) {
             _status.value = DohStatus.Bypassed
         } else if (!dohUnavailable) {
+            // First lookup of the session: probe the endpoint with a very short budget before
+            // committing the real timeout. A blocked endpoint costs ~0.5s instead of
+            // (2s connect + 3s call) per bootstrap address, and the probe latches the same
+            // `dohUnavailable` flag the failure path below sets, so the next name goes straight
+            // to the system resolver. The probe uses its own 500ms-budget client so a healthy
+            // endpoint costs the probe only a fraction of the real lookup's time.
+            if (!dohProbed) {
+                dohProbed = true
+                val probeClient =
+                    bootstrapClient
+                        .newBuilder()
+                        .connectTimeout(500, TimeUnit.MILLISECONDS)
+                        .callTimeout(800, TimeUnit.MILLISECONDS)
+                        .build()
+                val reachable =
+                    runCatching {
+                            val probe =
+                                DnsOverHttps.Builder()
+                                    .client(probeClient)
+                                    .url(endpoint)
+                                    .bootstrapDnsHosts(
+                                        InetAddress.getByName("1.1.1.1"),
+                                        InetAddress.getByName("2606:4700:4700::1111"),
+                                    )
+                                    .includeIPv6(true)
+                                    .build()
+                            probe.lookup(endpoint.host).isNotEmpty()
+                        }
+                        .getOrDefault(false)
+                if (!reachable) {
+                    dohUnavailable = true
+                    _status.value = DohStatus.FellBack("probe failed before first lookup")
+                    logW("dns: DoH endpoint unreachable on first probe, using system resolver")
+                    return Dns.SYSTEM.lookup(hostname)
+                }
+            }
             try {
                 val resolved = doh.lookup(hostname)
                 _status.value = DohStatus.Working(hostname)

@@ -26,6 +26,8 @@ import org.matrix.vector.daemon.utils.getRealUsers
 
 private const val TAG = "VectorConfigCache"
 
+private fun elapsedUs(startNs: Long): Long = (System.nanoTime() - startNs) / 1_000L
+
 object ConfigCache {
   // Module preference operations are delegated to PreferenceStore
   // Writable operations of modules are delegated to ModuleDatabase
@@ -66,18 +68,50 @@ object ConfigCache {
   }
 
   private fun ensureCacheReady() {
-    if (!state.isCacheReady && packageManager?.asBinder()?.isBinderAlive == true) {
-      // The rebuild lock, not `this`: this is the one place that starts a rebuild without going
-      // through the channel, so it has to queue behind a rebuild already in flight rather than
-      // merely behind the short swaps that publish one.
-      synchronized(rebuildLock) {
-        if (!state.isCacheReady) {
-          Log.i(TAG, "System services are ready. Mapping modules and scopes.")
-          updateManager(false)
-          setupMiscPath()
-          performCacheUpdate()
-          synchronized(this) { state = state.copy(isCacheReady = true) }
-        }
+    if (state.isCacheReady) return
+
+    val startNs = System.nanoTime()
+    val packageManagerAlive = packageManager?.asBinder()?.isBinderAlive == true
+    if (!packageManagerAlive) {
+      Log.w(
+          TAG,
+          "[startup-trace] ensureCacheReady skipped cacheReady=false " +
+              "packageManagerAlive=false elapsedUs=${elapsedUs(startNs)}")
+      return
+    }
+
+    Log.i(TAG, "[startup-trace] ensureCacheReady begin cacheReady=false")
+    val lockWaitStartNs = System.nanoTime()
+    // The rebuild lock, not `this`: this is the one place that starts a rebuild without going
+    // through the channel, so it has to queue behind a rebuild already in flight rather than
+    // merely behind the short swaps that publish one.
+    synchronized(rebuildLock) {
+      val lockWaitUs = elapsedUs(lockWaitStartNs)
+      if (!state.isCacheReady) {
+        Log.i(
+            TAG,
+            "[startup-trace] ensureCacheReady lock acquired waitUs=$lockWaitUs")
+        Log.i(TAG, "System services are ready. Mapping modules and scopes.")
+        val managerStartNs = System.nanoTime()
+        updateManager(false)
+        val managerUs = elapsedUs(managerStartNs)
+        val miscStartNs = System.nanoTime()
+        setupMiscPath()
+        val miscUs = elapsedUs(miscStartNs)
+        val updateStartNs = System.nanoTime()
+        performCacheUpdate()
+        val updateUs = elapsedUs(updateStartNs)
+        synchronized(this) { state = state.copy(isCacheReady = true) }
+        Log.i(
+            TAG,
+            "[startup-trace] ensureCacheReady end rebuilt=true waitUs=$lockWaitUs " +
+                "managerUs=$managerUs miscUs=$miscUs cacheUpdateUs=$updateUs " +
+                "totalUs=${elapsedUs(startNs)}")
+      } else {
+        Log.i(
+            TAG,
+            "[startup-trace] ensureCacheReady end rebuilt=false " +
+                "waitUs=$lockWaitUs totalUs=${elapsedUs(startNs)}")
       }
     }
   }
@@ -453,12 +487,26 @@ object ConfigCache {
   }
 
   fun getModulesForProcess(processName: String, uid: Int): List<LoadedModule> {
+    val startNs = System.nanoTime()
+    Log.i(
+        TAG,
+        "[startup-trace] getModulesForProcess begin process=$processName uid=$uid " +
+            "cacheReady=${state.isCacheReady}")
+    val readyStartNs = System.nanoTime()
     ensureCacheReady()
+    val readyUs = elapsedUs(readyStartNs)
     if (processName == "system_server") {
       Log.w(TAG, "Skip unexpected module queries for $processName")
       return emptyList()
     }
-    return modulesForProcess(state.scopes, processName, uid)
+    val lookupStartNs = System.nanoTime()
+    val modules = modulesForProcess(state.scopes, processName, uid)
+    Log.i(
+        TAG,
+        "[startup-trace] getModulesForProcess end process=$processName uid=$uid " +
+            "count=${modules.size} readyUs=$readyUs lookupUs=${elapsedUs(lookupStartNs)} " +
+            "totalUs=${elapsedUs(startNs)}")
+    return modules
   }
 
   private fun modulesForProcess(

@@ -2,6 +2,8 @@ package org.matrix.vector.manager.ui
 
 import android.content.Intent
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -36,11 +38,6 @@ class MainActivity : ComponentActivity() {
         // without it.
         ServiceLocator.attach(this)
 
-        // Started here rather than from the panels that need it: the splash is dead time the app
-        // is spending anyway, and these reads are what makes a panel's first visit slower than its
-        // second. By the time the splash has played, most of them have already answered.
-        ServiceLocator.prefetch()
-
         // The launcher copies the label and icon when the shortcut is pinned and keeps its copy, so
         // a pinned shortcut otherwise represents Vector with whatever build pinned it for as long as
         // it lives. A no-op unless one is pinned, and unless this manager is the parasitic one.
@@ -66,6 +63,12 @@ class MainActivity : ComponentActivity() {
         DeepLink.offerFromCreate(intent)
 
         setContent { LocalizedContent { VectorTheme { SplashGate { VectorApp() } } } }
+
+        // Do not compete with the first Compose frame. In a parasitic shell process, enumerating
+        // installed packages plus the cached catalog can allocate tens of MB and trigger a long
+        // stop-the-world GC, leaving the manager visibly black. Start the same idempotent warm-up
+        // after the frame has been handed to SurfaceFlinger.
+        Handler(Looper.getMainLooper()).postDelayed({ ServiceLocator.prefetch() }, 750L)
     }
 
     /**
