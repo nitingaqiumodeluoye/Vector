@@ -2549,16 +2549,27 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
                                uint64_t current_pc_hint,
                                int use_blr,
                                int pre_scan) {
+    uint64_t perf_start = hook_perf_enabled() ? hook_perf_now_ns() : 0;
+    uint64_t stage_start = perf_start;
     if (!g_engine.initialized || !target) {
         return NULL;
+    }
+    if (perf_start != 0) {
+        hook_log("[perf] art_router begin target=%p stealth=%d pre_scan=%d skip_resolve=%d",
+                 target, stealth, pre_scan, skip_resolve);
     }
 
     /* Resolve tiny ART trampolines (LDR+BR 8 bytes) to actual target */
     if (!skip_resolve) {
+        stage_start = perf_start != 0 ? hook_perf_now_ns() : 0;
         void* resolved = resolve_art_trampoline(target, jni_env);
         if (resolved != target) {
             hook_log("[art_router] resolved %p → %p", target, resolved);
             target = resolved;
+        }
+        if (stage_start != 0) {
+            hook_log("[perf] art_router stage=resolve target=%p elapsedUs=%llu",
+                     target, (unsigned long long)hook_perf_elapsed_us(stage_start));
         }
     }
 
@@ -2574,6 +2585,10 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
     if (existing) {
         void* trampoline = existing->trampoline;
         hook_unlock(&g_engine.lock);
+        if (perf_start != 0) {
+            hook_log("[perf] art_router end target=%p result=existing elapsedUs=%llu",
+                     target, (unsigned long long)hook_perf_elapsed_us(perf_start));
+        }
         return trampoline;
     }
 
@@ -2590,8 +2605,14 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
      * Keep enough headroom to avoid Arm64Writer's overflow abort in-app. */
     size_t art_thunk_alloc = pre_scan ? 32768 : 16384;
     if (!entry->thunk || entry->thunk_alloc < art_thunk_alloc) {
+        stage_start = perf_start != 0 ? hook_perf_now_ns() : 0;
         entry->thunk = hook_alloc_near(art_thunk_alloc, target);
         entry->thunk_alloc = art_thunk_alloc;
+        if (stage_start != 0) {
+            hook_log("[perf] art_router stage=alloc_thunk target=%p size=%zu thunk=%p elapsedUs=%llu",
+                     target, art_thunk_alloc, entry->thunk,
+                     (unsigned long long)hook_perf_elapsed_us(stage_start));
+        }
     }
     if (!entry->thunk) {
         free_entry(entry);
@@ -2599,15 +2620,21 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
         return NULL;
     }
 
+    stage_start = perf_start != 0 ? hook_perf_now_ns() : 0;
     if (build_trampoline(entry, 0) < 0) {
         free_entry(entry);
         hook_unlock(&g_engine.lock);
         return NULL;
     }
+    if (stage_start != 0) {
+        hook_log("[perf] art_router stage=build_trampoline target=%p elapsedUs=%llu",
+                 target, (unsigned long long)hook_perf_elapsed_us(stage_start));
+    }
 
     /* Generate router thunk — not_found path jumps to trampoline.
      * Thunk 布局: [12B 伪 OAT header/CodeInfo] [thunk body].
      * thunk_size 返回值含 12B 前缀. entry_point/patch_target 指向 body start. */
+    stage_start = perf_start != 0 ? hook_perf_now_ns() : 0;
     size_t thunk_size = generate_art_router_thunk(
         entry->thunk, art_thunk_alloc,
         entry->trampoline, quickcode_offset, current_pc_hint, use_blr, pre_scan);
@@ -2616,22 +2643,42 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
         hook_unlock(&g_engine.lock);
         return NULL;
     }
+    if (stage_start != 0) {
+        hook_log("[perf] art_router stage=generate_thunk target=%p size=%zu elapsedUs=%llu",
+                 target, thunk_size,
+                 (unsigned long long)hook_perf_elapsed_us(stage_start));
+    }
 
     /* Patch target to jump to router thunk body (跳过 12B 伪 header) */
     void* patch_dest = (uint8_t*)entry->thunk + FAKE_OAT_PREFIX_SIZE;
+    stage_start = perf_start != 0 ? hook_perf_now_ns() : 0;
     if (patch_target(target, patch_dest, stealth, entry) != 0) {
         free_entry(entry);
         hook_unlock(&g_engine.lock);
         return NULL;
     }
+    if (stage_start != 0) {
+        hook_log("[perf] art_router stage=patch_target target=%p dest=%p elapsedUs=%llu",
+                 target, patch_dest,
+                 (unsigned long long)hook_perf_elapsed_us(stage_start));
+    }
 
+    stage_start = perf_start != 0 ? hook_perf_now_ns() : 0;
     finalize_hook(entry, entry->thunk, thunk_size);
+    if (stage_start != 0) {
+        hook_log("[perf] art_router stage=finalize target=%p elapsedUs=%llu",
+                 target, (unsigned long long)hook_perf_elapsed_us(stage_start));
+    }
 
     void* trampoline = entry->trampoline;
     hook_unlock(&g_engine.lock);
 
     hook_log("[art_router] installed: target=%p, thunk=%p, trampoline=%p",
              target, entry->thunk, trampoline);
+    if (perf_start != 0) {
+        hook_log("[perf] art_router end target=%p result=installed elapsedUs=%llu",
+                 target, (unsigned long long)hook_perf_elapsed_us(perf_start));
+    }
 
     return trampoline;
 }

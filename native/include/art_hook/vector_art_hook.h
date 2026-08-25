@@ -55,11 +55,25 @@ struct MethodState {
     ~MethodState();
 };
 
-/** Initialize the ARM64 WxShadow engine and discover the current ART layout. */
+/** Initialize the complete rustFrida-compatible ART controller. */
 bool Initialize(JNIEnv *env);
+
+/**
+ * Initialize only the pre-attach ART layout, executable pool and interpreter router needed by
+ * rawVector's ActivityThread.attach bootstrap hook.
+ */
+bool InitializeBootstrap(JNIEnv *env);
+
+/** Complete the shared routers, DoCall, GC, OAT and signal layers after attach returns. */
+bool CompleteInitialization(JNIEnv *env);
+void SetSystemProcess(bool is_system);
+void SetManagerProcess(bool is_manager);
 
 /** Whether the ARM64 backend was initialized successfully. */
 bool IsAvailable();
+
+/** Whether the selected ART patch mode uses the WxShadow publish path. */
+bool IsWxShadowStealthMode();
 
 /** Decode an opaque/odd jmethodID into the backing ArtMethod pointer. */
 uintptr_t DecodeArtMethod(JNIEnv *env, jobject reflected_method);

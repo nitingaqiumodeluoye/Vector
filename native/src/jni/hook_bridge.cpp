@@ -1,11 +1,14 @@
 #include <alloca.h>
 #include <parallel_hashmap/phmap.h>
 #include <sys/mman.h>
+#include <sys/system_properties.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstring>
+#include <cstdlib>
 #include <lsplant.hpp>
 #include <limits>
 #include <memory>
@@ -19,6 +22,39 @@
 #include "jni/jni_hooks.h"
 
 namespace {
+
+bool HookPerfEnabled() {
+    const char *value = std::getenv("VECTOR_ART_HOOK_PERF");
+    auto enabled = [](const char *candidate) {
+        return candidate &&
+               (std::strcmp(candidate, "1") == 0 ||
+                std::strcmp(candidate, "true") == 0 ||
+                std::strcmp(candidate, "TRUE") == 0 ||
+                std::strcmp(candidate, "yes") == 0 ||
+                std::strcmp(candidate, "YES") == 0 ||
+                std::strcmp(candidate, "on") == 0 ||
+                std::strcmp(candidate, "ON") == 0);
+    };
+    if (enabled(value)) return true;
+    char property[PROP_VALUE_MAX] = {};
+    return (__system_property_get("debug.vector.art.perf", property) > 0 &&
+            enabled(property)) ||
+           (__system_property_get("persist.vector.art.perf", property) > 0 &&
+            enabled(property));
+}
+
+uint64_t HookPerfNowNs() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+
+uint64_t HookPerfElapsedUs(uint64_t start_ns) {
+    if (start_ns == 0) return 0;
+    const uint64_t now_ns = HookPerfNowNs();
+    return now_ns >= start_ns ? (now_ns - start_ns) / 1000ULL : 0;
+}
 
 /**
  * @struct HookItem
@@ -112,8 +148,9 @@ namespace vector::native::jni {
 
 void SetManagerProcess(bool is_manager) {
     is_manager_process.store(is_manager, std::memory_order_release);
+    art::SetManagerProcess(is_manager);
     if (is_manager) {
-        LOGI("Manager process selected: WxShadow ART backend disabled for bootstrap hooks");
+        LOGI("Manager process selected: using normal ART hook mode for pre-attach bootstrap");
     }
 }
 
@@ -358,6 +395,22 @@ static void VectorArtHookCallback(HookContext *, void *) {}
 }  // namespace vector::native::jni
 
 namespace vector::native::jni {
+VECTOR_DEF_NATIVE_METHOD(jboolean, HookBridge, initializeArtBootstrap) {
+    return art::InitializeBootstrap(env) ? JNI_TRUE : JNI_FALSE;
+}
+
+VECTOR_DEF_NATIVE_METHOD(void, HookBridge, setSystemProcess, jboolean is_system) {
+    art::SetSystemProcess(is_system == JNI_TRUE);
+}
+
+VECTOR_DEF_NATIVE_METHOD(jboolean, HookBridge, completeArtBootstrap) {
+    return art::CompleteInitialization(env) ? JNI_TRUE : JNI_FALSE;
+}
+
+VECTOR_DEF_NATIVE_METHOD(jboolean, HookBridge, isWxShadowStealthMode) {
+    return art::IsWxShadowStealthMode() ? JNI_TRUE : JNI_FALSE;
+}
+
 /**
  * @brief JNI method to install a hook on a given method or constructor.
  * @param useModernApi Distinguishes between the legacy and modern callback
@@ -373,6 +426,7 @@ VECTOR_DEF_NATIVE_METHOD(jboolean, HookBridge, hookMethod, jboolean useModernApi
                          jboolean allowArtBackend) {
     if (!hookMethod || !hooker || !callback) return JNI_FALSE;
     bool newHook = false;
+    const uint64_t perf_start = HookPerfEnabled() ? HookPerfNowNs() : 0;
 
 #ifndef NDEBUG
     // Simple RAII struct for performance timing in debug builds.
@@ -409,6 +463,11 @@ VECTOR_DEF_NATIVE_METHOD(jboolean, HookBridge, hookMethod, jboolean useModernApi
             ctor(target, std::move(ptr));
             newHook = true;
         });
+    if (perf_start != 0) {
+        LOGI("[perf] java_hook target={} newHook={} allowArtBackend={} elapsedUs={}",
+             static_cast<void *>(target), newHook, allowArtBackend,
+             HookPerfElapsedUs(perf_start));
+    }
 
     // If this is the first time this method is being hooked, install the
     // rustFrida-compatible clone+native-replacement route. LSPlant remains a
@@ -423,17 +482,21 @@ VECTOR_DEF_NATIVE_METHOD(jboolean, HookBridge, hookMethod, jboolean useModernApi
         } else if (env->ExceptionCheck()) {
             env->ExceptionClear();
         }
-        // Framework-owned bootstrap hooks (VectorHookBuilder with no module id) run before
-        // ActivityThread attaches. rustFrida's Java.ready gate deliberately avoids installing
-        // ART routing from that pre-attach path (quickjs-hook/src/jsapi/java/java_boot.js
-        // Java._installGateHook), because shared ART router setup can consume the Android
-        // process-start timeout. Keep those framework bootstrap hooks, and the parasitic manager
-        // bootstrap, on LSPlant; module-requested hooks still prefer the WxShadow backend.
-        if (allowArtBackend && !is_manager_process.load(std::memory_order_acquire) &&
-            hooker_object && callback_method && art::Initialize(env)) {
+        // Reference: rustFrida quickjs-hook/src/jsapi/java/java_hook_api/install.rs installs the
+        // cloned ArtMethod and native trampoline through the WxShadow ART route. Bootstrap timing
+        // is controlled by the Java caller; backend selection stays WxShadow-first in every
+        // process, including the manager.
+        if (allowArtBackend && hooker_object && callback_method &&
+            art::InitializeBootstrap(env)) {
+            const uint64_t art_start = perf_start != 0 ? HookPerfNowNs() : 0;
             auto state = art::Install(env, hookMethod,
                                       VectorArtHookCallback,
                                       reinterpret_cast<uintptr_t>(target));
+            if (art_start != 0) {
+                LOGI("[perf] java_hook stage=art_install target={} success={} elapsedUs={}",
+                     static_cast<void *>(target), state != nullptr,
+                     HookPerfElapsedUs(art_start));
+            }
             if (state) {
                 auto global_hooker = env->NewGlobalRef(hooker_object);
                 if (global_hooker) {
@@ -443,7 +506,15 @@ VECTOR_DEF_NATIVE_METHOD(jboolean, HookBridge, hookMethod, jboolean useModernApi
                     hook_item->art_state_ptr.store(hook_item->art_state.get(),
                                                    std::memory_order_release);
                 }
-                if (hook_item->art_state && art::Activate(*hook_item->art_state)) {
+                const uint64_t activate_start = perf_start != 0 ? HookPerfNowNs() : 0;
+                const bool activated = hook_item->art_state &&
+                                       art::Activate(*hook_item->art_state);
+                if (activate_start != 0) {
+                    LOGI("[perf] java_hook stage=art_activate target={} success={} elapsedUs={}",
+                         static_cast<void *>(target), activated,
+                         HookPerfElapsedUs(activate_start));
+                }
+                if (activated) {
                     // The object is the callback monitor for this backend;
                     // original invocation uses the raw clone in art_state.
                     hook_item->SetBackup(hook_item->hooker_object);
@@ -1248,6 +1319,10 @@ VECTOR_DEF_NATIVE_METHOD(jobject, HookBridge, findStaticInitializer, jclass targ
 
 // Array of native method descriptors for JNI registration.
 static JNINativeMethod gMethods[] = {
+    VECTOR_NATIVE_METHOD(HookBridge, initializeArtBootstrap, "()Z"),
+    VECTOR_NATIVE_METHOD(HookBridge, setSystemProcess, "(Z)V"),
+    VECTOR_NATIVE_METHOD(HookBridge, completeArtBootstrap, "()Z"),
+    VECTOR_NATIVE_METHOD(HookBridge, isWxShadowStealthMode, "()Z"),
     VECTOR_NATIVE_METHOD(HookBridge, hookMethod,
                          "(ZLjava/lang/reflect/Executable;Ljava/lang/Class;ILjava/"
                          "lang/Object;Z)Z"),

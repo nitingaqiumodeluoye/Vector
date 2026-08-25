@@ -266,11 +266,16 @@ static int find_containing_vma(uintptr_t addr, uintptr_t* vma_start, size_t* vma
  * Returns 0 on success, -1 on failure.
  */
 static int pmd_split_cow(void* addr) {
+    uint64_t perf_start = hook_perf_enabled() ? hook_perf_now_ns() : 0;
     uintptr_t vma_start = 0;
     size_t vma_size = 0;
 
     if (find_containing_vma((uintptr_t)addr, &vma_start, &vma_size) != 0) {
         hook_log("pmd_split_cow: VMA not found for addr=%p", addr);
+        if (perf_start != 0) {
+            hook_log("[perf] pmd_split_cow failed stage=find_vma addr=%p elapsedUs=%llu",
+                     addr, (unsigned long long)hook_perf_elapsed_us(perf_start));
+        }
         return -1;
     }
 
@@ -278,6 +283,10 @@ static int pmd_split_cow(void* addr) {
     if (mprotect((void*)vma_start, vma_size,
                  PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
         hook_log("pmd_split_cow: mprotect(rwx) failed errno=%d", errno);
+        if (perf_start != 0) {
+            hook_log("[perf] pmd_split_cow failed stage=mprotect_rwx addr=%p elapsedUs=%llu errno=%d",
+                     addr, (unsigned long long)hook_perf_elapsed_us(perf_start), errno);
+        }
         return -1;
     }
 
@@ -291,6 +300,10 @@ static int pmd_split_cow(void* addr) {
 
     hook_log("pmd_split_cow: COW triggered for addr=%p (VMA=%p-%p)",
              addr, (void*)vma_start, (void*)(vma_start + vma_size));
+    if (perf_start != 0) {
+        hook_log("[perf] pmd_split_cow done addr=%p vmaSize=%zu elapsedUs=%llu",
+                 addr, vma_size, (unsigned long long)hook_perf_elapsed_us(perf_start));
+    }
     return 0;
 }
 
@@ -304,13 +317,24 @@ static int pmd_split_cow(void* addr) {
  */
 int wxshadow_patch(void* addr, const void* buf, size_t len) {
     int ret;
+    uint64_t perf_start = hook_perf_enabled() ? hook_perf_now_ns() : 0;
+    uint64_t stage_start = perf_start;
 
     hook_log("[wxshadow_patch] enter addr=%p buf=%p len=%zu pid=%d", addr, buf, len, getpid());
     ret = prctl(PR_WXSHADOW_PATCH, 0, (uintptr_t)addr, (uintptr_t)buf, len);
     hook_log("[wxshadow_patch] prctl pid=0 ret=%d errno=%d addr=%p len=%zu", ret, errno, addr, len);
+    if (stage_start != 0) {
+        hook_log("[perf] wxshadow_patch stage=prctl_pid0 addr=%p len=%zu ret=%d elapsedUs=%llu",
+                 addr, len, ret, (unsigned long long)hook_perf_elapsed_us(stage_start));
+    }
     if (ret != 0) {
+        stage_start = perf_start != 0 ? hook_perf_now_ns() : 0;
         ret = prctl(PR_WXSHADOW_PATCH, getpid(), (uintptr_t)addr, (uintptr_t)buf, len);
         hook_log("[wxshadow_patch] prctl pid=self ret=%d errno=%d addr=%p len=%zu", ret, errno, addr, len);
+        if (stage_start != 0) {
+            hook_log("[perf] wxshadow_patch stage=prctl_self addr=%p len=%zu ret=%d elapsedUs=%llu",
+                     addr, len, ret, (unsigned long long)hook_perf_elapsed_us(stage_start));
+        }
     }
 
     if (ret != 0) {
@@ -324,24 +348,48 @@ int wxshadow_patch(void* addr, const void* buf, size_t len) {
          * in libart.so — mprotecting a sub-range would fragment the VMA. */
         hook_log("wxshadow PATCH failed (errno=%d), trying PMD split + COW for addr=%p", errno, addr);
 
+        stage_start = perf_start != 0 ? hook_perf_now_ns() : 0;
         if (pmd_split_cow(addr) == 0) {
+            if (stage_start != 0) {
+                hook_log("[perf] wxshadow_patch stage=pmd_split_cow addr=%p elapsedUs=%llu",
+                         addr, (unsigned long long)hook_perf_elapsed_us(stage_start));
+            }
             hook_log("[wxshadow_patch] retry after PMD split addr=%p len=%zu", addr, len);
+            stage_start = perf_start != 0 ? hook_perf_now_ns() : 0;
             ret = prctl(PR_WXSHADOW_PATCH, 0, (uintptr_t)addr, (uintptr_t)buf, len);
             hook_log("[wxshadow_patch] retry prctl pid=0 ret=%d errno=%d addr=%p len=%zu", ret, errno, addr, len);
+            if (stage_start != 0) {
+                hook_log("[perf] wxshadow_patch stage=retry_prctl_pid0 addr=%p len=%zu ret=%d elapsedUs=%llu",
+                         addr, len, ret, (unsigned long long)hook_perf_elapsed_us(stage_start));
+            }
             if (ret != 0) {
+                stage_start = perf_start != 0 ? hook_perf_now_ns() : 0;
                 ret = prctl(PR_WXSHADOW_PATCH, getpid(), (uintptr_t)addr, (uintptr_t)buf, len);
                 hook_log("[wxshadow_patch] retry prctl pid=self ret=%d errno=%d addr=%p len=%zu", ret, errno, addr, len);
+                if (stage_start != 0) {
+                    hook_log("[perf] wxshadow_patch stage=retry_prctl_self addr=%p len=%zu ret=%d elapsedUs=%llu",
+                             addr, len, ret, (unsigned long long)hook_perf_elapsed_us(stage_start));
+                }
             }
         }
 
         if (ret != 0) {
             hook_log("wxshadow PATCH failed after COW: addr=%p errno=%d", addr, errno);
+            if (perf_start != 0) {
+                hook_log("[perf] wxshadow_patch end addr=%p len=%zu result=%d elapsedUs=%llu",
+                         addr, len, ret,
+                         (unsigned long long)hook_perf_elapsed_us(perf_start));
+            }
             return HOOK_ERROR_WXSHADOW_FAILED;
         }
         hook_log("wxshadow PATCH succeeded after PMD split: addr=%p", addr);
     }
 
     hook_log("wxshadow stealth patch OK: addr=%p len=%zu", addr, len);
+    if (perf_start != 0) {
+        hook_log("[perf] wxshadow_patch end addr=%p len=%zu result=0 elapsedUs=%llu",
+                 addr, len, (unsigned long long)hook_perf_elapsed_us(perf_start));
+    }
     return 0;
 }
 
@@ -1362,6 +1410,8 @@ void* find_rw_sibling(void* target, size_t len) {
 int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
     int jump_result;
     uint8_t jump_buf[MIN_HOOK_SIZE] __attribute__((aligned(32)));
+    uint64_t perf_start = hook_perf_enabled() ? hook_perf_now_ns() : 0;
+    uint64_t stage_start = perf_start;
 
     hook_log("[patch_target] enter target=%p jump_dest=%p stealth=%d entry=%p original_size=%zu",
              target, jump_dest, stealth, entry, entry ? entry->original_size : 0);
@@ -1380,6 +1430,11 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
         hook_log("[patch_target] after dynamic jump target=%p dest=%p result=%d",
                  target, jump_dest, jump_result);
     }
+    if (stage_start != 0) {
+        hook_log("[perf] patch_target stage=build_jump target=%p dest=%p stealth=%d result=%d elapsedUs=%llu",
+                 target, jump_dest, stealth, jump_result,
+                 (unsigned long long)hook_perf_elapsed_us(stage_start));
+    }
     if (jump_result < 0) {
         hook_log("[patch_target] hook_write_jump failed target=%p dest=%p result=%d",
                  target, jump_dest, jump_result);
@@ -1388,6 +1443,7 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
 
     if (entry && entry->original_size != (size_t)jump_result) {
         size_t previous_size = entry->original_size;
+        stage_start = perf_start != 0 ? hook_perf_now_ns() : 0;
         entry->original_size = (size_t)jump_result;
         if (build_trampoline(entry, 0) < 0) {
             entry->original_size = previous_size;
@@ -1397,6 +1453,11 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
         }
         hook_log("[patch_target] adjusted overwrite size target=%p old=%zu new=%d",
                  target, previous_size, jump_result);
+        if (stage_start != 0) {
+            hook_log("[perf] patch_target stage=rebuild_trampoline target=%p old=%zu new=%d elapsedUs=%llu",
+                     target, previous_size, jump_result,
+                     (unsigned long long)hook_perf_elapsed_us(stage_start));
+        }
     }
 
     if (stealth == 1) {
@@ -1413,6 +1474,7 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
         uintptr_t t = (uintptr_t)target;
         int ok = 0;
 
+        stage_start = perf_start != 0 ? hook_perf_now_ns() : 0;
         if ((t & 0xFFF) + (uintptr_t)jump_result > 0x1000) {
             /* target 跨页: KPM copy_from_user_via_pte 单页限制. 分两段写, 顺序很关键:
              *   1. 先写第二页 (jump 尾部): target 首指令未变, CPU 继续原流程, 安全
@@ -1428,6 +1490,7 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
                 hook_log("[STEALTH1] cross-page second segment failed target=%p", target);
                 return HOOK_ERROR_WXSHADOW_FAILED;
             }
+            __builtin___clear_cache((char*)second_addr, (char*)second_addr + second_len);
             hook_log("[patch_target] cross-page second segment patched target=%p second=%p len=%zu",
                      target, second_addr, second_len);
             if (wxshadow_patch(target, jump_buf, first_len) != 0) {
@@ -1435,6 +1498,7 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
                 wxshadow_release(second_addr);
                 return HOOK_ERROR_WXSHADOW_FAILED;
             }
+            __builtin___clear_cache((char*)target, (char*)target + first_len);
             hook_log("[patch_target] cross-page first segment patched target=%p len=%zu",
                      target, first_len);
             /* LDR literal relocate: 两页各扫一次 (shadow 页 R/X 互斥按页生效) */
@@ -1450,6 +1514,9 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
             hook_log("[patch_target] before wxshadow_patch single-page target=%p len=%d dest=%p",
                      target, jump_result, jump_dest);
             if (wxshadow_patch(target, jump_buf, jump_result) == 0) {
+                __builtin___clear_cache((char*)target, (char*)target + jump_result);
+                hook_log("[patch_target] wxshadow icache flushed target=%p len=%d",
+                         target, jump_result);
                 hook_log("[patch_target] after wxshadow_patch single-page OK target=%p len=%d",
                          target, jump_result);
                 if (!disable_wxshadow_ldr_reloc) {
@@ -1463,16 +1530,30 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
                          target, jump_result);
             }
         }
+        if (stage_start != 0) {
+            hook_log("[perf] patch_target stage=stealth_publish target=%p len=%d ok=%d elapsedUs=%llu",
+                     target, jump_result, ok,
+                     (unsigned long long)hook_perf_elapsed_us(stage_start));
+        }
 
         if (ok) {
             entry->stealth = 1;
             entry->original_size = jump_result;
+            if (perf_start != 0) {
+                hook_log("[perf] patch_target end target=%p stealth=1 result=0 elapsedUs=%llu",
+                         target, (unsigned long long)hook_perf_elapsed_us(perf_start));
+            }
             return 0;
         }
         /* stealth1 严格模式: wxshadow 失败拒绝降级到 mprotect。
          * 降级会直接修改原始内存字节 + RWX 权限变更，
          * CRC 校验 / /proc/self/maps 扫描均可检测。 */
         hook_log("\033[31m[STEALTH] wxshadow 失败 %p，拒绝降级 mprotect\033[0m", target);
+        if (perf_start != 0) {
+            hook_log("[perf] patch_target end target=%p stealth=1 result=%d elapsedUs=%llu",
+                     target, HOOK_ERROR_WXSHADOW_FAILED,
+                     (unsigned long long)hook_perf_elapsed_us(perf_start));
+        }
         return HOOK_ERROR_WXSHADOW_FAILED;
     }
 
@@ -1486,8 +1567,15 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
     int jump_len = jump_result;
 
     {
+        stage_start = perf_start != 0 ? hook_perf_now_ns() : 0;
         void* writable = find_rw_sibling(target, (size_t)jump_len);
+        if (stage_start != 0) {
+            hook_log("[perf] patch_target stage=find_rw_sibling target=%p len=%d found=%d elapsedUs=%llu",
+                     target, jump_len, writable != NULL,
+                     (unsigned long long)hook_perf_elapsed_us(stage_start));
+        }
         if (writable) {
+            stage_start = perf_start != 0 ? hook_perf_now_ns() : 0;
             memcpy(writable, jump_buf, (size_t)jump_len);
             /* flush icache 在 target 侧 (CPU 执行地址) — 虚拟地址不同但物理页同 */
             __builtin___clear_cache((char*)target, (char*)target + jump_len);
@@ -1496,6 +1584,15 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
             entry->original_size = jump_len;
             hook_log("[patch_target] rw-sibling OK target=%p via writable=%p len=%d",
                      target, writable, jump_len);
+            if (stage_start != 0) {
+                hook_log("[perf] patch_target stage=rw_sibling_write target=%p len=%d elapsedUs=%llu",
+                         target, jump_len,
+                         (unsigned long long)hook_perf_elapsed_us(stage_start));
+            }
+            if (perf_start != 0) {
+                hook_log("[perf] patch_target end target=%p stealth=0 path=rw-sibling result=0 elapsedUs=%llu",
+                         target, (unsigned long long)hook_perf_elapsed_us(perf_start));
+            }
             return 0;
         }
     }
@@ -1504,22 +1601,54 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
      * this jump; a fixed 2-page span fails when a recomp slot sits on the last
      * mapped page of a tiny trampoline region. */
     int saved_prot[8] = {0};
+    stage_start = perf_start != 0 ? hook_perf_now_ns() : 0;
     size_t saved_count = save_range_prot_pages(target, (size_t)jump_len, saved_prot,
                                                sizeof(saved_prot) / sizeof(saved_prot[0]));
     if (saved_count == 0 || saved_count > sizeof(saved_prot) / sizeof(saved_prot[0]) ||
             mprotect_range_pages(target, (size_t)jump_len, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
         hook_log("[patch_target] mprotect(RWX) %p len=%d failed errno=%d(%s)",
                  target, jump_len, errno, strerror(errno));
+        if (stage_start != 0) {
+            hook_log("[perf] patch_target stage=mprotect_enable target=%p len=%d result=failed elapsedUs=%llu",
+                     target, jump_len,
+                     (unsigned long long)hook_perf_elapsed_us(stage_start));
+        }
         return HOOK_ERROR_MPROTECT_FAILED;
     }
+    if (stage_start != 0) {
+        hook_log("[perf] patch_target stage=mprotect_enable target=%p len=%d pages=%zu elapsedUs=%llu",
+                 target, jump_len, saved_count,
+                 (unsigned long long)hook_perf_elapsed_us(stage_start));
+    }
+    stage_start = perf_start != 0 ? hook_perf_now_ns() : 0;
     jump_result = hook_write_jump(target, jump_dest);
     if (jump_result < 0) {
         restore_range_prot_pages(target, (size_t)jump_len, saved_prot, saved_count);
+        if (stage_start != 0) {
+            hook_log("[perf] patch_target stage=normal_write target=%p len=%d result=%d elapsedUs=%llu",
+                     target, jump_len, jump_result,
+                     (unsigned long long)hook_perf_elapsed_us(stage_start));
+        }
         return jump_result;
     }
+    if (stage_start != 0) {
+        hook_log("[perf] patch_target stage=normal_write target=%p len=%d result=0 elapsedUs=%llu",
+                 target, jump_result,
+                 (unsigned long long)hook_perf_elapsed_us(stage_start));
+    }
+    stage_start = perf_start != 0 ? hook_perf_now_ns() : 0;
     entry->stealth = 0;
     entry->original_size = jump_result;
     restore_range_prot_pages(target, (size_t)jump_len, saved_prot, saved_count);
+    if (stage_start != 0) {
+        hook_log("[perf] patch_target stage=mprotect_restore target=%p len=%d elapsedUs=%llu",
+                 target, jump_len,
+                 (unsigned long long)hook_perf_elapsed_us(stage_start));
+    }
+    if (perf_start != 0) {
+        hook_log("[perf] patch_target end target=%p stealth=0 path=mprotect result=0 elapsedUs=%llu",
+                 target, (unsigned long long)hook_perf_elapsed_us(perf_start));
+    }
 
     return 0;
 }

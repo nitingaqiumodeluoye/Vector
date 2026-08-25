@@ -9,7 +9,7 @@
 
 namespace vector::native::jni {
 
-/// Selects the LSPlant-only bootstrap path used by Vector's parasitic manager.
+/// Records manager-process identity for lifecycle and diagnostic logging.
 void SetManagerProcess(bool is_manager);
 
 /// Records whether LSPlant has been initialized in this process.

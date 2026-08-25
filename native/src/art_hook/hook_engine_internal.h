@@ -21,6 +21,57 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
+#include <time.h>
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
+
+static inline bool hook_perf_value_enabled(const char *value) {
+    return value &&
+           (strcmp(value, "1") == 0 ||
+            strcmp(value, "true") == 0 ||
+            strcmp(value, "TRUE") == 0 ||
+            strcmp(value, "yes") == 0 ||
+            strcmp(value, "YES") == 0 ||
+            strcmp(value, "on") == 0 ||
+            strcmp(value, "ON") == 0);
+}
+
+static inline bool hook_perf_enabled(void) {
+    const char *value = getenv("VECTOR_ART_HOOK_PERF");
+    if (hook_perf_value_enabled(value)) {
+        return true;
+    }
+#ifdef __ANDROID__
+    char property[PROP_VALUE_MAX] = {};
+    if (__system_property_get("debug.vector.art.perf", property) > 0 &&
+        hook_perf_value_enabled(property)) {
+        return true;
+    }
+    if (__system_property_get("persist.vector.art.perf", property) > 0 &&
+        hook_perf_value_enabled(property)) {
+        return true;
+    }
+#endif
+    return false;
+}
+
+static inline uint64_t hook_perf_now_ns(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static inline uint64_t hook_perf_elapsed_us(uint64_t start_ns) {
+    uint64_t now_ns;
+    if (start_ns == 0) {
+        return 0;
+    }
+    now_ns = hook_perf_now_ns();
+    return now_ns >= start_ns ? (now_ns - start_ns) / 1000ULL : 0;
+}
 
 static inline bool hook_env_flag_enabled(const char* name) {
     const char* value = getenv(name);

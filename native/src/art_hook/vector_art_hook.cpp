@@ -14,12 +14,14 @@
 #include <algorithm>
 #include <atomic>
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -46,6 +48,47 @@ constexpr uint32_t kAccNterpInvokeFastPath = 0x00200000u;
 constexpr size_t kInitialPoolSize = 128 * 1024;
 constexpr char kHookExecPoolVmaName[] = "wwb_hook_exec";
 
+bool ArtPerfEnabled() {
+    const char *value = getenv("VECTOR_ART_HOOK_PERF");
+    if (value &&
+        (strcmp(value, "1") == 0 ||
+         strcmp(value, "true") == 0 ||
+         strcmp(value, "TRUE") == 0 ||
+         strcmp(value, "yes") == 0 ||
+         strcmp(value, "YES") == 0 ||
+         strcmp(value, "on") == 0 ||
+         strcmp(value, "ON") == 0)) {
+        return true;
+    }
+    char property[PROP_VALUE_MAX] = {};
+    for (const char *name : {"debug.vector.art.perf", "persist.vector.art.perf"}) {
+        if (__system_property_get(name, property) > 0 &&
+            (strcmp(property, "1") == 0 ||
+             strcmp(property, "true") == 0 ||
+             strcmp(property, "TRUE") == 0 ||
+             strcmp(property, "yes") == 0 ||
+             strcmp(property, "YES") == 0 ||
+             strcmp(property, "on") == 0 ||
+             strcmp(property, "ON") == 0)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+uint64_t ArtPerfNowNs() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+
+uint64_t ArtPerfElapsedUs(uint64_t start_ns) {
+    if (start_ns == 0) return 0;
+    const uint64_t now_ns = ArtPerfNowNs();
+    return now_ns >= start_ns ? (now_ns - start_ns) / 1000ULL : 0;
+}
+
 #ifndef PR_SET_VMA
 #define PR_SET_VMA 0x53564d41
 #endif
@@ -53,7 +96,7 @@ constexpr char kHookExecPoolVmaName[] = "wwb_hook_exec";
 #define PR_SET_VMA_ANON_NAME 0
 #endif
 
-void SetHookExecPoolVmaName(void *base, size_t size) {
+void SetHookVmaName(void *base, size_t size, const char *name) {
     // Keep Vector's ART hook initial executable pool aligned with rustFrida:
     // agent/src/quickjs_loader.rs::ExecMemory::new_near names the initial exec_mem
     // "wwb_hook_exec". Extension pools remain "wwb_hook_pool" in
@@ -62,11 +105,15 @@ void SetHookExecPoolVmaName(void *base, size_t size) {
     errno = 0;
     int ret = prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME,
                     reinterpret_cast<unsigned long>(base), size,
-                    reinterpret_cast<unsigned long>(kHookExecPoolVmaName));
+                    reinterpret_cast<unsigned long>(name));
     if (ret != 0) {
         LOGW("WxShadow ART trace: failed to name exec pool base={} size={} name={} errno={}",
-             base, size, kHookExecPoolVmaName, errno);
+             base, size, name, errno);
     }
+}
+
+void SetHookExecPoolVmaName(void *base, size_t size) {
+    SetHookVmaName(base, size, kHookExecPoolVmaName);
 }
 
 enum class ArtStealthMode : int {
@@ -154,9 +201,9 @@ size_t g_do_call_target_count = 0;
 std::array<uintptr_t, 8> g_gc_hook_targets{};
 size_t g_gc_hook_target_count = 0;
 uintptr_t g_oat_header_hook_target = 0;
-uintptr_t g_fixup_hook_target = 0;
 std::mutex g_state_mutex;
 std::vector<MethodState *> g_active_states;
+std::atomic<bool> g_gc_sync_in_progress{false};
 JNIEnv *g_init_env = nullptr;
 std::once_flag g_quick_entrypoints_once;
 uintptr_t g_quick_test_suspend_entrypoint = 0;
@@ -168,6 +215,8 @@ std::atomic<uintptr_t> g_implicit_suspend_trigger_offset{UINTPTR_MAX};
 std::once_flag g_classlinker_discovery_once;
 ClassLinkerTrampolines g_classlinker_trampolines;
 ArtStealthMode g_art_stealth_mode = ArtStealthMode::Normal;
+bool g_is_system_process = false;
+bool g_is_manager_process = false;
 bool g_art_stealth_auto_selected = true;
 std::string g_art_stealth_source = "default:auto";
 std::string g_art_stealth_value = "auto";
@@ -179,10 +228,17 @@ jobject FindKnownNativeMethod(JNIEnv *env, uintptr_t *art_method);
 uint32_t CompileDontBotherFlag();
 void RegisterActiveState(MethodState *state);
 void UnregisterActiveState(MethodState *state);
-void SynchronizeReplacementMethods();
+void SynchronizeReplacementMethods(const char *phase);
 void *g_exec_pool = nullptr;
-std::once_flag g_init_once;
+std::once_flag g_base_init_once;
+std::once_flag g_bootstrap_init_once;
+std::once_flag g_interpreter_router_once;
+std::once_flag g_controller_init_once;
+bool g_base_initialized = false;
+bool g_bootstrap_initialized = false;
+bool g_interpreter_router_initialized = false;
 bool g_initialized = false;
+bool g_thread_layout_found = false;
 std::mutex g_install_mutex;
 jfieldID g_art_method_field = nullptr;
 std::once_flag g_art_method_field_once;
@@ -193,6 +249,25 @@ const char *ArtStealthModeName(ArtStealthMode mode) {
 
 int ArtStealthFlag() {
     return static_cast<int>(g_art_stealth_mode);
+}
+
+void *InstallArtRouterWithFallback(void *target, uint32_t quickcode_offset,
+                                   JNIEnv *env, void **out_hooked_target,
+                                   int skip_resolve, uint64_t current_pc_hint,
+                                   int use_blr, int pre_scan) {
+    void *trampoline = hook_install_art_router(
+        target, quickcode_offset, ArtStealthFlag(), env, out_hooked_target,
+        skip_resolve, current_pc_hint, use_blr, pre_scan);
+    if (trampoline || g_art_stealth_mode != ArtStealthMode::WxShadow ||
+        !g_art_stealth_auto_selected) {
+        return trampoline;
+    }
+    LOGW("WxShadow ART hook failed at {}; falling back to normal patch", target);
+    g_art_stealth_mode = ArtStealthMode::Normal;
+    hook_set_stealth_mode(0);
+    return hook_install_art_router(
+        target, quickcode_offset, 0, env, out_hooked_target,
+        skip_resolve, current_pc_hint, use_blr, pre_scan);
 }
 
 bool IsWxShadowStealthMode() {
@@ -326,45 +401,11 @@ bool UseSharedJniNterpLayer1() {
     // - rust_frida/src/repl.rs preconfigures that mode only when the script
     //   explicitly declares Java.setStealth(...).
     //
-    // Vector's default "auto" chooses wxshadow after a local probe so
-    // per-method patching can stay stealthy, but that is not equivalent to
-    // rustFrida's explicit Java.setStealth(1/2).  Do not hook process-wide
-    // hot JNI/Nterp stubs in auto mode; Hunter executes Nterp at very high
-    // frequency and that creates a wxshadow read/exec switch storm.
+    // Vector's default auto policy selects wxshadow only for system_server,
+    // but that is not equivalent to rustFrida's explicit Java.setStealth(1/2).
+    // Do not hook process-wide hot JNI/Nterp stubs in auto mode; Hunter executes
+    // Nterp at very high frequency and that creates a wxshadow read/exec switch storm.
     return !g_art_stealth_auto_selected;
-}
-
-bool ProbeWxShadowPatchAvailable() {
-    const long sys_page_size = sysconf(_SC_PAGESIZE);
-    const size_t page_size = sys_page_size > 0 ? static_cast<size_t>(sys_page_size)
-                                               : static_cast<size_t>(4096);
-    void *page = mmap(nullptr, page_size, PROT_READ | PROT_WRITE | PROT_EXEC,
-                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    LOGI("WxShadow ART trace: probe exec mmap base={} size={} pid={}",
-         page, page_size, getpid());
-    if (page == MAP_FAILED) {
-        LOGW("WxShadow ART stealth auto probe: scratch mmap failed errno={}", errno);
-        return false;
-    }
-    SetHookExecPoolVmaName(page, page_size);
-    constexpr uint32_t kRetInsn = 0xd65f03c0u;
-    memcpy(page, &kRetInsn, sizeof(kRetInsn));
-    hook_flush_cache(page, sizeof(kRetInsn));
-
-    constexpr uint32_t kNopInsn = 0xd503201fu;
-    const uint32_t patched = kNopInsn;
-    const int result = wxshadow_patch(page, &patched, sizeof(patched));
-    bool released = false;
-    if (result == HOOK_OK) {
-        const int release_result = wxshadow_release(page);
-        released = release_result == HOOK_OK;
-        if (release_result != HOOK_OK) {
-            LOGW("WxShadow ART stealth auto probe: release failed result={}",
-                 release_result);
-        }
-    }
-    munmap(page, page_size);
-    return result == HOOK_OK && released;
 }
 
 ArtStealthMode SelectArtStealthMode() {
@@ -381,16 +422,29 @@ ArtStealthMode SelectArtStealthMode() {
     // Source reference: rustFrida quickjs-hook/src/jsapi/hook_api/registry.rs
     // defines StealthMode { Normal=0, WxShadow=1 }, and
     // art_controller.rs keeps the default Normal until Java.setStealth opts in.
-    // Vector has no Java-facing setStealth bootstrap here, so auto only opts
-    // into WxShadow after the kernel prctl path is proven available in-process.
+    // Vector has no Java-facing setStealth bootstrap here, so auto applies the
+    // process policy below before ART hooks lock the mode.
     if (auto_mode || !configured) {
-        const bool available = ProbeWxShadowPatchAvailable();
-        const auto selected = available ? ArtStealthMode::WxShadow
-                                        : ArtStealthMode::Normal;
-        LOGI("WxShadow ART stealth mode selected: {} source={} value={} probe={}",
-             ArtStealthModeName(selected), source.c_str(), raw_value.c_str(),
-             available ? "ready" : "unavailable");
-        return selected;
+        // rawVector installs the parasitic manager hooks before ActivityThread.attach. On this
+        // Android 12 host, publishing WxShadow pages during that cold specialization window can
+        // collide with framework native initialization before the process attaches. rustFrida's
+        // default mode is Normal until stealth is explicitly requested, so keep the manager's
+        // internal bootstrap hooks on that baseline while target apps remain WxShadow-first.
+        if (g_is_manager_process) {
+            LOGI("WxShadow ART stealth mode selected: normal source={} value={} "
+                 "policy=manager-bootstrap-normal process=manager",
+                 source.c_str(), raw_value.c_str());
+            return ArtStealthMode::Normal;
+        }
+        // Auto is WxShadow-first. Do not create a temporary executable probe page:
+        // rustFrida selects the mode before installing hooks and lets the real patch
+        // operation report capability. A failed real patch remains an explicit hook
+        // installation failure instead of racing Hunter's /proc/maps scanner.
+        LOGI("WxShadow ART stealth mode selected: wxshadow source={} value={} "
+             "policy=wxshadow-first process={} probe=skipped",
+             source.c_str(), raw_value.c_str(),
+             g_is_system_process ? "system_server" : "app");
+        return ArtStealthMode::WxShadow;
     }
 
     LOGI("WxShadow ART stealth mode selected: {} source={} value={} probe=skipped",
@@ -615,10 +669,15 @@ void *ResolveArtSymbol(const char *name) {
 
 bool ProbeArtThreadLayout(JNIEnv *env) {
     if (!env) return false;
-    const auto env_address = reinterpret_cast<uintptr_t>(env);
+    // Android's MTE/PAC builds may return a tagged JNIEnvExt pointer (for example
+    // 0xb400...). rustFrida's safe_mem map checks operate on the canonical address;
+    // strip the tag before both the maps check and the raw read. Keeping the tagged
+    // value here makes the probe fail before it ever reaches Thread::tlsPtr_.jni_env.
+    const auto raw_env_address = reinterpret_cast<uintptr_t>(env);
+    const auto env_address = raw_env_address & kPacStripMask;
     if (!IsReadable(env_address + sizeof(uintptr_t), sizeof(uintptr_t))) {
         LOGW("WxShadow ART thread layout: JNIEnvExt unreadable at {}",
-             static_cast<void *>(env));
+             reinterpret_cast<void *>(raw_env_address));
         return false;
     }
 
@@ -633,7 +692,7 @@ bool ProbeArtThreadLayout(JNIEnv *env) {
         return false;
     }
 
-    const auto stripped_env = reinterpret_cast<uintptr_t>(env) & kPacStripMask;
+    const auto stripped_env = env_address;
     for (size_t offset = 144; offset < 384; offset += sizeof(uintptr_t)) {
         const auto candidate = *reinterpret_cast<volatile const uintptr_t *>(thread + offset);
         if ((candidate & kPacStripMask) != stripped_env) continue;
@@ -1003,62 +1062,74 @@ void UnregisterActiveState(MethodState *state) {
         g_active_states.end());
 }
 
-void SynchronizeReplacementMethods() {
+void SynchronizeReplacementMethods(const char *phase) {
     // Source reference: rustFrida art_controller.rs::synchronize_replacement_methods.
     // Vector's registry owns MethodState for the process lifetime after a
-    // successful activation, so a short mutex-protected snapshot is sufficient.
-    std::lock_guard lock(g_state_mutex);
-    for (auto *state : g_active_states) {
-        if (!state || state->native_entry_hook || !state->replacement ||
-            !state->original_art_method) {
-            continue;
+    // successful activation. Keep this callback free of /proc/self/maps scans:
+    // it runs from ART GC/fixup paths where blocking the collector blocks all
+    // threads waiting for GC completion.
+    bool expected = false;
+    if (!g_gc_sync_in_progress.compare_exchange_strong(
+            expected, true, std::memory_order_acquire, std::memory_order_relaxed)) {
+        if (ArtPerfEnabled()) {
+            LOGI("[perf] gc_sync phase={} skipped=reentrant", phase ? phase : "unknown");
         }
-        if (!IsReadable(state->original_art_method, sizeof(uint32_t)) ||
-            !IsReadable(state->replacement, state->method_size)) {
-            continue;
-        }
-        const auto declaring_class = *reinterpret_cast<volatile const uint32_t *>(
-            state->original_art_method);
-        *reinterpret_cast<volatile uint32_t *>(state->replacement) = declaring_class;
-        if (state->access_flags_offset + sizeof(uint32_t) <= state->method_size) {
-            constexpr uint32_t kAccFastInterpreterToInterpreterInvoke = 0x40000000u;
-            auto flags = *reinterpret_cast<volatile uint32_t *>(
-                state->replacement + state->access_flags_offset);
-            flags = (flags | CompileDontBotherFlag()) &
-                    ~kAccFastInterpreterToInterpreterInvoke;
-            *reinterpret_cast<volatile uint32_t *>(
-                state->replacement + state->access_flags_offset) = flags;
-        }
-        if (state->original_entry_mutated &&
-            state->entry_offset + sizeof(uintptr_t) <= state->method_size &&
-            g_interpreter_bridge_router.source != 0 &&
-            IsReadable(state->original_art_method,
-                       state->entry_offset + sizeof(uintptr_t))) {
-            auto *entry = reinterpret_cast<volatile uintptr_t *>(
-                state->original_art_method + state->entry_offset);
-            if ((*entry & kPacStripMask) !=
-                (g_interpreter_bridge_router.source & kPacStripMask)) {
-                // rustFrida's post-install/delayed-entry-refresh keeps an
-                // internal entry downgrade stable when ART class fixup writes
-                // the original shared entry back. Vector folds the same repair
-                // into its existing GC/ClassLinker synchronization hooks.
-                *entry = g_interpreter_bridge_router.source;
-                hook_flush_cache(reinterpret_cast<void *>(
-                                     state->original_art_method + state->entry_offset),
-                                 sizeof(uintptr_t));
+        return;
+    }
+
+    const uint64_t perf_start = ArtPerfEnabled() ? ArtPerfNowNs() : 0;
+    size_t active_count = 0;
+    size_t synced_count = 0;
+    {
+        // GC callbacks run while ART holds ClassLinker/collector coordination
+        // locks. Never make the collector wait for an install/uninstall writer;
+        // a later GC/fixup callback will retry the declaring-class sync.
+        std::unique_lock lock(g_state_mutex, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            if (ArtPerfEnabled()) {
+                LOGI("[perf] gc_sync phase={} skipped=state_mutex_busy",
+                     phase ? phase : "unknown");
             }
+            g_gc_sync_in_progress.store(false, std::memory_order_release);
+            return;
         }
-        hook_flush_cache(reinterpret_cast<void *>(state->replacement), state->method_size);
+        active_count = g_active_states.size();
+        for (auto *state : g_active_states) {
+            if (!state || state->native_entry_hook || !state->replacement ||
+                !state->original_art_method) {
+                continue;
+            }
+            const auto declaring_class = *reinterpret_cast<volatile const uint32_t *>(
+                state->original_art_method);
+            *reinterpret_cast<volatile uint32_t *>(state->replacement) = declaring_class;
+            ++synced_count;
+        }
+    }
+    g_gc_sync_in_progress.store(false, std::memory_order_release);
+
+    if (perf_start != 0) {
+        LOGI("[perf] gc_sync phase={} active={} synced={} elapsedUs={}",
+             phase ? phase : "unknown", active_count, synced_count,
+             ArtPerfElapsedUs(perf_start));
     }
 }
 
-void OnGcSyncLeave(HookContext *, void *) { SynchronizeReplacementMethods(); }
-void OnGcSyncEnter(HookContext *, void *) { SynchronizeReplacementMethods(); }
+void OnGcSyncLeave(HookContext *, void *) {
+    SynchronizeReplacementMethods("leave");
+}
+
+void OnGcSyncEnter(HookContext *, void *) {
+    SynchronizeReplacementMethods("enter");
+}
 
 bool IsReplacementMethod(uintptr_t method) {
     method &= kPacStripMask;
     if (!method) return false;
-    std::lock_guard lock(g_state_mutex);
+    // OAT header queries are also made from ART hot paths. Returning a
+    // conservative miss on contention avoids stalling ClassLinker while a
+    // replacement is being published; the next query observes the registry.
+    std::unique_lock lock(g_state_mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return false;
     return std::any_of(g_active_states.begin(), g_active_states.end(),
                        [method](const MethodState *state) {
                            return state && !state->native_entry_hook &&
@@ -1111,6 +1182,18 @@ bool InitializeOatHeaderLayer() {
 }
 
 size_t InitializeGcSyncLayer() {
+    // Application startup can synchronously query ART heap/class metadata
+    // (Launch's environment detector is one example). Installing the
+    // CopyingPhase/CollectGarbageInternal/RunFlipFunction hooks in every app
+    // process makes those queries contend with GC coordination locks and can
+    // turn a normal collection into a multi-second main-thread stall.
+    // rustFrida needs these hooks for the system_server replacement lifecycle;
+    // app processes use the stable per-method router instead.
+    if (!g_is_system_process) {
+        LOGI("WxShadow ART GC sync skipped for app process");
+        return 0;
+    }
+
     // Source reference: rustFrida art_method/bridge.rs discovery and
     // art_controller.rs GC hook installation. Signatures vary by API, so try
     // the same candidate symbols and attach generic enter/leave callbacks.
@@ -1127,12 +1210,6 @@ size_t InitializeGcSyncLayer() {
     constexpr const char *kFlipCandidates[] = {
         "_ZN3art6Thread15RunFlipFunctionEPS0_b",
         "_ZN3art6Thread15RunFlipFunctionEPS0_",
-    };
-    constexpr const char *kFixupCandidates[] = {
-        "_ZN3art11ClassLinker40MakeInitializedClassesVisiblyInitializedEPNS_6ThreadEb",
-        "_ZN3art11ClassLinker22FixupStaticTrampolinesEPNS_6ThreadENS_6ObjPtrINS_6mirror5ClassEEE",
-        "_ZN3art11ClassLinker22FixupStaticTrampolinesEPNS_6ObjPtrINS_6mirror5ClassEEE",
-        "_ZN3art11ClassLinker22FixupStaticTrampolinesEPNS_6mirror5ClassE",
     };
     std::vector<uintptr_t> targets;
     auto add_first = [&targets](const auto &candidates) {
@@ -1151,8 +1228,12 @@ size_t InitializeGcSyncLayer() {
     const auto copying = add_first(kCopyingCandidates);
     const auto collecting = add_first(kCollectCandidates);
     const auto flipping = add_first(kFlipCandidates);
-    const auto fixup = add_first(kFixupCandidates);
-    for (const auto address : {copying, collecting, fixup}) {
+    // Match rustFrida art_controller.rs: GC synchronization is installed only
+    // at Copying/MarkingPhase and CollectGarbageInternal on-leave. ClassLinker
+    // fixup runs while ClassLinker locks are held and is not a GC sync point;
+    // doing replacement writes and icache maintenance there can block dex
+    // registration and the next GC checkpoint.
+    for (const auto address : {copying, collecting}) {
         if (!address || g_gc_hook_target_count >= g_gc_hook_targets.size()) continue;
         if (std::find(g_gc_hook_targets.begin(),
                       g_gc_hook_targets.begin() + g_gc_hook_target_count,
@@ -1162,7 +1243,6 @@ size_t InitializeGcSyncLayer() {
         if (hook_attach(reinterpret_cast<void *>(address), nullptr, OnGcSyncLeave,
                         nullptr, ArtStealthFlag()) == HOOK_OK) {
             g_gc_hook_targets[g_gc_hook_target_count++] = address;
-            if (address == fixup) g_fixup_hook_target = address;
             LOGI("WxShadow ART GC sync leave hook ready: {}",
                  reinterpret_cast<void *>(address));
         }
@@ -1266,9 +1346,9 @@ bool InitializeSharedNterpRouter(JNIEnv *env) {
     }
 
     void *hooked_target = nullptr;
-    void *trampoline = hook_install_art_router(
+    void *trampoline = InstallArtRouterWithFallback(
         reinterpret_cast<void *>(target), static_cast<uint32_t>(g_layout.entry_offset),
-        ArtStealthFlag(), env, &hooked_target,
+        env, &hooked_target,
         1,  // Source already resolved, matching rustFrida prepare_hook_target.
         0,  // Layer 1 has no current-PC hint.
         0,  // Layer 1 shared stubs do not use BLR mode.
@@ -1315,9 +1395,9 @@ bool InitializeSharedNterpWithClinitRouter(JNIEnv *env) {
     }
 
     void *hooked_target = nullptr;
-    void *trampoline = hook_install_art_router(
+    void *trampoline = InstallArtRouterWithFallback(
         reinterpret_cast<void *>(target), static_cast<uint32_t>(g_layout.entry_offset),
-        ArtStealthFlag(), env, &hooked_target, 1, 0, 0, 1);
+        env, &hooked_target, 1, 0, 0, 1);
     if (!trampoline) {
         LOGE("WxShadow ART controller: shared NterpWithClinit router installation failed");
         return false;
@@ -1400,9 +1480,18 @@ bool InitializeSharedLibartRouter(const char *label, const char *symbol, JNIEnv 
         return false;
     }
     void *hooked_target = nullptr;
-    void *trampoline = hook_install_art_router(
-        reinterpret_cast<void *>(target), static_cast<uint32_t>(g_layout.entry_offset),
-        ArtStealthFlag(), env, &hooked_target, 1, 0, 0, 0);
+    void *trampoline = nullptr;
+    // ART may still be publishing the libart executable/shadow mapping during the first
+    // post-specialize hook. rustFrida's controller retries this shared-entry publication rather
+    // than changing patch semantics; keep the same stealth path and use a short bounded retry.
+    for (int attempt = 0; attempt < 4 && !trampoline; ++attempt) {
+        trampoline = InstallArtRouterWithFallback(
+            reinterpret_cast<void *>(target), static_cast<uint32_t>(g_layout.entry_offset),
+            env, &hooked_target, 1, 0, 0, 0);
+        if (!trampoline && attempt < 3) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
     if (!trampoline) {
         LOGW("WxShadow ART controller: {} shared router installation failed", label);
         return false;
@@ -1756,6 +1845,7 @@ void SyncOriginalCloneForJni(const MethodState &state) {
             *reinterpret_cast<volatile const uintptr_t *>(state.original_art_method +
                                                          state.data_offset);
     }
+
 }
 
 jvalue ReadArgument(JNIEnv *env, jobject value, ValueKind kind, bool *ok) {
@@ -2186,8 +2276,8 @@ extern "C" uint64_t art_quick_top_quick_frame_offset() {
     return g_thread_layout.valid ? g_thread_layout.managed_stack_offset : UINT64_MAX;
 }
 
-bool InitializeImpl(JNIEnv *env) {
-    if (g_initialized) return true;
+bool InitializeBaseImpl(JNIEnv *env) {
+    if (g_base_initialized) return true;
     g_init_env = env;
     // Resolve the reflection field before probing any method IDs. Android 11+
     // may return an odd/opaque jmethodID, while older releases expose the
@@ -2314,43 +2404,129 @@ bool InitializeImpl(JNIEnv *env) {
     // with the same fail-open stack-check semantics used by rustFrida.
     g_thread_current = reinterpret_cast<ThreadCurrentFn>(
         ResolveArtSymbol("_ZN3art6Thread7CurrentEv"));
-    const bool thread_layout_found = ProbeArtThreadLayout(env);
+    g_thread_layout_found = ProbeArtThreadLayout(env);
     if (!g_thread_current) {
         LOGW("WxShadow ART stack guard: art::Thread::Current unavailable");
     }
     g_art_stealth_mode = SelectArtStealthMode();
     hook_set_stealth_mode(ArtStealthFlag());
     DiscoverClassLinkerTrampolines(env);
+    g_base_initialized = true;
+    LOGI("WxShadow ART bootstrap base ready: stealth={} ArtMethod size={} flags={} data={} "
+         "entry={} jni={} thread_current={} thread_layout={}",
+         ArtStealthModeName(g_art_stealth_mode), g_layout.method_size,
+         g_layout.access_flags_offset, g_layout.data_offset, g_layout.entry_offset,
+         g_layout.jni_trampoline, reinterpret_cast<void *>(g_thread_current),
+         g_thread_layout_found);
+    return true;
+}
+
+bool InitializeBootstrapImpl(JNIEnv *env) {
+    if (g_bootstrap_initialized) return true;
+    // Timing reference: rawVector installs ActivityThread.attach before attach runs and loads
+    // modules only after chain.proceed() returns. Hook semantics reference: rustFrida's
+    // art_controller.rs Layer 1 shared router is installed on demand for an internal entry.
+    // Keep the pre-attach window limited to layout and executable-pool discovery; installing a
+    // process-wide interpreter router here would route module class loading through the full ART
+    // matrix before rawVector's post-attach module boundary.
+    g_bootstrap_initialized = true;
+    LOGI("WxShadow ART bootstrap ready: shared_interpreter=deferred");
+    return true;
+}
+
+bool EnsureInterpreterRouter(JNIEnv *env) {
+    std::call_once(g_interpreter_router_once, [env] {
+        g_interpreter_router_initialized = InitializeSharedLibartRouter(
+            "quick_to_interpreter_bridge", "art_quick_to_interpreter_bridge", env,
+            &g_interpreter_bridge_router);
+    });
+    return g_interpreter_router_initialized;
+}
+
+bool CompleteInitializationImpl(JNIEnv *env) {
+    const uint64_t perf_start = ArtPerfEnabled() ? ArtPerfNowNs() : 0;
+    if (g_initialized) return true;
     // Source reference: rustFrida art_controller.rs Layer 1 skips shared
     // generic-JNI and Nterp unless Java.setStealth(1/2) explicitly selected a
     // stealth mode before ART hooks are installed. Vector's auto mode only
     // opts per-method patching into wxshadow; it does not imply process-wide
     // hot-stub routing.
     const bool use_shared_jni_nterp_layer1 = UseSharedJniNterpLayer1();
+    uint64_t stage_start = perf_start != 0 ? ArtPerfNowNs() : 0;
     const bool shared_jni_ready = use_shared_jni_nterp_layer1 && InitializeSharedLibartRouter(
         "quick_generic_jni_trampoline", "art_quick_generic_jni_trampoline", env,
         &g_jni_router);
+    if (stage_start != 0) {
+        LOGI("[perf] art_controller component=shared_jni enabled={} ready={} elapsedUs={}",
+             use_shared_jni_nterp_layer1, shared_jni_ready,
+             ArtPerfElapsedUs(stage_start));
+    }
+    stage_start = perf_start != 0 ? ArtPerfNowNs() : 0;
     const bool shared_nterp_ready =
         use_shared_jni_nterp_layer1 && InitializeSharedNterpRouter(env);
+    if (stage_start != 0) {
+        LOGI("[perf] art_controller component=shared_nterp enabled={} ready={} elapsedUs={}",
+             use_shared_jni_nterp_layer1, shared_nterp_ready,
+             ArtPerfElapsedUs(stage_start));
+    }
+    stage_start = perf_start != 0 ? ArtPerfNowNs() : 0;
     const bool shared_nterp_clinit_ready =
         use_shared_jni_nterp_layer1 && InitializeSharedNterpWithClinitRouter(env);
+    if (stage_start != 0) {
+        LOGI("[perf] art_controller component=shared_nterp_clinit enabled={} ready={} elapsedUs={}",
+             use_shared_jni_nterp_layer1, shared_nterp_clinit_ready,
+             ArtPerfElapsedUs(stage_start));
+    }
     if (!use_shared_jni_nterp_layer1) {
         LOGI("WxShadow ART controller: shared JNI/Nterp Layer1 skipped stealth={} auto={} "
              "source={} value={}",
              ArtStealthModeName(g_art_stealth_mode), g_art_stealth_auto_selected,
              g_art_stealth_source.c_str(), g_art_stealth_value.c_str());
     }
-    const bool shared_interpreter_ready = InitializeSharedLibartRouter(
-        "quick_to_interpreter_bridge", "art_quick_to_interpreter_bridge", env,
-        &g_interpreter_bridge_router);
+    stage_start = perf_start != 0 ? ArtPerfNowNs() : 0;
+    const bool shared_interpreter_ready = EnsureInterpreterRouter(env);
+    if (stage_start != 0) {
+        LOGI("[perf] art_controller component=shared_interpreter ready={} elapsedUs={}",
+             shared_interpreter_ready, ArtPerfElapsedUs(stage_start));
+    }
+    stage_start = perf_start != 0 ? ArtPerfNowNs() : 0;
     const bool shared_resolution_ready = InitializeSharedLibartRouter(
         "quick_resolution_trampoline", "art_quick_resolution_trampoline", env,
         &g_resolution_router);
+    if (stage_start != 0) {
+        LOGI("[perf] art_controller component=shared_resolution ready={} elapsedUs={}",
+             shared_resolution_ready, ArtPerfElapsedUs(stage_start));
+    }
+    stage_start = perf_start != 0 ? ArtPerfNowNs() : 0;
     const size_t do_call_count = InitializeDoCallLayer();
+    if (stage_start != 0) {
+        LOGI("[perf] art_controller component=do_call count={} elapsedUs={}",
+             do_call_count, ArtPerfElapsedUs(stage_start));
+    }
+    stage_start = perf_start != 0 ? ArtPerfNowNs() : 0;
     const size_t gc_hook_count = InitializeGcSyncLayer();
-    const bool oat_header_ready = InitializeOatHeaderLayer();
+    if (stage_start != 0) {
+        LOGI("[perf] art_controller component=gc_sync count={} elapsedUs={}",
+             gc_hook_count, ArtPerfElapsedUs(stage_start));
+    }
+    // The OAT-header replacement path is required by the system_server
+    // replacement lifecycle. In ordinary apps it adds process-wide ART metadata
+    // probes and inline patches during the first attach, exactly where MIUI's
+    // startup watchdog may request a heap snapshot. Keep app startup on the
+    // per-method router; install the heavier guard only in system_server.
+    stage_start = perf_start != 0 ? ArtPerfNowNs() : 0;
+    const bool oat_header_ready = g_is_system_process && InitializeOatHeaderLayer();
+    if (stage_start != 0) {
+        LOGI("[perf] art_controller component=oat_header ready={} elapsedUs={}",
+             oat_header_ready, ArtPerfElapsedUs(stage_start));
+    }
+    stage_start = perf_start != 0 ? ArtPerfNowNs() : 0;
     const int oat_inline_patched =
         oat_header_ready ? hook_patch_inlined_oat_header_checks(g_oat_header_hook_target) : 0;
+    if (stage_start != 0) {
+        LOGI("[perf] art_controller component=oat_inline_patch count={} elapsedUs={}",
+             oat_inline_patched, ArtPerfElapsedUs(stage_start));
+    }
     if (oat_header_ready) {
         if (oat_inline_patched < 0) {
             LOGW("WxShadow ART inlined OAT header patch failed: {}", oat_inline_patched);
@@ -2358,7 +2534,12 @@ bool InitializeImpl(JNIEnv *env) {
             LOGI("WxShadow ART inlined OAT header patch ready: count={}", oat_inline_patched);
         }
     }
-    const bool signal_guard_ready = InitializeSignalGuards();
+    stage_start = perf_start != 0 ? ArtPerfNowNs() : 0;
+    const bool signal_guard_ready = g_is_system_process && InitializeSignalGuards();
+    if (stage_start != 0) {
+        LOGI("[perf] art_controller component=signal_guard ready={} elapsedUs={}",
+             signal_guard_ready, ArtPerfElapsedUs(stage_start));
+    }
     g_initialized = true;
     LOGI("WxShadow ART backend ready: stealth={} ArtMethod size={} flags={} data={} entry={} jni={} "
          "thread_current={} thread_layout={} shared_jni_nterp_layer1={} "
@@ -2367,16 +2548,47 @@ bool InitializeImpl(JNIEnv *env) {
          "oat_header={} oat_inline_patch={} signal_guard={}",
          ArtStealthModeName(g_art_stealth_mode), g_layout.method_size,
          g_layout.access_flags_offset, g_layout.data_offset, g_layout.entry_offset,
-         g_layout.jni_trampoline, reinterpret_cast<void *>(g_thread_current), thread_layout_found,
+         g_layout.jni_trampoline, reinterpret_cast<void *>(g_thread_current),
+         g_thread_layout_found,
          use_shared_jni_nterp_layer1, shared_nterp_ready, shared_nterp_clinit_ready,
          shared_jni_ready, shared_interpreter_ready, shared_resolution_ready,
          do_call_count, gc_hook_count, oat_header_ready, oat_inline_patched, signal_guard_ready);
+    if (perf_start != 0) {
+        LOGI("[perf] art_controller end stealth={} elapsedUs={}",
+             ArtStealthModeName(g_art_stealth_mode), ArtPerfElapsedUs(perf_start));
+    }
     return true;
 }
 
 #endif  // defined(__aarch64__)
 
 }  // namespace
+
+bool IsWxShadowStealthMode() {
+#if defined(__aarch64__)
+    return g_art_stealth_mode == ArtStealthMode::WxShadow;
+#else
+    return false;
+#endif
+}
+
+void SetSystemProcess(bool is_system) {
+#if defined(__aarch64__)
+    g_is_system_process = is_system;
+    LOGI("WxShadow ART process context: system={}", is_system);
+#else
+    (void)is_system;
+#endif
+}
+
+void SetManagerProcess(bool is_manager) {
+#if defined(__aarch64__)
+    g_is_manager_process = is_manager;
+    LOGI("WxShadow ART manager process context: manager={}", is_manager);
+#else
+    (void)is_manager;
+#endif
+}
 
 MethodState::~MethodState() {
 #if defined(__aarch64__)
@@ -2419,8 +2631,43 @@ MethodState::~MethodState() {
 
 bool Initialize(JNIEnv *env) {
 #if defined(__aarch64__)
+    return CompleteInitialization(env);
+#else
+    (void)env;
+    return false;
+#endif
+}
+
+bool InitializeBootstrap(JNIEnv *env) {
+#if defined(__aarch64__)
+    const uint64_t perf_start = ArtPerfEnabled() ? ArtPerfNowNs() : 0;
     if (!env) return false;
-    std::call_once(g_init_once, [env] { g_initialized = InitializeImpl(env); });
+    std::call_once(g_base_init_once, [env] { g_base_initialized = InitializeBaseImpl(env); });
+    if (!g_base_initialized) return false;
+    std::call_once(g_bootstrap_init_once,
+                   [env] { g_bootstrap_initialized = InitializeBootstrapImpl(env); });
+    if (perf_start != 0) {
+        LOGI("[perf] art_bootstrap end ready={} stealth={} elapsedUs={}",
+             g_bootstrap_initialized, ArtStealthModeName(g_art_stealth_mode),
+             ArtPerfElapsedUs(perf_start));
+    }
+    return g_bootstrap_initialized;
+#else
+    (void)env;
+    return false;
+#endif
+}
+
+bool CompleteInitialization(JNIEnv *env) {
+#if defined(__aarch64__)
+    const uint64_t perf_start = ArtPerfEnabled() ? ArtPerfNowNs() : 0;
+    if (!InitializeBootstrap(env)) return false;
+    std::call_once(g_controller_init_once,
+                   [env] { g_initialized = CompleteInitializationImpl(env); });
+    if (perf_start != 0) {
+        LOGI("[perf] art_complete end ready={} elapsedUs={}",
+             g_initialized, ArtPerfElapsedUs(perf_start));
+    }
     return g_initialized;
 #else
     (void)env;
@@ -2430,7 +2677,7 @@ bool Initialize(JNIEnv *env) {
 
 bool IsAvailable() {
 #if defined(__aarch64__)
-    return g_initialized;
+    return g_bootstrap_initialized;
 #else
     return false;
 #endif
@@ -2452,7 +2699,8 @@ std::unique_ptr<MethodState> Install(JNIEnv *env, jobject reflected_method,
     (void)env; (void)reflected_method; (void)callback; (void)key;
     return nullptr;
 #else
-    if (!env || !reflected_method || !callback || !Initialize(env)) return nullptr;
+    const uint64_t perf_start = ArtPerfEnabled() ? ArtPerfNowNs() : 0;
+    if (!env || !reflected_method || !callback || !InitializeBootstrap(env)) return nullptr;
     std::lock_guard lock(g_install_mutex);
 
     auto state = std::make_unique<MethodState>();
@@ -2568,6 +2816,13 @@ std::unique_ptr<MethodState> Install(JNIEnv *env, jobject reflected_method,
             shared_router = &g_interpreter_bridge_router;
             downgrade_shared_entry = true;
         }
+        if (!shared_router && EnsureInterpreterRouter(env)) {
+            shared_router = &g_interpreter_bridge_router;
+            downgrade_shared_entry = true;
+            LOGD("WxShadow ART dynamic shared router prepared on demand: method={} source={}",
+                 reinterpret_cast<void *>(state->original_art_method),
+                 reinterpret_cast<void *>(state->original_entry));
+        }
     }
     const bool uses_shared_router = shared_router != nullptr;
     if (!state->native_entry_hook && !route_has_independent_code && !uses_shared_router) {
@@ -2667,6 +2922,11 @@ std::unique_ptr<MethodState> Install(JNIEnv *env, jobject reflected_method,
         LOGD("WxShadow ART registered-native route prepared: method={} target={}",
              reinterpret_cast<void *>(state->original_art_method),
              reinterpret_cast<void *>(state->native_entry_target));
+        if (perf_start != 0) {
+            LOGI("[perf] art_method_install end method={} route=registered_native elapsedUs={}",
+                 reinterpret_cast<void *>(state->original_art_method),
+                 ArtPerfElapsedUs(perf_start));
+        }
         return state;
     }
     state->replacement = reinterpret_cast<uintptr_t>(malloc(state->method_size));
@@ -2727,9 +2987,9 @@ std::unique_ptr<MethodState> Install(JNIEnv *env, jobject reflected_method,
         }
     } else {
         void *hooked_target = nullptr;
-        state->quick_trampoline = reinterpret_cast<uintptr_t>(hook_install_art_router(
+        state->quick_trampoline = reinterpret_cast<uintptr_t>(InstallArtRouterWithFallback(
             reinterpret_cast<void *>(state->original_entry),
-            static_cast<uint32_t>(state->entry_offset), ArtStealthFlag(), env, &hooked_target,
+            static_cast<uint32_t>(state->entry_offset), env, &hooked_target,
             0, 0, 0, 0));
         if (!state->quick_trampoline) return nullptr;
         state->router_target = reinterpret_cast<uintptr_t>(
@@ -2739,12 +2999,18 @@ std::unique_ptr<MethodState> Install(JNIEnv *env, jobject reflected_method,
              reinterpret_cast<void *>(state->original_entry),
              reinterpret_cast<void *>(state->router_target));
     }
+    if (perf_start != 0) {
+        LOGI("[perf] art_method_install end method={} route=art_router stealth={} elapsedUs={}",
+             reinterpret_cast<void *>(state->original_art_method),
+             ArtStealthModeName(g_art_stealth_mode), ArtPerfElapsedUs(perf_start));
+    }
     return state;
 #endif
 }
 
 bool Activate(MethodState &state) {
 #if defined(__aarch64__)
+    const uint64_t perf_start = ArtPerfEnabled() ? ArtPerfNowNs() : 0;
     // Publish complete callback state atomically with respect to concurrent
     // installs; the router table itself has no internal writer lock.
     std::lock_guard lock(g_install_mutex);
@@ -2764,6 +3030,11 @@ bool Activate(MethodState &state) {
         LOGD("WxShadow ART registered-native entry installed: method={} target={} trampoline={}",
              reinterpret_cast<void *>(state.original_art_method),
              reinterpret_cast<void *>(state.native_entry_target), trampoline);
+        if (perf_start != 0) {
+            LOGI("[perf] art_method_activate end method={} route=registered_native elapsedUs={}",
+                 reinterpret_cast<void *>(state.original_art_method),
+                 ArtPerfElapsedUs(perf_start));
+        }
         return true;
     }
     if (state.original_art_method == 0 || state.replacement == 0 ||
@@ -2771,6 +3042,11 @@ bool Activate(MethodState &state) {
         return false;
     }
     RegisterActiveState(&state);
+    if (perf_start != 0) {
+        LOGI("[perf] art_method_activate end method={} route=art_router elapsedUs={}",
+             reinterpret_cast<void *>(state.original_art_method),
+             ArtPerfElapsedUs(perf_start));
+    }
     return true;
 #else
     (void)state;
@@ -2822,14 +3098,6 @@ jobject InvokeOriginal(JNIEnv *env, const MethodState &state, jobject receiver,
         }
     } object_ref_guard{env, object_args};
 
-    // Source: rustFrida callback/original_call.rs avoids JNI for the normal
-    // quick callback path and invokes the relocated quick trampoline directly.
-    // Vector's current Java callback enters here from the JNI replacement, so
-    // prefer the live ArtMethod plus the engine's one-shot orig_bypass. This
-    // keeps ART's pre-invoke metadata reads on the real ArtMethod while the
-    // router still tail-calls the original quick trampoline instead of
-    // re-entering this callback. Registered native-entry hooks still use the
-    // clone because their original target is the replaced JNI function pointer.
     struct OriginalBypassGuard {
         uintptr_t method = 0;
         bool active = false;
@@ -2842,7 +3110,7 @@ jobject InvokeOriginal(JNIEnv *env, const MethodState &state, jobject receiver,
         state.quick_trampoline != 0) {
         original_bypass.active =
             orig_bypass_set_current_thread(state.original_art_method,
-                                           state.quick_trampoline) == 0;
+                                            state.quick_trampoline) == 0;
         use_live_original = original_bypass.active;
     }
 

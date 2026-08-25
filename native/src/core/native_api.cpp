@@ -1,10 +1,12 @@
 #include "core/native_api.h"
 
+#include <android/dlext.h>
+
 #include <sys/mman.h>
 #include <sys/prctl.h>
 
-#include <algorithm>
 #include <cerrno>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -12,18 +14,23 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <string_view>
+#include <unordered_set>
+#include <unordered_map>
+#include <vector>
 
 #include "common/logging.h"
 #include "art_hook/hook_engine.h"
 #include "elf/elf_image.h"
 #include "elf/symbol_cache.h"
+#include "elf_loader.h"
 
 /**
  * @file native_api.cpp
- * @brief Implementation of the native module loading and API provisioning system.
+ * @brief Implementation of Vector's wxshadow native hook and core ELF loading helpers.
  */
 
-using lsplant::operator""_sym;
 /*
  * ===========================================================================================
  * LSPLANT HOOKING DSL (DOMAIN SPECIFIC LANGUAGE) DOCUMENTATION
@@ -88,17 +95,37 @@ using lsplant::operator""_sym;
 namespace vector::native {
 
 namespace {
-// Mutex to protect access to the global module lists.
-std::mutex g_module_registry_mutex;
-// List of callback functions provided by loaded native modules.
+std::mutex g_core_elf_registry_mutex;
+std::unordered_map<std::string, std::unique_ptr<ElfLoader>> g_loaded_module_loaders;
+std::unordered_map<std::string, void *> g_loaded_module_linker_handles;
+std::unordered_set<std::string> g_module_native_libs;
+std::unordered_set<void *> g_initialized_linker_module_handles;
+std::unordered_set<std::string> g_loading_module_libraries;
 std::list<NativeOnModuleLoaded> g_module_loaded_callbacks;
-// List of native library filenames that are registered as modules.
-std::list<std::string> g_module_native_libs;
+
+// Temporary diagnostic build switch requested for comparing Vector soLoader against Android linker.
+// Keep the Java/daemon transport unchanged (module ELF still arrives as sealed SharedMemory), but
+// hand the FD to bionic linker via android_dlopen_ext instead of Vector's ElfLoader. This must not
+// be kept enabled in the production soLoader path.
+constexpr bool kDiagUseAndroidLinkerForModuleNative = false;
+
+using DoDlopen = void *(*)(const char *name, int flags, const void *extinfo,
+                           const void *caller_addr);
+DoDlopen g_do_dlopen_backup = nullptr;
+std::mutex g_do_dlopen_backup_mutex;
+std::condition_variable g_do_dlopen_backup_ready;
+std::once_flag g_native_load_monitor_once;
+bool g_native_load_monitor_installed = false;
 
 constexpr size_t kModuleHookExecPoolSize = 128 * 1024;
 constexpr char kInitialHookExecVmaName[] = "wwb_hook_exec";
 std::mutex g_module_hook_engine_mutex;
 void *g_module_hook_exec_pool = nullptr;
+
+std::unique_ptr<void, std::function<void(void *)>> g_api_page(
+    mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0), [](void *ptr) {
+        if (ptr != MAP_FAILED) munmap(ptr, 4096);
+    });
 
 #ifndef PR_SET_VMA
 #define PR_SET_VMA 0x53564d41
@@ -107,14 +134,6 @@ void *g_module_hook_exec_pool = nullptr;
 #define PR_SET_VMA_ANON_NAME 0
 #endif
 
-// A smart pointer to a memory page that will hold the NativeAPIEntries struct.
-std::unique_ptr<void, std::function<void(void *)>> g_api_page(
-    mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0), [](void *ptr) {
-        if (ptr != MAP_FAILED) {
-            munmap(ptr, 4096);
-        }
-    });
-
 bool IsWxshadowHookEngineReady() {
 #if defined(__aarch64__)
     ExecPoolRange range{};
@@ -122,6 +141,51 @@ bool IsWxshadowHookEngineReady() {
 #else
     return false;
 #endif
+}
+
+std::string FindMapLine(void *address) {
+    if (address == nullptr) return "(null)";
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) return "(maps unavailable)";
+
+    const uintptr_t target = reinterpret_cast<uintptr_t>(address);
+    char line[512];
+    while (fgets(line, sizeof(line), maps)) {
+        unsigned long start = 0;
+        unsigned long end = 0;
+        if (sscanf(line, "%lx-%lx", &start, &end) != 2) continue;
+        if (target >= static_cast<uintptr_t>(start) && target < static_cast<uintptr_t>(end)) {
+            fclose(maps);
+            const size_t len = strnlen(line, sizeof(line));
+            if (len > 0 && line[len - 1] == '\n') line[len - 1] = '\0';
+            return line;
+        }
+    }
+    fclose(maps);
+    return "(not mapped)";
+}
+
+std::string FormatBytes(const void *address, size_t size) {
+    if (address == nullptr || size == 0) return "";
+    constexpr size_t kMaxBytes = 32;
+    if (size > kMaxBytes) size = kMaxBytes;
+
+    const auto *bytes = reinterpret_cast<const uint8_t *>(address);
+    char buffer[kMaxBytes * 3] = {};
+    size_t offset = 0;
+    for (size_t i = 0; i < size && offset < sizeof(buffer); ++i) {
+        const int written = snprintf(buffer + offset, sizeof(buffer) - offset, "%02x%s",
+                                     bytes[i], i + 1 == size ? "" : " ");
+        if (written <= 0) break;
+        offset += static_cast<size_t>(written);
+    }
+    return std::string(buffer);
+}
+
+bool HasEnding(std::string_view full_string, std::string_view ending) {
+    if (full_string.length() < ending.length()) return false;
+    return full_string.compare(full_string.length() - ending.length(), std::string_view::npos,
+                               ending) == 0;
 }
 
 void SetInitialHookExecVmaName(void *base, size_t size) {
@@ -207,6 +271,11 @@ int HookModuleInlineWxshadow(void *original, void *replace, void **backup) {
         return HOOK_ERROR_WXSHADOW_FAILED;
     }
 
+    LOGI("Native module wxshadow inline hook installed: target={} replacement={} trampoline={} "
+         "targetMap='{}' replacementMap='{}' trampolineMap='{}'",
+         original, replace, trampoline, FindMapLine(original).c_str(),
+         FindMapLine(replace).c_str(), FindMapLine(trampoline).c_str());
+
     *backup = trampoline;
     return HOOK_OK;
 #else
@@ -230,6 +299,141 @@ int UnhookModuleInlineWxshadow(void *original) {
     return HOOK_ERROR_NOT_INITIALIZED;
 #endif
 }
+
+const NativeAPIEntries *g_native_api_entries = nullptr;
+
+void InitializeApiEntries() {
+    if (g_api_page.get() == MAP_FAILED) {
+        LOGE("Failed to allocate NativeAPIEntries page");
+        return;
+    }
+    auto *entries = new (g_api_page.get()) NativeAPIEntries{
+        .version = 2,
+        .hookFunc = &HookInlineWxshadow,
+        .unhookFunc = &UnhookInlineWxshadow,
+    };
+    if (mprotect(g_api_page.get(), 4096, PROT_READ) != 0) {
+        PLOGE("Failed to protect NativeAPIEntries page");
+        return;
+    }
+    g_native_api_entries = entries;
+}
+
+bool EnsureNativeApi() {
+    static const bool initialized = [] {
+        InitializeApiEntries();
+        return g_native_api_entries != nullptr;
+    }();
+    return initialized;
+}
+
+void NotifyNativeModuleCallbacks(const char *name, void *handle) {
+    if (handle == nullptr) return;
+
+    std::vector<NativeOnModuleLoaded> callbacks;
+    {
+        std::lock_guard<std::mutex> lock(g_core_elf_registry_mutex);
+        callbacks.assign(g_module_loaded_callbacks.begin(), g_module_loaded_callbacks.end());
+    }
+
+    for (const auto callback : callbacks) {
+        try {
+            callback(name, handle);
+        } catch (...) {
+            LOGE("Native module library-load callback threw for '{}'.",
+                 name != nullptr ? name : "(null)");
+        }
+    }
+}
+
+void *DoDlopenHook(const char *name, int flags, const void *extinfo, const void *caller_addr) {
+    std::unique_lock<std::mutex> lock(g_do_dlopen_backup_mutex);
+    g_do_dlopen_backup_ready.wait(lock, [] { return g_do_dlopen_backup != nullptr; });
+    const auto backup = g_do_dlopen_backup;
+    lock.unlock();
+
+    void *handle = backup(name, flags, extinfo, caller_addr);
+    const std::string lib_name = name != nullptr ? name : "null";
+    LOGV("do_dlopen hook triggered for library: '{}'", lib_name.c_str());
+    if (handle != nullptr) {
+        bool should_initialize_module = false;
+        std::string matched_module_lib;
+        {
+            std::lock_guard<std::mutex> registry_lock(g_core_elf_registry_mutex);
+            for (const auto &module_lib : g_module_native_libs) {
+                if (HasEnding(lib_name, module_lib)) {
+                    should_initialize_module =
+                        g_initialized_linker_module_handles.insert(handle).second;
+                    matched_module_lib = module_lib;
+                    break;
+                }
+            }
+        }
+
+        if (should_initialize_module) {
+            LOGW("DIAG linker detected registered native module loaded: name='{}' match='{}' handle={}",
+                 lib_name.c_str(), matched_module_lib.c_str(), handle);
+            void *init_sym = dlsym(handle, "native_init");
+            if (init_sym == nullptr) {
+                LOGE("DIAG linker module '{}' does not export native_init: {}",
+                     lib_name.c_str(), dlerror());
+            } else {
+                try {
+                    auto native_init = reinterpret_cast<NativeInit>(init_sym);
+                    LOGW("DIAG linker native_init diagnostics for '{}': addr={} map='{}' bytes=[{}]",
+                         lib_name.c_str(), init_sym, FindMapLine(init_sym).c_str(),
+                         FormatBytes(init_sym, 16).c_str());
+                    if (auto callback = native_init(g_native_api_entries); callback != nullptr) {
+                        std::lock_guard<std::mutex> registry_lock(g_core_elf_registry_mutex);
+                        g_module_loaded_callbacks.push_back(callback);
+                        LOGW("DIAG linker native_init for '{}' registered library-load callback {}.",
+                             lib_name.c_str(), reinterpret_cast<void *>(callback));
+                    } else {
+                        LOGW("DIAG linker native_init for '{}' completed without library-load callback.",
+                             lib_name.c_str());
+                    }
+                } catch (...) {
+                    LOGE("DIAG linker native_init threw for module '{}'.", lib_name.c_str());
+                }
+            }
+        }
+    }
+    NotifyNativeModuleCallbacks(name, handle);
+    return handle;
+}
+
+bool InstallNativeLibraryLoadMonitor() {
+    std::call_once(g_native_load_monitor_once, [] {
+        // Reference: the original Vector native ABI hooked this linker internal entrypoint to
+        // deliver NativeOnModuleLoaded(name, handle) after a successful target-library load.
+        // The replacement is installed through Vector's wxshadow hook engine instead of LSPlant.
+        const auto *linker = ElfSymbolCache::GetLinker();
+        if (linker == nullptr) {
+            LOGE("Cannot install native library-load monitor: linker image unavailable.");
+            return;
+        }
+        void *target = linker->getSymbAddress<void *>(
+            "__dl__Z9do_dlopenPKciPK17android_dlextinfoPKv");
+        if (target == nullptr) {
+            LOGE("Cannot install native library-load monitor: do_dlopen symbol unavailable.");
+            return;
+        }
+
+        void *backup = nullptr;
+        if (HookInlineWxshadow(target, reinterpret_cast<void *>(&DoDlopenHook), &backup) != HOOK_OK ||
+            backup == nullptr) {
+            LOGE("Cannot install native library-load monitor through wxshadow.");
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_do_dlopen_backup_mutex);
+            g_do_dlopen_backup = reinterpret_cast<DoDlopen>(backup);
+        }
+        g_do_dlopen_backup_ready.notify_all();
+        g_native_load_monitor_installed = true;
+    });
+    return g_native_load_monitor_installed;
+}
 }  // namespace
 
 int HookInlineWxshadow(void *original, void *replace, void **backup) {
@@ -240,109 +444,151 @@ int UnhookInlineWxshadow(void *original) {
     return UnhookModuleInlineWxshadow(original);
 }
 
-// The read-only, statically available Native API entry points for modules.
-const NativeAPIEntries *g_native_api_entries = nullptr;
-
-/**
- * @brief Initializes the Native API entries struct and makes it read-only.
- */
-void InitializeApiEntries() {
-    if (g_api_page.get() == MAP_FAILED) {
-        LOGF("Failed to allocate memory for native API entries.");
-        LOGD("Release the memory page pointer %p", g_api_page.release());
+void RegisterNativeLib(const std::string &library_name) {
+    if (library_name.empty()) {
+        LOGE("Cannot register empty native module library name.");
         return;
     }
-    auto *entries = new (g_api_page.get()) NativeAPIEntries{
-        .version = 2,
-        .hookFunc = &HookInlineWxshadow,
-        .unhookFunc = &UnhookInlineWxshadow,
-    };
-    if (mprotect(g_api_page.get(), 4096, PROT_READ) != 0) {
-        PLOGE("Failed to mprotect API page to read-only");
-    }
-    g_native_api_entries = entries;
-    LOGI("Native API entries initialized and protected.");
-}
+    if (!EnsureNativeApi()) return;
+    if (!InstallNativeLibraryLoadMonitor()) return;
 
-void RegisterNativeLib(const std::string &library_name) {
-    static bool is_initialized = []() {
-        InitializeApiEntries();
-        return InstallNativeAPI(lsplant::InitInfo{
-            .inline_hooker =
-                [](void *target, void *replacement) {
-                    void *backup = nullptr;
-                    return HookInline(target, replacement, &backup) == 0 ? backup : nullptr;
-                },
-            .art_symbol_resolver =
-                [](auto symbol) { return ElfSymbolCache::GetLinker()->getSymbAddress(symbol); },
-        });
-    }();
-
-    if (!is_initialized) {
-        LOGE("Cannot register module '{}' because native API failed to initialize.",
+    std::lock_guard<std::mutex> lock(g_core_elf_registry_mutex);
+    if (!g_module_native_libs.insert(library_name).second) {
+        LOGD("DIAG linker native module library '{}' is already registered.",
              library_name.c_str());
         return;
     }
-
-    std::lock_guard<std::mutex> lock(g_module_registry_mutex);
-    // The list is walked on every dlopen in the process and never shrinks - there is no
-    // unregistration, and hot reload records a module's names again for each new generation - so
-    // without this it grows without bound and every dlopen pays for the duplicates.
-    if (std::find(g_module_native_libs.begin(), g_module_native_libs.end(), library_name) !=
-        g_module_native_libs.end()) {
-        LOGD("Native module library '{}' is already registered.", library_name.c_str());
-        return;
-    }
-    g_module_native_libs.push_back(library_name);
-    LOGD("Native module library '{}' has been registered.", library_name.c_str());
+    LOGW("DIAG linker native module library '{}' has been registered.",
+         library_name.c_str());
 }
 
-bool HasEnding(std::string_view fullString, std::string_view ending) {
-    if (fullString.length() >= ending.length()) {
-        return (fullString.compare(fullString.length() - ending.length(), std::string_view::npos,
-                                   ending) == 0);
+bool LoadNativeLibraryFd(int fd, size_t size, const std::string &library_name) {
+    if (fd < 0 || size == 0 || library_name.empty()) {
+        LOGE("Invalid module ELF input name='{}' fd={} size={}", library_name, fd, size);
+        return false;
     }
-    return false;
-}
+    if (!EnsureNativeApi()) return false;
+    if (!InstallNativeLibraryLoadMonitor()) return false;
+    LOGI("Vector soLoader loading module ELF '{}' fd={} size={}", library_name.c_str(), fd, size);
 
-inline static auto do_dlopen_hook =
-    "__dl__Z9do_dlopenPKciPK17android_dlextinfoPKv"_sym.hook->*
-    []<lsplant::Backup auto backup>(const char *name, int flags, const void *extinfo,
-                                    const void *caller_addr) static -> void * {
-    void *handle = backup(name, flags, extinfo, caller_addr);
-    const std::string lib_name = (name != nullptr) ? name : "null";
-    LOGV("do_dlopen hook triggered for library: '{}'", lib_name.c_str());
-
-    if (handle == nullptr) return nullptr;
-
-    std::lock_guard<std::mutex> lock(g_module_registry_mutex);
-
-    for (std::string_view module_lib : g_module_native_libs) {
-        if (HasEnding(lib_name, module_lib)) {
-            LOGI("Detected registered native module being loaded: '{}'", lib_name.c_str());
-            void *init_sym = dlsym(handle, "native_init");
-            if (init_sym == nullptr) {
-                LOGW("Library '{}' matches a module name but does not export 'native_init'.",
-                     lib_name.c_str());
-                break;
-            }
-            auto native_init = reinterpret_cast<NativeInit>(init_sym);
-            if (auto callback = native_init(g_native_api_entries)) {
-                g_module_loaded_callbacks.push_back(callback);
-                LOGI("Initialized native module '{}' and registered its callback.",
-                     lib_name.c_str());
-            }
-            break;
+    {
+        std::lock_guard<std::mutex> lock(g_core_elf_registry_mutex);
+        if (g_loaded_module_loaders.contains(library_name)) {
+            LOGI("Module ELF '{}' is already loaded through Vector soLoader.", library_name.c_str());
+            return true;
+        }
+        if (g_loaded_module_linker_handles.contains(library_name)) {
+            LOGI("Module ELF '{}' is already loaded through diagnostic Android linker path.",
+                 library_name.c_str());
+            return true;
+        }
+        if (!g_loading_module_libraries.insert(library_name).second) {
+            LOGE("Module ELF '{}' is already being loaded.", library_name.c_str());
+            return false;
         }
     }
 
-    for (const auto &callback : g_module_loaded_callbacks) {
-        callback(name, handle);
+    const auto finish_loading = [&library_name]() {
+        std::lock_guard<std::mutex> lock(g_core_elf_registry_mutex);
+        g_loading_module_libraries.erase(library_name);
+    };
+
+    if constexpr (kDiagUseAndroidLinkerForModuleNative) {
+        LOGW("DIAG linker loader enabled for module ELF '{}' fd={} size={}; bypassing Vector soLoader for this build.",
+             library_name.c_str(), fd, size);
+
+        android_dlextinfo extinfo{};
+        extinfo.flags = ANDROID_DLEXT_USE_LIBRARY_FD | ANDROID_DLEXT_FORCE_LOAD;
+        extinfo.library_fd = fd;
+        void *handle = android_dlopen_ext(library_name.c_str(), RTLD_NOW, &extinfo);
+        if (handle == nullptr) {
+            LOGE("DIAG linker loader failed for module '{}': {}", library_name.c_str(), dlerror());
+            finish_loading();
+            return false;
+        }
+        LOGW("DIAG linker loader linked module ELF '{}' handle={} map='{}'.",
+             library_name.c_str(), handle, FindMapLine(handle).c_str());
+
+        auto init_sym = dlsym(handle, "native_init");
+        if (init_sym == nullptr) {
+            LOGE("DIAG linker loader module '{}' does not export native_init: {}",
+                 library_name.c_str(), dlerror());
+            finish_loading();
+            return false;
+        }
+
+        try {
+            auto native_init = reinterpret_cast<NativeInit>(init_sym);
+            LOGW("DIAG linker native_init diagnostics for '{}': addr={} map='{}' bytes=[{}]",
+                 library_name.c_str(), init_sym, FindMapLine(init_sym).c_str(),
+                 FormatBytes(init_sym, 16).c_str());
+            LOGW("DIAG linker calling native_init for module ELF '{}' at {}",
+                 library_name.c_str(), init_sym);
+            if (auto callback = native_init(g_native_api_entries); callback != nullptr) {
+                std::lock_guard<std::mutex> lock(g_core_elf_registry_mutex);
+                g_module_loaded_callbacks.push_back(callback);
+                LOGW("DIAG linker native_init for '{}' registered library-load callback {}.",
+                     library_name.c_str(), reinterpret_cast<void *>(callback));
+            } else {
+                LOGW("DIAG linker native_init for '{}' completed without library-load callback.",
+                     library_name.c_str());
+            }
+        } catch (...) {
+            LOGE("DIAG linker native_init threw for module '{}'.", library_name.c_str());
+            finish_loading();
+            return false;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_core_elf_registry_mutex);
+            g_loading_module_libraries.erase(library_name);
+            g_loaded_module_linker_handles.emplace(library_name, handle);
+        }
+        return true;
     }
 
-    return handle;
-};
+    auto loader = std::make_unique<ElfLoader>();
+    if (!loader->LoadLibraryFd(fd, size, library_name.c_str())) {
+        LOGE("Vector soLoader failed for module '{}'.", library_name.c_str());
+        finish_loading();
+        return false;
+    }
+    LOGI("Vector soLoader linked module ELF '{}'.", library_name.c_str());
 
-bool InstallNativeAPI(const lsplant::HookHandler &handler) { return handler(do_dlopen_hook); }
+    auto init_sym = loader->GetSymbol("native_init");
+    if (init_sym == nullptr) {
+        LOGE("Module '{}' does not export native_init.", library_name.c_str());
+        finish_loading();
+        return false;
+    }
+
+    try {
+        auto native_init = reinterpret_cast<NativeInit>(init_sym);
+        LOGI("native_init entry diagnostics for '{}': addr={} map='{}' bytes=[{}]",
+             library_name.c_str(), init_sym, FindMapLine(init_sym).c_str(),
+             FormatBytes(init_sym, 16).c_str());
+        LOGI("Calling native_init for module ELF '{}' at {}", library_name.c_str(), init_sym);
+        if (auto callback = native_init(g_native_api_entries); callback != nullptr) {
+            std::lock_guard<std::mutex> lock(g_core_elf_registry_mutex);
+            g_module_loaded_callbacks.push_back(callback);
+            LOGI("native_init for '{}' registered library-load callback {}.",
+                 library_name.c_str(), reinterpret_cast<void *>(callback));
+        } else {
+            LOGI("native_init for '{}' completed without library-load callback.",
+                 library_name.c_str());
+        }
+    } catch (...) {
+        LOGE("native_init threw for module '{}'.", library_name.c_str());
+        finish_loading();
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_core_elf_registry_mutex);
+        g_loading_module_libraries.erase(library_name);
+        g_loaded_module_loaders.emplace(library_name, std::move(loader));
+    }
+    return true;
+}
 
 }  // namespace vector::native
