@@ -23,10 +23,12 @@ import org.matrix.vector.impl.core.VectorModuleManager;
 import org.matrix.vector.impl.core.VectorServiceClient;
 import org.matrix.vector.impl.utils.VectorModuleClassLoader;
 import org.matrix.vector.nativebridge.HookBridge;
+import org.matrix.vector.nativebridge.NativeAPI;
 import org.matrix.vector.nativebridge.ResourcesHook;
 import org.matrix.vector.ipc.ModuleCode;
 import org.matrix.vector.util.Log;
 
+import java.io.File;
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
@@ -203,16 +205,25 @@ public final class XposedInit {
     }
 
     public static void loadLegacyModules() {
+        long totalStartNs = System.nanoTime();
         var moduleList = VectorServiceClient.INSTANCE.getLegacyModules();
+        Log.i(TAG, "[startup-trace] loadLegacyModules begin count=" + moduleList.size());
         moduleList.forEach(module -> {
+            long moduleStartNs = System.nanoTime();
             var apk = module.apkPath;
             var name = module.packageName;
             var file = module.code;
             loadedModules.put(name, Optional.of(apk)); // temporarily add it for XSharedPreference
-            if (!loadModule(name, apk, file)) {
+            boolean loaded = loadModule(name, apk, file);
+            if (!loaded) {
                 loadedModules.remove(name);
             }
+            Log.i(TAG, "[startup-trace] legacy module end package=" + name
+                    + " loaded=" + loaded + " elapsedUs="
+                    + ((System.nanoTime() - moduleStartNs) / 1_000L));
         });
+        Log.i(TAG, "[startup-trace] loadLegacyModules end elapsedUs="
+                + ((System.nanoTime() - totalStartNs) / 1_000L));
     }
 
     private static final AtomicBoolean modulesLoaded = new AtomicBoolean(false);
@@ -221,27 +232,65 @@ public final class XposedInit {
         // A late-injected system server calls this directly because its ActivityThread.attach
         // already ran; guard so the normal path cannot load a second generation on top.
         if (!modulesLoaded.compareAndSet(false, true)) {
+            Log.i(TAG, "[startup-trace] loadModules skipped: modules already loaded");
             return;
         }
+        long totalStartNs = System.nanoTime();
+        long stepStartNs = System.nanoTime();
+        Log.i(TAG, "[startup-trace] loadModules step begin: getModules");
+        var moduleList = VectorServiceClient.INSTANCE.getModules();
+        Log.i(TAG, "[startup-trace] loadModules step end: getModules count=" + moduleList.size()
+                + " elapsedUs=" + ((System.nanoTime() - stepStartNs) / 1_000L));
+        Log.i(TAG, "[startup-trace] loadModules begin count=" + moduleList.size()
+                + " system=" + startsSystemServer);
+
+        stepStartNs = System.nanoTime();
+        Log.i(TAG, "[startup-trace] loadModules step begin: reflect.ActivityThread.mPackages");
         var packages = (ArrayMap<?, ?>) XposedHelpers.getObjectField(at, "mPackages");
-        VectorServiceClient.INSTANCE.getModules().forEach(module -> {
+        Log.i(TAG, "[startup-trace] loadModules step end: reflect.ActivityThread.mPackages"
+                + " size=" + packages.size()
+                + " elapsedUs=" + ((System.nanoTime() - stepStartNs) / 1_000L));
+
+        moduleList.forEach(module -> {
+            long moduleStartNs = System.nanoTime();
+            long moduleStepStartNs = System.nanoTime();
+            Log.i(TAG, "[startup-trace] module step begin label=loadedModules.put module="
+                    + module.packageName);
             loadedModules.put(module.packageName, Optional.empty());
-            if (!VectorModuleManager.INSTANCE.loadModule(module, startsSystemServer, VectorServiceClient.INSTANCE.getProcessName())) {
+            Log.i(TAG, "[startup-trace] module step end label=loadedModules.put module="
+                    + module.packageName
+                    + " elapsedUs=" + ((System.nanoTime() - moduleStepStartNs) / 1_000L));
+            moduleStepStartNs = System.nanoTime();
+            Log.i(TAG, "[startup-trace] module step begin label=VectorModuleManager.loadModule.call module="
+                    + module.packageName);
+            boolean loaded = VectorModuleManager.INSTANCE.loadModule(
+                    module, startsSystemServer, VectorServiceClient.INSTANCE.getProcessName());
+            Log.i(TAG, "[startup-trace] module step end label=VectorModuleManager.loadModule.call module="
+                    + module.packageName
+                    + " loaded=" + loaded
+                    + " elapsedUs=" + ((System.nanoTime() - moduleStepStartNs) / 1_000L));
+            if (!loaded) {
                 loadedModules.remove(module.packageName);
             } else {
+                moduleStepStartNs = System.nanoTime();
+                Log.i(TAG, "[startup-trace] module step begin label=mPackages.remove module="
+                        + module.packageName);
                 packages.remove(module.packageName);
+                Log.i(TAG, "[startup-trace] module step end label=mPackages.remove module="
+                        + module.packageName
+                        + " elapsedUs=" + ((System.nanoTime() - moduleStepStartNs) / 1_000L));
             }
+            Log.i(TAG, "[startup-trace] module end package=" + module.packageName
+                    + " loaded=" + loaded + " elapsedUs="
+                    + ((System.nanoTime() - moduleStartNs) / 1_000L));
         });
+        Log.i(TAG, "[startup-trace] loadModules end elapsedUs="
+                + ((System.nanoTime() - totalStartNs) / 1_000L));
     }
 
-    /**
-     * Load all so from an APK by reading <code>assets/native_init</code>.
-     * It will only store the so names but not doing anything.
-     */
+    /** Registers module native entrypoint names before module code can invoke System.loadLibrary. */
     private static void initNativeModule(List<String> moduleLibraryNames) {
-        if (!moduleLibraryNames.isEmpty()) {
-            Log.w(TAG, "  Ignoring native_init entries: module native libraries are disabled; use Vector core native hook APIs.");
-        }
+        moduleLibraryNames.forEach(NativeAPI::recordNativeEntrypoint);
     }
 
     private static boolean initModule(ClassLoader mcl, String apk, List<String> moduleClassNames) {
@@ -291,10 +340,18 @@ public final class XposedInit {
     private static boolean loadModule(String name, String apk, ModuleCode file) {
         Log.v(TAG, "Render legacy module " + name + " from " + apk);
 
-        // rustFrida-aligned module model: module APKs provide DEX/script logic only.
-        // Native inline hooks are installed by Vector core; do not point this ClassLoader at
-        // apk!/lib/<abi>, because that makes linker mmap the module base.apk into targets.
-        var librarySearchPath = "";
+        // rawVector reference: legacy/src/main/java/de/robv/android/xposed/XposedInit.java
+        // exposes the staged system_server directory first, then the APK's stored lib entries.
+        // initNativeModule() below registers these names before module code can load them.
+        var sb = new StringBuilder();
+        if (startsSystemServer && file.nativeLibraryDir != null) {
+            sb.append(file.nativeLibraryDir).append(File.pathSeparator);
+        }
+        var abis = Process.is64Bit() ? Build.SUPPORTED_64_BIT_ABIS : Build.SUPPORTED_32_BIT_ABIS;
+        for (String abi : abis) {
+            sb.append(apk).append("!/lib/").append(abi).append(File.pathSeparator);
+        }
+        var librarySearchPath = sb.toString();
 
         // This must run before the first active reference to VectorModuleClassLoader: ART links its
         // hidden BaseDexClassLoader(ByteBuffer...) super call before loadApk() can execute. This is

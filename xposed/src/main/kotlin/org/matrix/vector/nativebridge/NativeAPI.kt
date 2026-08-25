@@ -1,12 +1,16 @@
 package org.matrix.vector.nativebridge
 
+import android.os.SharedMemory
+
 object NativeAPI {
     /**
-     * Compatibility no-op. Vector no longer loads native code from module APKs at runtime; native
-     * inline hook capabilities are provided by Vector core.
+     * Loads module ELF images from sealed SharedMemory through Vector's soLoader only.
      */
     @JvmStatic external fun recordNativeEntrypoint(library_name: String)
 
-    /** Installs Vector core's built-in RegisterNatives probe through the wxshadow hook engine. */
-    @JvmStatic external fun installRegisterNativesProbe(): Boolean
+    @JvmStatic
+    external fun loadNativeLibraries(
+        libraryNames: Array<String>,
+        libraries: Array<SharedMemory>,
+    ): BooleanArray
 }

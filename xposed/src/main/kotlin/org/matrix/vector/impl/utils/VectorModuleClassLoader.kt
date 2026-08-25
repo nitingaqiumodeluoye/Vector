@@ -14,7 +14,10 @@ import java.net.URL
 import java.nio.ByteBuffer
 import java.util.Collections
 import java.util.Enumeration
+import java.util.jar.JarFile
 import java.util.stream.Collectors
+import java.util.zip.ZipEntry
+import de.wwb.android.wbosed.api.WbModule
 import org.matrix.vector.nativebridge.HookBridge
 
 /**
@@ -65,7 +68,7 @@ class VectorModuleClassLoader : ByteBufferDexClassLoader {
         // parent is the framework's own loader, which carries the legacy bridge, so refusing to
         // resolve those names here is what actually enforces it - reflective lookups against this
         // loader included, since Class.forName and loadClass both funnel through this override.
-        if (blockLegacyApi && LEGACY_API_PREFIXES.any { name.startsWith(it) }) {
+        if (blockLegacyApi && isBlockedLegacyApiName(name)) {
             throw ClassNotFoundException(
                 "$name is unavailable to modules targeting Xposed API 102 or higher"
             )
@@ -93,15 +96,35 @@ class VectorModuleClassLoader : ByteBufferDexClassLoader {
         }
     }
 
+    private fun isBlockedLegacyApiName(name: String): Boolean =
+        LEGACY_API_PREFIXES.any { name.startsWith(it) } &&
+            MODERN_API_PACKAGE_PREFIXES.none { name.startsWith(it) }
+
     override fun findLibrary(libraryName: String): String? {
         val fileName = System.mapLibraryName(libraryName)
         for (file in nativeLibraryDirs) {
             val path = file.path
             if (path.contains(ZIP_SEPARATOR)) {
-                // rustFrida-aligned mode: modules are DEX/script inputs, not native-library
-                // providers. Returning an apk!/lib entry makes linker mmap the foreign module
-                // base.apk into the target process.
-                continue
+                if (!USE_RAW_VECTOR_LINKER_NATIVE_LOADER) {
+                    // rustFrida-aligned mode: modules are DEX/script inputs, not native-library
+                    // providers. Returning an apk!/lib entry makes linker mmap the foreign module
+                    // base.apk into the target process.
+                    continue
+                }
+                val split = path.split(ZIP_SEPARATOR, limit = 2)
+                try {
+                    JarFile(split[0]).use { jarFile ->
+                        val entryName = "${split[1]}/$fileName"
+                        val entry = jarFile.getEntry(entryName)
+                        if (entry != null && entry.method == ZipEntry.STORED) {
+                            val resolved = "${split[0]}$ZIP_SEPARATOR$entryName"
+                            Log.w(TAG, "rawVector linker findLibrary($libraryName) -> $resolved")
+                            return resolved
+                        }
+                    }
+                } catch (e: IOException) {
+                    Log.e(TAG, "Cannot open ${split[0]}", e)
+                }
             } else if (file.isDirectory) {
                 val entryPath = File(file, fileName).path
                 try {
@@ -136,6 +159,7 @@ class VectorModuleClassLoader : ByteBufferDexClassLoader {
     companion object {
         private const val TAG = "VectorModuleClassLoader"
         private const val ZIP_SEPARATOR = "!/"
+        private const val USE_RAW_VECTOR_LINKER_NATIVE_LOADER = true
 
         /**
          * What the legacy API is called *here*, which is not what it is called in source: the
@@ -156,6 +180,12 @@ class VectorModuleClassLoader : ByteBufferDexClassLoader {
                         "android.content.res.XModule",
                     )
                 }
+        }
+        // Vector keeps the legacy bridge and modern API under the same source namespace. Derive
+        // the actual modern package from the framework API class so this also works when daemon
+        // dex obfuscation rewrites the package at runtime.
+        private val MODERN_API_PACKAGE_PREFIXES: Array<String> by lazy {
+            arrayOf(WbModule::class.java.name.substringBeforeLast('.') + ".")
         }
         private val SYSTEM_NATIVE_LIBRARY_DIRS = splitPaths(System.getProperty("java.library.path"))
 

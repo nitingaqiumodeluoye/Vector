@@ -3,6 +3,7 @@ package org.matrix.vector.impl.core
 import android.os.Build
 import android.os.Bundle
 import android.os.Process
+import android.os.SharedMemory
 import de.wwb.android.wbosed.api.WbInterface
 import de.wwb.android.wbosed.api.WbInterface.ExceptionMode
 import de.wwb.android.wbosed.api.WbModule
@@ -22,6 +23,7 @@ import org.matrix.vector.impl.VectorLifecycleManager
 import org.matrix.vector.impl.hooks.VectorHookBuilder
 import org.matrix.vector.impl.utils.VectorModuleClassLoader
 import org.matrix.vector.nativebridge.HookBridge
+import org.matrix.vector.nativebridge.NativeAPI
 
 /**
  * Responsible for loading modules into the target process. Handles ClassLoader isolation and
@@ -30,6 +32,75 @@ import org.matrix.vector.nativebridge.HookBridge
 object VectorModuleManager {
 
     private const val TAG = "VectorModuleManager"
+    // rawVector baseline: register native_init names, expose the module's native-library search
+    // path, and let the module invoke Android's linker through System.loadLibrary().
+    private const val USE_RAW_VECTOR_LINKER_NATIVE_LOADER = true
+
+    private fun elapsedUs(startNs: Long): Long = (System.nanoTime() - startNs) / 1_000L
+
+    private inline fun <T> traceStartupStep(
+        label: String,
+        modulePackageName: String,
+        block: () -> T,
+    ): T {
+        val startNs = System.nanoTime()
+        Log.i(
+            TAG,
+            "[startup-trace] module step begin label=$label module=$modulePackageName",
+        )
+        return try {
+            val result = block()
+            Log.i(
+                TAG,
+                "[startup-trace] module step end label=$label module=$modulePackageName " +
+                    "elapsedUs=${elapsedUs(startNs)}",
+            )
+            result
+        } catch (t: Throwable) {
+            Log.e(
+                TAG,
+                "[startup-trace] module step failed label=$label module=$modulePackageName " +
+                    "elapsedUs=${elapsedUs(startNs)}",
+                t,
+            )
+            throw t
+        }
+    }
+
+    private fun magicOf(buffer: java.nio.ByteBuffer): String =
+        if (buffer.capacity() >= 4) {
+            "%02x %02x %02x %02x"
+                .format(
+                    buffer.get(0).toInt() and 0xff,
+                    buffer.get(1).toInt() and 0xff,
+                    buffer.get(2).toInt() and 0xff,
+                    buffer.get(3).toInt() and 0xff,
+                )
+        } else {
+            "<too-small:${buffer.capacity()}>"
+        }
+
+    private fun traceNativeSharedMemory(modulePackageName: String, libraryName: String, memory: SharedMemory) {
+        runCatching {
+                val buffer = memory.mapReadOnly()
+                try {
+                    Log.i(
+                        TAG,
+                        "Received native SharedMemory $modulePackageName/$libraryName " +
+                            "size=${buffer.capacity()} magic=${magicOf(buffer)}",
+                    )
+                } finally {
+                    SharedMemory.unmap(buffer)
+                }
+            }
+            .onFailure { error ->
+                Log.e(
+                    TAG,
+                    "Cannot inspect native SharedMemory $modulePackageName/$libraryName",
+                    error,
+                )
+            }
+    }
 
     private fun traceAnonymousExecMaps(stage: String, modulePackageName: String) {
         runCatching {
@@ -76,7 +147,57 @@ object VectorModuleManager {
     /**
      * Loads a module APK, instantiates its entry classes, and binds them to the Vector framework.
      */
-    fun loadModule(module: LoadedModule, isSystemServer: Boolean, processName: String): Boolean {
+    fun loadModule(module: LoadedModule, isSystemServer: Boolean, processName: String): Boolean =
+        traceStartupStep("loadModule", module.packageName) {
+        if (USE_RAW_VECTOR_LINKER_NATIVE_LOADER) {
+            if (module.code.moduleLibraryNames.isNotEmpty()) {
+                Log.w(
+                    TAG,
+                    "rawVector linker native loader enabled for ${module.packageName}; " +
+                        "skipping Vector soLoader SharedMemory load.",
+                )
+            }
+            module.code.preLoadedNativeLibraries.forEach { memory ->
+                runCatching { memory.close() }
+            }
+        } else {
+            val nativeNames =
+                module.code.moduleLibraryNames
+                    .map { "${module.packageName}!/${it}" }
+                    .toTypedArray()
+            val nativeImages = module.code.preLoadedNativeLibraries.toTypedArray()
+            if (nativeNames.isNotEmpty() || nativeImages.isNotEmpty()) {
+                nativeImages.forEachIndexed { index, memory ->
+                    traceNativeSharedMemory(
+                        module.packageName,
+                        module.code.moduleLibraryNames.getOrNull(index) ?: "<missing-name:$index>",
+                        memory,
+                    )
+                }
+                val loaded =
+                    runCatching {
+                            try {
+                                NativeAPI.loadNativeLibraries(nativeNames, nativeImages)
+                            } finally {
+                                nativeImages.forEach { it.close() }
+                            }
+                        }
+                        .getOrElse {
+                            Log.e(TAG, "Failed to load native libraries for ${module.packageName}", it)
+                            return false
+                        }
+                if (loaded.size != nativeNames.size || loaded.any { !it }) {
+                    Log.e(TAG, "One or more native libraries failed for ${module.packageName}")
+                    return false
+                }
+                Log.i(
+                    TAG,
+                    "Loaded native libraries for ${module.packageName}: " +
+                        nativeNames.indices.joinToString { index -> "${nativeNames[index]}=${loaded[index]}" },
+                )
+            }
+        }
+
         traceAnonymousExecMaps("renderModule:before-build", module.packageName)
         val (generation, entries) =
             buildGeneration(module, isSystemServer, processName) ?: return false
@@ -100,11 +221,8 @@ object VectorModuleManager {
             traceAnonymousExecMaps("onModuleLoaded:after:${entry.javaClass.name}", module.packageName)
         }
 
-        // Module native_init entries are intentionally not executed. Native inline hooks are
-        // provided by Vector core's wxshadow engine; modules stay as DEX/script logic.
-
         Log.d(TAG, "Rendered module ${module.packageName} successfully.")
-        return true
+        true
     }
 
     // Publishes nothing, so a reload can fail before the old generation is touched.
@@ -117,12 +235,36 @@ object VectorModuleManager {
             Log.d(TAG, "Render module ${module.packageName}")
             traceAnonymousExecMaps("buildGeneration:start", module.packageName)
 
-            // rustFrida-aligned module model: module APKs provide DEX/script logic only.
-            // Native inline hook code lives in Vector's core wxshadow hook engine. Do not expose
-            // module.apkPath!/lib/<abi> to BaseDexClassLoader; otherwise a module calling
-            // System.loadLibrary() makes linker mmap the module base.apk into the target process,
-            // which is an observable foreign-code-container mapping.
-            val librarySearchPath = ""
+            val librarySearchPath =
+                if (USE_RAW_VECTOR_LINKER_NATIVE_LOADER) {
+                    buildString {
+                        if (isSystemServer) {
+                            module.code.nativeLibraryDir?.let {
+                                append(it).append(File.pathSeparator)
+                            }
+                        }
+                        val abis =
+                            if (Process.is64Bit()) Build.SUPPORTED_64_BIT_ABIS
+                            else Build.SUPPORTED_32_BIT_ABIS
+                        for (abi in abis) {
+                            append(module.apkPath)
+                                .append("!/lib/")
+                                .append(abi)
+                                .append(File.pathSeparator)
+                        }
+                    }
+                } else {
+                    // Module native libraries are loaded separately from sealed SharedMemory by
+                    // Vector's soLoader. Keep the BaseDexClassLoader search path empty so
+                    // System.loadLibrary() and APK zip paths cannot reach Android's linker.
+                    ""
+                }
+            if (USE_RAW_VECTOR_LINKER_NATIVE_LOADER) {
+                Log.w(
+                    TAG,
+                    "rawVector linker librarySearchPath for ${module.packageName}: $librarySearchPath",
+                )
+            }
 
             // VectorModuleClassLoader directly links BaseDexClassLoader's hidden ByteBuffer
             // constructor. The exemption must be installed before the first active reference to
@@ -170,12 +312,14 @@ object VectorModuleManager {
                         else ExceptionMode.PROTECTIVE,
                 )
 
-            if (module.code.moduleLibraryNames.isNotEmpty()) {
-                Log.w(
-                    TAG,
-                    "Ignoring native_init entries for ${module.packageName}: " +
-                        "module native libraries are disabled; use Vector core native hook APIs.",
-                )
+            if (USE_RAW_VECTOR_LINKER_NATIVE_LOADER) {
+                module.code.moduleLibraryNames.forEach { libraryName ->
+                    Log.w(
+                        TAG,
+                        "rawVector linker registering native entrypoint $libraryName for ${module.packageName}",
+                    )
+                    NativeAPI.recordNativeEntrypoint(libraryName)
+                }
             }
 
             // Instantiate the module entry classes
@@ -220,6 +364,14 @@ object VectorModuleManager {
             if (entries.isEmpty()) {
                 Log.e(TAG, "No entry class of ${module.packageName} could be instantiated")
                 return null
+            }
+
+            if (module.code.moduleLibraryNames.isNotEmpty() &&
+                module.code.preLoadedNativeLibraries.isEmpty()) {
+                Log.w(
+                    TAG,
+                    "Module ${module.packageName} has native entries but no soLoader images",
+                )
             }
 
             val generation =

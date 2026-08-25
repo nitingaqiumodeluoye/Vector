@@ -11,8 +11,9 @@ import java.lang.reflect.Executable
 import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
-import org.matrix.vector.util.Utils
+import org.matrix.vector.impl.core.VectorStartup
 import org.matrix.vector.impl.di.VectorBootstrap
+import org.matrix.vector.util.Utils
 import org.matrix.vector.nativebridge.HookBridge
 
 /**
@@ -114,6 +115,14 @@ class VectorHookBuilder(
 
     /** Installs [record] natively and records the handle against its owner. */
     private fun register(record: VectorHookRecord, moduleId: String?): HookHandle {
+        if (moduleId != null && VectorStartup.isAppAttachCompleted()) {
+            // rustFrida's install.rs ensures the ART controller before publishing a module hook.
+            // The rawVector lifecycle boundary is already past attach, so this no longer delays
+            // the module class/native load itself.
+            if (!HookBridge.completeArtBootstrap()) {
+                throw HookFailedError("Cannot initialize WxShadow ART controller")
+            }
+        }
         if (
             !HookBridge.hookMethod(
                 true,
@@ -121,7 +130,9 @@ class VectorHookBuilder(
                 VectorNativeHooker::class.java,
                 record.priority,
                 record,
-                moduleId != null,
+                // rawVector determines when framework/module hooks are installed. The native
+                // bridge selects the lightweight or complete rustFrida-compatible WxShadow stage.
+                true,
             )
         ) {
             throw HookFailedError("Cannot hook $origin")

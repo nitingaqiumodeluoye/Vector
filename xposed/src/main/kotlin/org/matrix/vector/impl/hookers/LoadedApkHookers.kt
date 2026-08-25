@@ -11,6 +11,8 @@ import org.matrix.vector.impl.VectorLifecycleManager
 import org.matrix.vector.impl.di.LegacyPackageInfo
 import org.matrix.vector.impl.di.VectorBootstrap
 
+private fun elapsedUs(startNs: Long): Long = (System.nanoTime() - startNs) / 1_000L
+
 /** Safe reflection helper */
 private inline fun <reified T> Any.getFieldValue(name: String): T? {
     var clazz: Class<*>? = this.javaClass
@@ -89,6 +91,7 @@ private object LoadedApkTracker {
 /** Tracks and prepares Application instances when their LoadedApk is instantiated. */
 object LoadedApkCtorHooker : WbInterface.Hooker {
     override fun intercept(chain: WbInterface.Chain): Any? {
+        val startNs = System.nanoTime()
         val result = chain.proceed()
         val loadedApk = chain.thisObject ?: return result
 
@@ -111,6 +114,10 @@ object LoadedApkCtorHooker : WbInterface.Hooker {
             LoadedApkTracker.activeApks.add(loadedApk)
         }
 
+        Utils.logI(
+            "[startup-trace] LoadedApk.<init> package=$packageName " +
+                "tracked=${!isPreload} elapsedUs=${elapsedUs(startNs)}"
+        )
         return result
     }
 }
@@ -134,13 +141,20 @@ object LoadedApkCreateAppFactoryHooker : WbInterface.Hooker {
             val apkPackageName =
                 loadedApk.getFieldValue<String>("mPackageName") ?: appInfo.packageName
             val ctx = PackageContextHelper.resolve(loadedApk, apkPackageName)
-
+            val result = chain.proceed()
+            val startNs = System.nanoTime()
             VectorLifecycleManager.dispatchPackageLoaded(
                 ctx.packageName,
                 appInfo,
                 ctx.isFirstPackage,
                 defaultClassLoader,
             )
+            Utils.logI(
+                "[startup-trace] LoadedApk.createAppFactory package=${ctx.packageName} " +
+                    "first=${ctx.isFirstPackage} dispatch=packageLoaded " +
+                    "elapsedUs=${elapsedUs(startNs)}"
+            )
+            return result
         }
 
         return chain.proceed()
@@ -156,6 +170,10 @@ object LoadedApkCreateCLHooker : WbInterface.Hooker {
         // Proceed: Modern modules need onPackageReady even for Split APKs (args[0] != null)
         val isInitialLoad =
             chain.args.firstOrNull() == null && LoadedApkTracker.activeApks.contains(loadedApk)
+        val startNs = if (isInitialLoad) System.nanoTime() else 0L
+        if (isInitialLoad) {
+            Utils.logI("[startup-trace] LoadedApk.createOrUpdateClassLoaderLocked begin")
+        }
         val result = chain.proceed()
 
         try {
@@ -204,6 +222,13 @@ object LoadedApkCreateCLHooker : WbInterface.Hooker {
             // Cleanup: Once the initial load is done, we remove it from activeApks.
             // Subsequent calls (Split APKs) will now be recognized as non-initial loads.
             LoadedApkTracker.activeApks.remove(loadedApk)
+            if (isInitialLoad) {
+                Utils.logI(
+                    "[startup-trace] LoadedApk.createOrUpdateClassLoaderLocked end " +
+                        "package=${loadedApk.getFieldValue<String>("mPackageName")} " +
+                        "elapsedUs=${elapsedUs(startNs)}"
+                )
+            }
         }
 
         return result

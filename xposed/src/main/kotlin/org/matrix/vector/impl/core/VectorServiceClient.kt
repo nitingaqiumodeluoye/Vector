@@ -1,7 +1,9 @@
 package org.matrix.vector.impl.core
 
 import android.os.IBinder
+import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.os.Process
 import org.matrix.vector.ipc.LoadedModule
 import org.matrix.vector.ipc.IProcessChannel
 import org.matrix.vector.ipc.IFrameworkService
@@ -15,7 +17,13 @@ object VectorServiceClient : IFrameworkService, IBinder.DeathRecipient {
 
     private const val TAG = "VectorServiceClient"
 
+    private fun elapsedUs(startNs: Long): Long = (System.nanoTime() - startNs) / 1_000L
+
     private var service: IFrameworkService? = null
+    private val legacyModulesLock = Any()
+
+    @Volatile private var prefetchedLegacyModules: List<LoadedModule>? = null
+
     var processName: String = ""
         private set
 
@@ -26,6 +34,7 @@ object VectorServiceClient : IFrameworkService, IBinder.DeathRecipient {
             runCatching {
                     service = appService
                     processName = niceName
+                    synchronized(legacyModulesLock) { prefetchedLegacyModules = null }
                     binder.linkToDeath(this, 0)
                 }
                 .onFailure {
@@ -46,6 +55,24 @@ object VectorServiceClient : IFrameworkService, IBinder.DeathRecipient {
         }
     }
 
+    /**
+     * Fetches legacy module metadata before WxShadow changes the app's ART execution state. The
+     * result is consumed later by the normal rawVector-aligned bootstrap path; module code is not
+     * loaded early.
+     */
+    fun prefetchLegacyModules() {
+        synchronized(legacyModulesLock) {
+            if (prefetchedLegacyModules != null) return
+        }
+
+        val modules = queryLegacyModules("prefetch") ?: return
+        synchronized(legacyModulesLock) {
+            if (prefetchedLegacyModules == null) {
+                prefetchedLegacyModules = modules
+            }
+        }
+    }
+
     override fun attachProcessChannel(channel: IProcessChannel?) {
         try {
             service?.attachProcessChannel(channel)
@@ -59,7 +86,58 @@ object VectorServiceClient : IFrameworkService, IBinder.DeathRecipient {
     }
 
     override fun getLegacyModules(): List<LoadedModule> {
-        return runCatching { service?.legacyModules }.getOrNull() ?: emptyList()
+        synchronized(legacyModulesLock) {
+            prefetchedLegacyModules?.let { modules ->
+                prefetchedLegacyModules = null
+                Log.i(
+                    TAG,
+                    "[startup-trace] getLegacyModules cache hit process=$processName " +
+                        "count=${modules.size}",
+                )
+                return modules
+            }
+        }
+
+        return queryLegacyModules("bootstrap") ?: emptyList()
+    }
+
+    private fun queryLegacyModules(stage: String): List<LoadedModule>? {
+        val startNs = System.nanoTime()
+        val currentService = service
+        if (currentService == null) {
+            Log.w(
+                TAG,
+                "[startup-trace] getLegacyModules client=null stage=$stage " +
+                    "process=$processName elapsedUs=${elapsedUs(startNs)}",
+            )
+            return null
+        }
+
+        val thread = Thread.currentThread()
+        val isMainThread = Looper.myLooper() === Looper.getMainLooper()
+        Log.i(
+            TAG,
+            "[startup-trace] getLegacyModules binder begin stage=$stage process=$processName " +
+                "thread=${thread.name} tid=${Process.myTid()} main=$isMainThread",
+        )
+        return try {
+            val modules = currentService.legacyModules
+            Log.i(
+                TAG,
+                "[startup-trace] getLegacyModules binder end stage=$stage process=$processName " +
+                    "count=${modules.size} thread=${thread.name} tid=${Process.myTid()} " +
+                    "main=$isMainThread elapsedUs=${elapsedUs(startNs)}",
+            )
+            modules.toList()
+        } catch (t: Throwable) {
+            Log.e(
+                TAG,
+                "[startup-trace] getLegacyModules binder failed stage=$stage process=$processName " +
+                    "elapsedUs=${elapsedUs(startNs)}",
+                t,
+            )
+            null
+        }
     }
 
     override fun getModules(): List<LoadedModule> {
@@ -85,5 +163,6 @@ object VectorServiceClient : IFrameworkService, IBinder.DeathRecipient {
     override fun binderDied() {
         service?.asBinder()?.unlinkToDeath(this, 0)
         service = null
+        synchronized(legacyModulesLock) { prefetchedLegacyModules = null }
     }
 }

@@ -16,6 +16,8 @@ object VectorLifecycleManager {
     // The framework's only strong reference to entry instances, and what detach() removes. Any
     // dispatch added later, hot reload included, must iterate this rather than keep its own list.
     val activeModules: MutableSet<WbModule> = ConcurrentHashMap.newKeySet()
+    private val loadedPackages: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    private val readyPackages: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
     fun detach(module: WbModule) {
         if (activeModules.remove(module)) {
@@ -37,6 +39,10 @@ object VectorLifecycleManager {
         isFirst: Boolean,
         defaultClassLoader: ClassLoader,
     ) {
+        if (!loadedPackages.add(packageName)) {
+            Log.d(TAG, "Skip duplicate onPackageLoaded for $packageName")
+            return
+        }
         val param =
             object : PackageLoadedParam {
                 override fun getPackageName(): String = packageName
@@ -68,6 +74,10 @@ object VectorLifecycleManager {
         classLoader: ClassLoader,
         appComponentFactory: Any?, // Abstracted for API compatibility
     ) {
+        if (!readyPackages.add(packageName)) {
+            Log.d(TAG, "Skip duplicate onPackageReady for $packageName")
+            return
+        }
         val param =
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && appComponentFactory != null) {
                 PackageReadyParamImplP(

@@ -7,6 +7,14 @@ import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Method
 
 object HookBridge {
+    @JvmStatic external fun initializeArtBootstrap(): Boolean
+
+    @JvmStatic external fun setSystemProcess(isSystem: Boolean)
+
+    @JvmStatic external fun completeArtBootstrap(): Boolean
+
+    @JvmStatic external fun isWxShadowStealthMode(): Boolean
+
     @JvmStatic
     external fun hookMethod(
         useModernApi: Boolean,
