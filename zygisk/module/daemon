@@ -3,13 +3,14 @@
 dir="${0%/*}"
 tmpDaemonApk="/data/local/tmp/daemon.apk"
 debug="@DEBUG@"
+module_dir_option="-Dvector.module.dir=$dir"
 
 # Safely check for debug APK and set classpath
 if [ -r "$tmpDaemonApk" ]; then
-  java_options="-Djava.class.path=$tmpDaemonApk"
+  java_options="-Djava.class.path=$tmpDaemonApk $module_dir_option"
   debug="true"
 else
-  java_options="-Djava.class.path=$dir/daemon.apk"
+  java_options="-Djava.class.path=$dir/daemon.apk $module_dir_option"
 fi
 
 # Apply debug options based on Android SDK version.

@@ -11,6 +11,7 @@
 #include <sys/system_properties.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -142,6 +143,13 @@ static void TraceAnonymousExecMaps(const char *stage) {
     }
     fclose(maps);
     LOGI("[exec-map-native] stage={} pid={} count={}", stage, getpid(), count);
+}
+
+static long long StartupElapsedUs(
+    const std::chrono::steady_clock::time_point &start) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now() - start)
+        .count();
 }
 
 // --- Process UID Constants ---
@@ -478,25 +486,38 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
 
     // --- Framework Injection ---
     lsplant::JUTFString nice_name_str(env_, args->nice_name);
+    const auto startup_start = std::chrono::steady_clock::now();
+    LOGI("[startup-trace] native postAppSpecialize begin package='{}'", nice_name_str.get());
     LOGD("Asking the daemon about '{}'.", nice_name_str.get());
     TraceAnonymousExecMaps("postAppSpecialize:entry");
 
     auto &ipc_bridge = IPCBridge::GetInstance();
+    auto stage_start = std::chrono::steady_clock::now();
     auto binder = ipc_bridge.RequestAppBinder(env_, args->nice_name);
     if (!binder) {
         // Usually because nothing has it in scope, but the daemon may also not be up yet or have
         // registered this process already. Only it knows which, and it logs the reason itself.
+        LOGI("[startup-trace] native stage end=RequestAppBinder package='{}' "
+             "elapsedUs={} result=none",
+             nice_name_str.get(), StartupElapsedUs(stage_start));
         LOGD("Not injecting '{}': the daemon has no binder for it.", nice_name_str.get());
         NameOwnZygiskRxVma();
         SetAllowUnload(true);
         return;
     }
+    LOGI("[startup-trace] native stage end=RequestAppBinder package='{}' "
+         "elapsedUs={} result=ok",
+         nice_name_str.get(), StartupElapsedUs(stage_start));
     NameOwnZygiskRxVma();
     TraceAnonymousExecMaps("postAppSpecialize:after-binder");
 
     // Fetch resources from the manager service.
+    stage_start = std::chrono::steady_clock::now();
     auto [dex_fd, dex_size] = ipc_bridge.FetchFrameworkDex(env_, binder.get());
     if (dex_fd < 0) {
+        LOGI("[startup-trace] native stage end=FetchFrameworkDex package='{}' "
+             "elapsedUs={} result=failed",
+             nice_name_str.get(), StartupElapsedUs(stage_start));
         LOGE("Failed to fetch framework DEX for '{}'.", nice_name_str.get());
         NameOwnZygiskRxVma();
         SetAllowUnload(true);
@@ -505,40 +526,50 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
 
     auto obfs_map = ipc_bridge.FetchObfuscationMap(env_, binder.get());
     ConfigBridge::GetInstance()->obfuscation_map(std::move(obfs_map));
+    LOGI("[startup-trace] native stage end=FetchFrameworkDex package='{}' "
+         "elapsedUs={} result=ok size={}",
+         nice_name_str.get(), StartupElapsedUs(stage_start), dex_size);
     TraceAnonymousExecMaps("postAppSpecialize:after-fetch");
 
+    stage_start = std::chrono::steady_clock::now();
     {
         PreloadedDex dex(dex_fd, dex_size);
         this->LoadDex(env_, std::move(dex));
     }
     close(dex_fd);  // The FD is duplicated by mmap, we can close it now.
+    LOGI("[startup-trace] native stage end=LoadDex package='{}' elapsedUs={}",
+         nice_name_str.get(), StartupElapsedUs(stage_start));
     TraceAnonymousExecMaps("postAppSpecialize:after-load-dex");
 
-    // rustFrida keeps pre-attach Java.ready gate hooks out of the raw-clone path and lets a
-    // post-resume Java worker discover the app ClassLoader instead
-    // (quickjs-hook/src/jsapi/java/java_boot.js Java._installGateHook and reflect.rs
-    // reprobe_classloader_once_with_env). For third-party app processes, avoid initializing
-    // LSPlant here: LSPlant::Init inline-hooks ART internals and is visible to libart CRC checks
-    // before any module hook requests arrive. The Java side will use a no-ART deferred bootstrap.
-    const bool use_art_bootstrap = is_manager_app_;
-    if (use_art_bootstrap) {
-        this->InitArtHooker(env_, init_info_);
-    } else {
-        LOGI("App process selected: LSPlant bootstrap disabled; using no-ART deferred bootstrap");
-    }
+    // Flow reference: rawVector installs framework hooks synchronously before ActivityThread.attach.
+    // Vector's hook backend is WxShadow rather than rawVector's LSPlant, so Java initializes the
+    // lightweight ART bootstrap before installing only the attach hook. The complete rustFrida
+    // controller is installed after attach returns.
+    const bool use_art_bootstrap = true;
+    LOGI("App process selected: using WxShadow pre-attach bootstrap");
     // Initialize JNI hooks via the native library.
+    stage_start = std::chrono::steady_clock::now();
     this->InitHooks(env_);
+    LOGI("[startup-trace] native stage end=InitHooks package='{}' elapsedUs={}",
+         nice_name_str.get(), StartupElapsedUs(stage_start));
     TraceAnonymousExecMaps("postAppSpecialize:after-init-hooks");
     // Find the Java entrypoint.
+    stage_start = std::chrono::steady_clock::now();
     this->SetupEntryClass(env_);
+    LOGI("[startup-trace] native stage end=SetupEntryClass package='{}' elapsedUs={}",
+         nice_name_str.get(), StartupElapsedUs(stage_start));
     TraceAnonymousExecMaps("postAppSpecialize:after-entry-class");
 
     // Hand off control to the Java side of the framework.
+    stage_start = std::chrono::steady_clock::now();
     TraceAnonymousExecMaps("postAppSpecialize:before-fork-common");
     bool entered = this->FindAndCall(
         env_, "forkCommon", "(ZZLjava/lang/String;Ljava/lang/String;Landroid/os/IBinder;Z)V",
         JNI_FALSE, JNI_FALSE, args->nice_name, args->app_data_dir, binder.get(),
         use_art_bootstrap ? JNI_TRUE : JNI_FALSE);
+    LOGI("[startup-trace] native stage end=Main.forkCommon package='{}' "
+         "elapsedUs={} result={}",
+         nice_name_str.get(), StartupElapsedUs(stage_start), entered);
     TraceAnonymousExecMaps("postAppSpecialize:after-fork-common");
 
     if (entered) {
@@ -552,6 +583,8 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     SetAllowUnload(false);
     NameOwnZygiskRxVma();
     ScheduleLateNameOwnZygiskRxVma();
+    LOGI("[startup-trace] native postAppSpecialize end package='{}' elapsedUs={}",
+         nice_name_str.get(), StartupElapsedUs(startup_start));
 }
 
 void VectorModule::preServerSpecialize(zygisk::ServerSpecializeArgs *args) {
@@ -602,26 +635,41 @@ void VectorModule::postServerSpecialize(const zygisk::ServerSpecializeArgs *args
     }
 
     // --- Framework Injection for System Server ---
+    bool is_late_inject = (args->runtime_flags & RuntimeFlags::LATE_INJECT) != 0;
+    const auto startup_start = std::chrono::steady_clock::now();
+    LOGI("[startup-trace] native postServerSpecialize begin late={}", is_late_inject);
     auto &ipc_bridge = IPCBridge::GetInstance();
     std::string bridgeServiceName = "serial";
-    bool is_late_inject = (args->runtime_flags & RuntimeFlags::LATE_INJECT) != 0;
     if (is_late_inject) bridgeServiceName = "serial_vector";
+    auto stage_start = std::chrono::steady_clock::now();
     auto system_binder = ipc_bridge.RequestSystemServerBinder(env_, bridgeServiceName);
     if (!system_binder) {
+        LOGI("[startup-trace] native stage end=RequestSystemServerBinder elapsedUs={} "
+             "result=failed",
+             StartupElapsedUs(stage_start));
         LOGE("Failed to get system server IPC binder. Aborting injection.");
         SetAllowUnload(true);  // Allow unload on failure.
         return;
     }
+    LOGI("[startup-trace] native stage end=RequestSystemServerBinder elapsedUs={} result=ok",
+         StartupElapsedUs(stage_start));
 
+    stage_start = std::chrono::steady_clock::now();
     auto manager_binder =
         ipc_bridge.RequestManagerBinderFromSystemServer(env_, system_binder.get());
+    LOGI("[startup-trace] native stage end=RequestManagerBinder elapsedUs={} result={}",
+         StartupElapsedUs(stage_start), manager_binder ? "ok" : "fallback-system");
 
     // Use either the direct manager binder if available,
     // otherwise proxy through the system binder.
     jobject effective_binder = manager_binder ? manager_binder.get() : system_binder.get();
 
+    stage_start = std::chrono::steady_clock::now();
     auto [dex_fd, dex_size] = ipc_bridge.FetchFrameworkDex(env_, effective_binder);
     if (dex_fd < 0) {
+        LOGI("[startup-trace] native stage end=FetchFrameworkDex(system) elapsedUs={} "
+             "result=failed",
+             StartupElapsedUs(stage_start));
         LOGE("Failed to fetch framework DEX for system_server.");
         SetAllowUnload(true);
         return;
@@ -629,24 +677,39 @@ void VectorModule::postServerSpecialize(const zygisk::ServerSpecializeArgs *args
 
     auto obfs_map = ipc_bridge.FetchObfuscationMap(env_, effective_binder);
     ConfigBridge::GetInstance()->obfuscation_map(std::move(obfs_map));
+    LOGI("[startup-trace] native stage end=FetchFrameworkDex(system) elapsedUs={} "
+         "result=ok size={}",
+         StartupElapsedUs(stage_start), dex_size);
 
+    stage_start = std::chrono::steady_clock::now();
     {
         PreloadedDex dex(dex_fd, dex_size);
         this->LoadDex(env_, std::move(dex));
     }
     close(dex_fd);
+    LOGI("[startup-trace] native stage end=LoadDex(system) elapsedUs={}",
+         StartupElapsedUs(stage_start));
 
+    stage_start = std::chrono::steady_clock::now();
     ipc_bridge.HookBridge(env_);
+    LOGI("[startup-trace] native stage end=HookBridge(system) elapsedUs={}",
+         StartupElapsedUs(stage_start));
 
+    stage_start = std::chrono::steady_clock::now();
     this->InitArtHooker(env_, init_info_);
     this->InitHooks(env_);
     this->SetupEntryClass(env_);
+    LOGI("[startup-trace] native stage end=InitHooksAndEntry(system) elapsedUs={}",
+         StartupElapsedUs(stage_start));
 
+    stage_start = std::chrono::steady_clock::now();
     auto system_name = lsplant::ScopedLocalRef(env_, env_->NewStringUTF("system"));
     bool entered = this->FindAndCall(
         env_, "forkCommon", "(ZZLjava/lang/String;Ljava/lang/String;Landroid/os/IBinder;Z)V",
         JNI_TRUE, is_late_inject, system_name.get(), nullptr, manager_binder.get(),
         JNI_TRUE);
+    LOGI("[startup-trace] native stage end=Main.forkCommon(system) elapsedUs={} result={}",
+         StartupElapsedUs(stage_start), entered);
 
     if (entered) {
         LOGI("Injected Vector framework into system_server.");
@@ -655,6 +718,8 @@ void VectorModule::postServerSpecialize(const zygisk::ServerSpecializeArgs *args
     }
     // See postAppSpecialize: the hooks outlive a failed entry, so the library must stay.
     SetAllowUnload(false);
+    LOGI("[startup-trace] native postServerSpecialize end elapsedUs={}",
+         StartupElapsedUs(startup_start));
 }
 
 void VectorModule::SetAllowUnload(bool unload) {

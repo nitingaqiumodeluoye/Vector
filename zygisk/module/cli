@@ -1,26 +1,31 @@
 #!/system/bin/sh
 
 tmpDaemonApk="/data/local/tmp/daemon.apk"
+module_dir="${0%/*}"
+if [ "$module_dir" = "$0" ]; then
+	module_dir=""
+fi
 
-# Safely check for debug APK and set classpath
-if [ -r "$tmpDaemonApk" ]; then
-	java_options="-Djava.class.path=$tmpDaemonApk"
-else
-	dex_path=""
+if [ -z "$module_dir" ] || [ ! -d "$module_dir" ]; then
 	for DEXDIR in /data/adb/modules $(magisk --path 2>/dev/null)/.magisk/modules; do
 		if [ -d "$DEXDIR/zygisk_vector" ]; then
-			dex_path="$DEXDIR/zygisk_vector"
+			module_dir="$DEXDIR/zygisk_vector"
 			break
 		fi
 	done
+fi
 
-	if [ -z "$dex_path" ]; then
+# Safely check for debug APK and set classpath
+if [ -r "$tmpDaemonApk" ]; then
+	java_options="-Djava.class.path=$tmpDaemonApk -Dvector.module.dir=$module_dir"
+else
+	if [ -z "$module_dir" ]; then
 		echo "No vector module path found"
 		exit 1
 	fi
 
-	dex_path="$dex_path/daemon.apk"
-	java_options="-Djava.class.path=$dex_path"
+	dex_path="$module_dir/daemon.apk"
+	java_options="-Djava.class.path=$dex_path -Dvector.module.dir=$module_dir"
 fi
 
 # Launch the cli

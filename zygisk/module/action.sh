@@ -6,15 +6,8 @@ if [ "$MODDIR" = "$0" ]; then
   MODDIR="/data/adb/modules/zygisk_vector"
 fi
 
-if pm path "$MANAGER_PACKAGE_NAME" >/dev/null 2>&1; then
-  am start -n "${MANAGER_PACKAGE_NAME}/.ui.MainActivity" && exit 0
-fi
-
-if [ -f "$MODDIR/manager.apk" ]; then
-  pm install -r "$MODDIR/manager.apk" >/dev/null 2>&1
-  if pm path "$MANAGER_PACKAGE_NAME" >/dev/null 2>&1; then
-    am start -n "${MANAGER_PACKAGE_NAME}/.ui.MainActivity" && exit 0
-  fi
-fi
-
+# The manager APK is a parasitic payload. Starting an installed copy directly creates a normal
+# application process, which is injected as a regular target and never receives the manager Binder
+# handoff. Route through the framework's launch category so the ActivityThread/system hooks create
+# the manager inside the designated host process and Constants.setBinder() is called.
 am start -c "${MANAGER_PACKAGE_NAME}.LAUNCH_MANAGER" "${INJECTED_PACKAGE_NAME}/.BugreportWarningActivity"

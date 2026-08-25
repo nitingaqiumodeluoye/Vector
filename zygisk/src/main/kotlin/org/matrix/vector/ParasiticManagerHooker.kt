@@ -54,6 +54,38 @@ object ParasiticManagerHooker {
         )
     }
 
+    /**
+     * Warms up the ART heap before the parasitic manager DEX is loaded into the host process.
+     *
+     * The host (com.android.shell) is forked with a cold, tiny heap (heapstartsize=8m). Injecting the
+     * manager APK and inflating the first Compose frame then exhausts it within a few megabytes, so
+     * every subsequent allocation waits on a stop-the-world GC (the startup logs showed
+     * WaitForGcToComplete stalls of 2.5s / 7.5s / 15.6s on `handleBindApplication` and
+     * `LAUNCH_ACTIVITY`). Raising the utilization target lets ART grow the heap before it is full,
+     * turning those blocking collections into cheap background ones.
+     *
+     * `setTargetHeapUtilization` is a public VMRuntime API (no hidden-API exemption needed); it is
+     * clamped to [0.0, 1.0] by the runtime, so the bounds are defensive only.
+     */
+    private fun warmUpHeap() {
+        // `dalvik.system.VMRuntime` is not on the zygisk module's compile classpath (the module
+        // compiles against the zygote's own view of the framework), so reach it by reflection. The
+        // class and both methods are stable public API; they just live off the compile path here.
+        runCatching {
+                val runtimeClass = Class.forName("dalvik.system.VMRuntime")
+                val getRuntime = runtimeClass.getMethod("getRuntime")
+                val runtime = getRuntime.invoke(null) ?: return
+                val getUtilization = runtimeClass.getMethod("getTargetHeapUtilization")
+                val current = getUtilization.invoke(runtime)
+                // 0.9 = keep more live heap before forcing a GC. A cold shell process is tiny, so
+                // this is what lets the 7 MB manager APK load without tripping blocking GCs.
+                runtimeClass.getMethod("setTargetHeapUtilization", Float::class.javaPrimitiveType)
+                    .invoke(runtime, 0.9f)
+                logD("heap warm-up: targetHeapUtilization $current -> 0.9")
+            }
+            .onFailure { logE("heap warm-up failed", it) }
+    }
+
     /** Constructs a hybrid PackageInfo. Combines the Manager's code with the Host's environment. */
     @Synchronized
     private fun getManagerPkgInfo(appInfo: ApplicationInfo?): PackageInfo? {
@@ -187,6 +219,10 @@ object ParasiticManagerHooker {
             object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam<*>) {
                     logD("ActivityThread#handleBindApplication() starts")
+                    // Expand the host heap before the manager APK is parsed and injected, so the
+                    // DEX + first Compose frame do not trip stop-the-world GCs on the cold shell
+                    // process (observed 2.5-15s stalls).
+                    warmUpHeap()
                     val bindData = param.args[0]
                     val hostAppInfo =
                         XposedHelpers.getObjectField(bindData, "appInfo") as ApplicationInfo
@@ -482,7 +518,13 @@ object ParasiticManagerHooker {
             // Asked first: a process the daemon did not launch the manager into gets null here,
             // and there is no point opening the APK for it.
             val managerBinder = VectorServiceClient.requestManagerService() ?: return false
-            VectorServiceClient.openManagerApk()!!.use { pfd ->
+            val managerApk =
+                VectorServiceClient.openManagerApk()
+                    ?: run {
+                        Utils.logW("Could not open manager APK from daemon")
+                        return false
+                    }
+            managerApk.use { pfd ->
                 val managerService = IManagerService.Stub.asInterface(managerBinder)
 
                 if (isParasitic) {

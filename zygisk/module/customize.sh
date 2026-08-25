@@ -3,8 +3,10 @@ SKIPUNZIP=1
 # =========================================================
 # Utils functions to extract and verify installation package
 
-TMPDIR_FOR_VERIFY="$TMPDIR/.vunzip"
-mkdir "$TMPDIR_FOR_VERIFY"
+TMPDIR_FOR_VERIFY="/data/local/tmp/.vector-vunzip.$$"
+rm -rf "$TMPDIR_FOR_VERIFY"
+mkdir -p "$TMPDIR_FOR_VERIFY/files"
+trap 'rm -rf "$TMPDIR_FOR_VERIFY"' EXIT
 
 abort_verify() {
   ui_print "*********************************************************"
@@ -20,7 +22,7 @@ extract() {
   local dir="$3"
   local junk_paths="${4:-false}" # Defaults to false if not provided
   local opts="-o"
-  local file_path hash_path file_basename
+  local file_path hash_path tmp_file_path file_basename
 
   file_basename=$(basename "$file")
 
@@ -28,25 +30,55 @@ extract() {
     opts="-oj"
     file_path="$dir/$file_basename"
     hash_path="${TMPDIR_FOR_VERIFY}/$file_basename.sha256"
+    tmp_file_path="${TMPDIR_FOR_VERIFY}/files/$file_basename"
   else
     file_path="$dir/$file"
     hash_path="${TMPDIR_FOR_VERIFY}/$file.sha256"
+    tmp_file_path="${TMPDIR_FOR_VERIFY}/files/$file"
   fi
 
-  # Extract the file and its hash
-  unzip $opts "$zip" "$file" -d "$dir" >/dev/null 2>&1
-  [ -f "$file_path" ] || abort_verify "Extracted $file does not exist"
+  # Stream to a neutral temp location first. Some APatch install contexts have produced
+  # same-sized zero-filled files when unzip writes directly into the module target.
+  mkdir -p "$(dirname "$tmp_file_path")"
+  rm -f "$tmp_file_path"
+  if ! unzip -p "$zip" "$file" >"$tmp_file_path" 2>/dev/null; then
+    rm -f "$tmp_file_path"
+    abort_verify "Failed to extract $file"
+  fi
+  [ -s "$tmp_file_path" ] || abort_verify "Extracted $file is empty"
 
-  unzip $opts "$zip" "$file.sha256" -d "${TMPDIR_FOR_VERIFY}" >/dev/null 2>&1
-  [ -f "$hash_path" ] || abort_verify "Hash file $file.sha256 does not exist"
+  mkdir -p "$(dirname "$hash_path")"
+  rm -f "$hash_path"
+  if ! unzip -p "$zip" "$file.sha256" >"$hash_path" 2>/dev/null; then
+    rm -f "$hash_path"
+    abort_verify "Failed to extract hash file $file.sha256"
+  fi
+  [ -s "$hash_path" ] || abort_verify "Hash file $file.sha256 is empty"
 
   # Read the expected hash and verify it
   local expected_hash
   read -r expected_hash < "$hash_path"
   expected_hash="${expected_hash%% *}" # Strip anything after the actual hash string
+  if ! echo "$expected_hash" | grep -Eq '^[0-9a-fA-F]{64}$'; then
+    abort_verify "Invalid hash for $file"
+  fi
 
-  if ! echo "$expected_hash  $file_path" | sha256sum -c -s -; then
+  if ! echo "$expected_hash  $tmp_file_path" | sha256sum -c -s -; then
     abort_verify "Failed to verify $file"
+  fi
+
+  mkdir -p "$(dirname "$file_path")"
+  rm -f "$file_path"
+  # APatch can return from installation before a normal cp-backed file is durable.  On the next
+  # boot the file keeps its size but reads as zeroes, which makes module.prop and the Zygisk ELF
+  # unusable.  Use fsync-capable dd for the final copy so the verified bytes reach storage before
+  # the installer returns.
+  if ! dd if="$tmp_file_path" of="$file_path" bs=65536 conv=fsync 2>/dev/null; then
+    rm -f "$file_path"
+    abort_verify "Failed to copy $file into module path"
+  fi
+  if ! echo "$expected_hash  $file_path" | sha256sum -c -s -; then
+    abort_verify "Failed to verify installed $file"
   fi
 
   ui_print "- Verified $file"
@@ -128,12 +160,28 @@ fi
 DEV_PATH=$(tr -dc 'a-z0-9' </dev/urandom | head -c 32)
 [ -f "$MODPATH/daemon.apk" ] && sed -i "s/5291374ceda0aef7c5d86cd2a4f6a3ac/$DEV_PATH/g" "$MODPATH/daemon.apk"
 
+# APatch/NeoZygisk may relabel module files as system_file, which root app_process cannot always
+# open as a classpath. Keep a readable mirror for the daemon and CLI; both wrappers prefer it.
+if [ -f "$MODPATH/daemon.apk" ]; then
+    rm -f /data/local/tmp/daemon.apk
+    dd if="$MODPATH/daemon.apk" of=/data/local/tmp/daemon.apk bs=65536 conv=fsync 2>/dev/null ||
+        unzip -op "$ZIPFILE" daemon.apk >/data/local/tmp/daemon.apk
+    sed -i "s/5291374ceda0aef7c5d86cd2a4f6a3ac/$DEV_PATH/g" /data/local/tmp/daemon.apk 2>/dev/null || true
+    chown shell shell /data/local/tmp/daemon.apk 2>/dev/null || true
+    chmod 0644 /data/local/tmp/daemon.apk
+    chcon u:object_r:shell_data_file:s0 /data/local/tmp/daemon.apk 2>/dev/null || true
+fi
+
 ui_print "- Setting permissions"
 set_perm_recursive "$MODPATH" 0 0 0755 0644
 [ -d "$MODPATH/bin" ] && set_perm_recursive "$MODPATH/bin" 0 2000 0755 0755 u:object_r:xposed_file:s0
 
+set_perm "$MODPATH/action.sh" 0 0 0755
 set_perm "$MODPATH/daemon" 0 0 0744
 set_perm "$MODPATH/cli" 0 0 0744
+
+# Make the module tree durable before APatch returns control to the caller.
+sync
 
 if [ "$(grep_prop ro.maple.enable)" = "1" ]; then
     ui_print "- Add ro.maple.enable=0"
