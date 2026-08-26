@@ -7,6 +7,7 @@ import android.os.IBinder
 import android.os.Handler
 import android.os.Looper
 import android.os.Process
+import android.view.Choreographer
 import dalvik.system.DexFile
 import java.io.File
 import java.lang.reflect.Executable
@@ -659,16 +660,44 @@ object VectorStartup {
         }
 
         if (HookBridge.isWxShadowStealthMode()) {
-            // rustFrida keeps the WxShadow controller lean around ART startup. Allow
-            // ClassLinker/GC to leave the controller-install window before rendering
-            // module classes; normal mode retains rawVector's immediate ordering.
+            // WxShadow keeps the ART controller lean around startup; the real thing we wait for
+            // is ClassLinker/GC leaving the controller-install window, i.e. the first UI turn.
+            // The source comment says the deferred callback "runs after the first UI turn", so
+            // drive the dispatch from that signal instead of a blind fixed cooldown: dispatch as
+            // soon as the first UI frame renders (ART has already run a full UI turn by then), and
+            // keep WXSHADOW_MODULE_LOAD_COOLDOWN_MS only as a hard cap for processes that never
+            // render a frame (background/service processes without an Activity). Whichever fires
+            // first wins; the AtomicBoolean guarantees dispatchLifecycle runs exactly once.
+            val dispatched = AtomicBoolean(false)
+            val defer = Runnable {
+                if (dispatched.compareAndSet(false, true)) {
+                    dispatchLifecycle()
+                }
+            }
+
+            val mainHandler = Handler(Looper.getMainLooper())
+            val firstFramePosted = runCatching {
+                Choreographer.getInstance().postFrameCallback { _ ->
+                    Utils.logI(
+                        "WxShadow module lifecycle triggered early on first UI frame " +
+                            "(before the ${WXSHADOW_MODULE_LOAD_COOLDOWN_MS}ms cap)"
+                    )
+                    mainHandler.post(defer)
+                }
+            }
+            if (firstFramePosted.isFailure) {
+                Utils.logE(
+                    "WxShadow Choreographer first-frame dispatch unavailable",
+                    firstFramePosted.exceptionOrNull(),
+                )
+            }
+
+            // Hard cap: a process with no renderable Activity (e.g. a :remote/service process)
+            // never produces a first frame, so fall back to the fixed cooldown.
+            mainHandler.postDelayed(defer, WXSHADOW_MODULE_LOAD_COOLDOWN_MS)
             Utils.logI(
-                "WxShadow deferred module lifecycle by ${WXSHADOW_MODULE_LOAD_COOLDOWN_MS}ms " +
-                    "after ART controller completion"
-            )
-            Handler(Looper.getMainLooper()).postDelayed(
-                dispatchLifecycle,
-                WXSHADOW_MODULE_LOAD_COOLDOWN_MS,
+                "WxShadow deferred module lifecycle by <=${WXSHADOW_MODULE_LOAD_COOLDOWN_MS}ms " +
+                    "(signal-driven: first UI frame, hard cap)"
             )
         } else {
             dispatchLifecycle()
