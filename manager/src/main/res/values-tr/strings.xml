@@ -3,7 +3,6 @@
 
     <string name="nav_home">Ana sayfa</string>
     <string name="nav_modules">Modüller</string>
-    <string name="nav_store">Katalog</string>
     <string name="nav_logs">Günlükler</string>
 
     <string name="panels_done">Bitti</string>
@@ -46,9 +45,6 @@
     <string name="info_not_injected">Enjekte edilmedi</string>
     <string name="status_notification">Durum bildirimi</string>
     <string name="status_notification_summary">Vector\'ün çalıştığını gösteren kalıcı bir bildirim.</string>
-    <string name="action_copy_all">Tümünü kopyala</string>
-    <string name="copied">Panoya kopyalandı</string>
-
     <string name="home_quarter_title">Son hareketler</string>
     <plurals name="home_commit_count">
         <item quantity="one">%1$d commit</item>
@@ -138,8 +134,6 @@
     <string name="settings_navigation">Gezinme</string>
     <string name="settings_floating_nav">Yüzen gezinme</string>
     <string name="settings_floating_nav_summary">Çubuğu, istediğiniz yere sürükleyebileceğiniz küçük bir topla değiştirir. Panelleri yelpaze gibi açmak için basılı tutun, açık kalmaları için dokunun.</string>
-    <string name="settings_rearrange_panels">Panelleri yeniden düzenle</string>
-    <string name="settings_rearrange_panels_summary">Sıralarını değiştirin ya da hiç açmadıklarınızı gizleyin.</string>
 
     <string name="settings_activity">Hareket akışı</string>
     <plurals name="settings_window_months">
@@ -266,7 +260,6 @@
     <string name="language_system">Sistem varsayılanı</string>
     <string name="language_system_summary">Telefonda ayarlı dili izle</string>
 
-    <string name="language_translated_by">Çeviren: %1$s</string>
     <string name="language_help_short">Çevir</string>
     <string name="language_help">Vector\'ü çevirmeye yardım edin</string>
 
@@ -287,16 +280,9 @@
     <string name="update_failed_start">Kurulum programı başlatılamadı.</string>
     <string name="update_failed_download">Güncelleme indirilemedi.</string>
     <string name="update_failed_exit">Kurulum programı başarısız oldu (çıkış %1$d).</string>
-    <string name="store_mute_updates">Bu modülün güncellemelerini yok say</string>
-    <string name="store_mute_updates_summary">Ne burada ne de modül listesinde artık eski sayılır</string>
-    <string name="store_options">Seçenekler</string>
     <string name="scope_framework_shared">Tüm kullanıcıların paylaştığı tek bir süreç, dolayısıyla bu cihazın tamamını etkiler</string>
     <string name="scope_self_hook">Bu modül kendi uygulamasına yüklenir, etkin olduğunu böyle bildirir</string>
     <string name="update_no_output">Kurulum programı hiçbir çıktı üretmedi.</string>
-    <string name="update_variant_release">Kararlı</string>
-    <string name="update_variant_debug">Hata ayıklama</string>
-    <string name="update_variant_release_why">Günlük kullanım için</string>
-    <string name="update_variant_debug_why">Ayrıntılı günlükler, hata bildirimi için</string>
     <string name="update_versions">Tüm sürümler</string>
     <string name="update_installed">Kurulu</string>
     <string name="update_older">Daha eski</string>
@@ -398,7 +384,6 @@
         <item quantity="one">yukarıdakinin aynısı %1$d çerçeve daha</item>
         <item quantity="other">yukarıdakilerin aynısı %1$d çerçeve daha</item>
     </plurals>
-    <string name="crash_frame_copied">Çerçeve kopyalandı</string>
     <string name="crash_unreadable">Bu çökme okunamadı. Olduğu gibi kopyalayıp bildirime ekleyin.</string>
     <string name="force_launcher_icons">Uygulamaların başlatıcı simgesini gizlemesini engelle</string>
     <string name="force_launcher_icons_summary">Android 10\'dan beri, kendi başlatıcı simgesini gizleyen bir uygulamaya, uygulama bilgisi sayfasını açan bir simge geri verilir. Gizli kalabilmesi için bunu kapatın — başlatıcınız yeniden başlatılana kadar durumu yansıtmayabilir. Hiçbir zaman başlatıcı simgesi olmamış uygulamalar, çoğu modül dahil, bundan etkilenmez.</string>
@@ -414,15 +399,6 @@
     <string name="scope_framework_restart_title">Çatı bunu henüz almadı</string>
     <string name="scope_framework_restart_body">Sistem çatısı yalnızca bir kez, Android başlarken yüklenir. Bu değişiklik ona ancak çatı yeniden başlatıldığında ulaşır — çalışan tüm uygulamalar kapanır, telefonun kendisi açık kalır.</string>
     <string name="scope_framework_restart_later">Daha sonra</string>
-    <string name="settings_network">Ağ</string>
-    <string name="settings_doh">Adları HTTPS üzerinden çöz</string>
-    <string name="settings_doh_summary">Adları ağın çözümleyicisi yerine Cloudflare üzerinden çözer. DNS\'i engelleyen veya kurcalayan ağlar için.</string>
-    <string name="settings_doh_untested">Henüz hiçbir ad çözümlenmedi.</string>
-    <string name="settings_doh_bypassed">Kullanılmıyor: bir proxy yapılandırılmış, adları o çözümlüyor.</string>
-    <string name="settings_doh_working">Çalışıyor — %1$s Cloudflare üzerinden çözümlendi.</string>
-    <string name="settings_doh_fell_back">Cloudflare\'a ulaşılamadı (%1$s), bu oturumun kalanında ağın çözümleyicisi kullanılacak.</string>
-    <string name="settings_doh_retry">Yeniden dene</string>
-
     <string name="launcher_title">Vector nasıl açılır</string>
     <string name="launcher_body">Vector uygulama olarak kurulu değil, bu yüzden başlatıcınızın gösterecek bir şeyi yok. Geri dönmenin yolları şunlar.</string>
     <string name="launcher_shortcut">Ana ekran kısayolu</string>

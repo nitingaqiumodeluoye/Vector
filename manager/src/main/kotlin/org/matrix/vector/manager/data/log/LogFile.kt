@@ -1,12 +1,18 @@
 package org.matrix.vector.manager.data.log
 
 import android.os.ParcelFileDescriptor
-import java.io.Closeable
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import kotlin.math.max
 import kotlin.math.min
 import kotlinx.coroutines.yield
+import org.matrix.vector.ui.logs.LogContent
+import org.matrix.vector.ui.logs.LogFacetCounter
+import org.matrix.vector.ui.logs.LogIndex
+import org.matrix.vector.ui.logs.LogQuery
+import org.matrix.vector.ui.logs.LogRow
+import org.matrix.vector.ui.logs.LogScanResult
+import org.matrix.vector.ui.logs.MAX_LINE_BYTES
 
 /**
  * A random-access window onto one of the daemon's log files.
@@ -36,7 +42,7 @@ import kotlinx.coroutines.yield
  * twice, and between the two closes the runtime is free to hand that number to an OkHttp socket or
  * a Coil bitmap, which the second close then silently detaches.
  */
-class LogFile(pfd: ParcelFileDescriptor) : Closeable {
+class LogFile(pfd: ParcelFileDescriptor) : LogContent {
 
     private val stream = ParcelFileDescriptor.AutoCloseInputStream(pfd)
     private val channel: FileChannel = stream.channel
@@ -50,7 +56,7 @@ class LogFile(pfd: ParcelFileDescriptor) : Closeable {
      * size is captured once and everything past it is ignored, so a line the daemon is appending
      * while this runs is never half-decoded — it simply appears on the next refresh.
      */
-    suspend fun index(): LogIndex {
+    override suspend fun index(): LogIndex {
         val size = channel.size()
         val starts = LongVec()
         starts.add(0L)
@@ -89,7 +95,7 @@ class LogFile(pfd: ParcelFileDescriptor) : Closeable {
      * loop below reads through the gaps and discards them rather than issuing one seek per line.
      * Either way the bytes held at once are bounded by [READ_BLOCK].
      */
-    suspend fun readRows(index: LogIndex, lines: IntArray): List<LogRow> {
+    override suspend fun readRows(index: LogIndex, lines: IntArray): List<LogRow> {
         val rows = ArrayList<LogRow>(lines.size + 8)
         var lastDate: String? = null
         var traceOwner = -1
@@ -171,7 +177,7 @@ class LogFile(pfd: ParcelFileDescriptor) : Closeable {
      * against is further back than the line above, and walking one line too far only widens the
      * window, which is free — whereas stopping one line too early is the bug.
      */
-    fun entryStart(index: LogIndex, line: Int): Int {
+    override fun entryStart(index: LogIndex, line: Int): Int {
         if (line >= index.lineCount) return line
         var at = line
         var steps = 0
@@ -198,14 +204,13 @@ class LogFile(pfd: ParcelFileDescriptor) : Closeable {
      * rather than a spinner, because on a large file this is long enough to be worth reporting
      * honestly.
      */
-    suspend fun scan(
+    override suspend fun scan(
         index: LogIndex,
         query: LogQuery,
         onProgress: (Float) -> Unit,
     ): LogScanResult {
         val matches = if (query.isActive) IntVec() else null
-        val tags = HashMap<String, Int>()
-        val levels = HashMap<LogLevel, Int>()
+        val facets = LogFacetCounter(query)
         var previousMatched = false
         // The last row that was an entry, which is what lets a line be read as part of its message
         // here exactly as [readRows] reads it — both the unprefixed kind and the split-off tail.
@@ -229,23 +234,14 @@ class LogFile(pfd: ParcelFileDescriptor) : Closeable {
                 if (previousMatched) matches?.add(lineIndex)
                 return@forEachLine
             }
-            if (row is LogRow.Entry) {
-                tags[row.tag] = (tags[row.tag] ?: 0) + 1
-                levels[row.level] = (levels[row.level] ?: 0) + 1
-            }
             lastEntry = row as? LogRow.Entry
-            previousMatched = query.matches(row)
+            // The daemon's framing carries the writer's uid, so the same pass that decides what the
+            // query keeps also counts the log's processes, its tags and its levels for the filter.
+            previousMatched = facets.add(row)
             if (previousMatched) matches?.add(lineIndex)
         }
 
-        return LogScanResult(
-            matches = matches?.toArray(),
-            facets =
-                LogFacets(
-                    tags = tags.entries.sortedByDescending { it.value }.map { it.key to it.value },
-                    levels = levels,
-                ),
-        )
+        return LogScanResult(matches = matches?.toArray(), facets = facets.facets())
     }
 
     override fun close() {
@@ -370,54 +366,6 @@ class LogFile(pfd: ParcelFileDescriptor) : Closeable {
         private const val SPACE = ' '.code
         private const val TAB = '\t'.code
     }
-}
-
-/**
- * Where every line of the file starts, plus the end sentinel.
- *
- * `bounds` has `lineCount + 1` entries; line `k` is the bytes in `[bounds[k], bounds[k + 1])`.
- * [droppedLeading] is how many lines fell off the front of an over-long file, and exists so the
- * header can say so rather than quietly misreport the file's length.
- */
-class LogIndex(val bounds: LongArray, val droppedLeading: Int) {
-    val lineCount: Int
-        get() = bounds.size - 1
-}
-
-/** What [LogFile.scan] found: the filtered line numbers, and what the file contains. */
-class LogScanResult(val matches: IntArray?, val facets: LogFacets)
-
-/** The tags and levels actually present, with counts, so the filter sheet cannot go stale. */
-data class LogFacets(
-    val tags: List<Pair<String, Int>> = emptyList(),
-    val levels: Map<LogLevel, Int> = emptyMap(),
-)
-
-/** Everything that narrows the view. All of it is applied in one pass over the file. */
-data class LogQuery(
-    val levels: Set<LogLevel> = emptySet(),
-    val tag: String? = null,
-    val text: String = "",
-) {
-    val isActive: Boolean
-        get() = levels.isNotEmpty() || tag != null || text.isNotBlank()
-
-    fun matches(row: LogRow): Boolean =
-        when (row) {
-            is LogRow.Entry ->
-                (levels.isEmpty() || row.level in levels) &&
-                    (tag == null || row.tag == tag) &&
-                    (text.isBlank() ||
-                        row.message.contains(text, ignoreCase = true) ||
-                        row.tag.contains(text, ignoreCase = true))
-            // A rotation banner has neither level nor tag, so it survives only a plain text
-            // search. It marks where the daemon restarted, which is worth keeping when it can be.
-            is LogRow.Marker ->
-                levels.isEmpty() &&
-                    tag == null &&
-                    (text.isBlank() || row.text.contains(text, ignoreCase = true))
-            is LogRow.DayBreak -> false
-        }
 }
 
 /** Growable `long` storage. `ArrayList<Long>` would box every offset. */

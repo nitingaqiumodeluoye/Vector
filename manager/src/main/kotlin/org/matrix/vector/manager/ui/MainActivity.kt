@@ -2,18 +2,19 @@ package org.matrix.vector.manager.ui
 
 import android.content.Intent
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import org.matrix.vector.manager.data.repository.LaunchShortcut
 import org.matrix.vector.manager.di.ServiceLocator
 import org.matrix.vector.manager.ui.navigation.DeepLink
 import org.matrix.vector.manager.ui.screens.splash.SplashGate
 import org.matrix.vector.manager.ui.theme.LocalizedContent
+import org.matrix.vector.manager.ui.theme.LocalizedOverlay
 import org.matrix.vector.manager.ui.theme.VectorTheme
+import org.matrix.vector.ui.LocalDialogLocalizer
 
 /**
  * The only activity.
@@ -38,8 +39,14 @@ class MainActivity : ComponentActivity() {
         // without it.
         ServiceLocator.attach(this)
 
+        // Started here rather than from the panels that need it: the splash is dead time the app
+        // is spending anyway, and these reads are what makes a panel's first visit slower than its
+        // second. By the time the splash has played, most of them have already answered.
+        ServiceLocator.prefetch()
+
         // The launcher copies the label and icon when the shortcut is pinned and keeps its copy, so
-        // a pinned shortcut otherwise represents Vector with whatever build pinned it for as long as
+        // a pinned shortcut otherwise represents Vector with whatever build pinned it for as long
+        // as
         // it lives. A no-op unless one is pinned, and unless this manager is the parasitic one.
         LaunchShortcut.update(this)
 
@@ -62,13 +69,20 @@ class MainActivity : ComponentActivity() {
         // offers a destination the reader may have left behind hours ago.
         DeepLink.offerFromCreate(intent)
 
-        setContent { LocalizedContent { VectorTheme { SplashGate { VectorApp() } } } }
-
-        // Do not compete with the first Compose frame. In a parasitic shell process, enumerating
-        // installed packages plus the cached catalog can allocate tens of MB and trigger a long
-        // stop-the-world GC, leaving the manager visibly black. Start the same idempotent warm-up
-        // after the frame has been handed to SurfaceFlinger.
-        Handler(Looper.getMainLooper()).postDelayed({ ServiceLocator.prefetch() }, 750L)
+        setContent {
+            LocalizedContent {
+                // Installed once, around everything. A dialog or a sheet is its own window, and
+                // Compose rebuilds the Android composition locals from that window's context on the
+                // way in -- which drops the language override at the boundary. The shared surfaces
+                // re-apply it through this hook, so it has to be in scope wherever one of them can
+                // open, not only where the first one did.
+                CompositionLocalProvider(
+                    LocalDialogLocalizer provides { content -> LocalizedOverlay(content) }
+                ) {
+                    VectorTheme { SplashGate { VectorApp() } }
+                }
+            }
+        }
     }
 
     /**

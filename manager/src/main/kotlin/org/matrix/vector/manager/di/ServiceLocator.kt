@@ -2,9 +2,9 @@ package org.matrix.vector.manager.di
 
 import org.matrix.vector.manager.data.model.ModuleDetectionCache
 import java.io.File
-import org.matrix.vector.manager.ui.screens.repo.latestOn
-import org.matrix.vector.manager.ui.screens.repo.StoreChannel
-import org.matrix.vector.manager.data.model.StoreEntry
+import org.matrix.vector.ui.store.latestOn
+import org.matrix.vector.ui.store.StoreChannel
+import org.matrix.vector.ui.store.StoreEntry
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.combine
@@ -41,8 +41,8 @@ import org.matrix.vector.manager.data.repository.SettingsRepository
 import org.matrix.vector.manager.ipc.DaemonClient
 import org.matrix.vector.manager.ipc.daemonPackageEventsFlow
 import org.matrix.vector.manager.ipc.packageEventsFlow
-import org.matrix.vector.manager.net.HttpClientFactory
-import org.matrix.vector.manager.net.VectorDns
+import org.matrix.vector.ui.net.HttpClientFactory
+import org.matrix.vector.ui.net.VectorDns
 
 /**
  * Hand-rolled service location, deliberately not a DI framework.
@@ -117,7 +117,7 @@ object ServiceLocator {
     val modules: ModuleRepository by lazy { ModuleRepository(daemon, appScope) }
 
     val apps: AppRepository by lazy {
-        AppRepository(daemon, context.packageManager, moduleDetection)
+        AppRepository(daemon, context.packageManager, moduleDetection, appScope)
     }
 
     /**
@@ -290,7 +290,7 @@ object ServiceLocator {
      */
     fun prefetch() {
         appScope.launch { runCatching { apps.getInstalledApps() } }
-        appScope.launch { runCatching { store.refresh() } }
+        appScope.launch { runCatching { store.refresh(false) } }
         // From disk only. Opening the manager is not by itself a reason to talk to GitHub, and
         // asking for a revalidation here would override Home's own gate — the one that decides how
         // rarely a launch is allowed to go and check.

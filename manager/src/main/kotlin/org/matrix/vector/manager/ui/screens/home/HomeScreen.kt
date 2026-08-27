@@ -10,7 +10,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.ExperimentalFoundationApi
-import androidx.compose.foundation.combinedClickable
+import org.matrix.vector.ui.contextClickable
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.size
@@ -89,11 +89,14 @@ import java.util.Date
 import kotlinx.coroutines.launch
 import org.matrix.vector.manager.ui.theme.LocalizedOverlay
 import org.matrix.vector.manager.R
-import org.matrix.vector.manager.ui.theme.currentLocale
+import org.matrix.vector.manager.ui.theme.CROWDIN_URL
+import org.matrix.vector.manager.ui.theme.VectorLocaleController
+import org.matrix.vector.ui.locale.LanguageSheet
+import org.matrix.vector.ui.locale.currentLocale
 import org.matrix.vector.manager.di.ServiceLocator
-import org.matrix.vector.manager.ui.components.VectorAlertDialog
-import org.matrix.vector.manager.ui.components.VectorSnackbarHost
-import org.matrix.vector.manager.ui.components.show
+import org.matrix.vector.ui.SharedAlertDialog
+import org.matrix.vector.ui.SharedSnackbarHost
+import org.matrix.vector.ui.show
 import org.matrix.vector.manager.data.github.CommunityFeed
 import org.matrix.vector.manager.data.github.FeedItem
 import org.matrix.vector.manager.data.github.FeedLayout
@@ -108,11 +111,15 @@ import org.matrix.vector.manager.ui.components.GapRow
 import org.matrix.vector.manager.ui.components.HistoryFootRow
 import org.matrix.vector.manager.ui.components.ContributorAvatar
 import org.matrix.vector.manager.ui.components.TakePartSection
-import org.matrix.vector.manager.ui.components.StatusHeader
-import org.matrix.vector.manager.ui.components.ambience.AmbienceKind
+import org.matrix.vector.ui.UpdatableVersion
+import org.matrix.vector.manager.ui.components.VectorAmbienceSettings
+import org.matrix.vector.manager.ui.components.statusWordRes
+import org.matrix.vector.manager.ui.components.toTone
+import org.matrix.vector.ui.StatusHeader
+import org.matrix.vector.ui.ambience.AmbienceKind
 import org.matrix.vector.manager.ui.screens.splash.WingedVictory
-import org.matrix.vector.manager.ui.components.compactCount
-import org.matrix.vector.manager.ui.theme.VectorMono
+import org.matrix.vector.ui.RepoStatsRow
+import org.matrix.vector.ui.theme.Mono
 
 /**
  * Home is the front page of the *project*, not only of the app.
@@ -223,7 +230,7 @@ fun HomeScreen(
         // up behind three-button navigation. Already-consumed insets are excluded from this, so it
         // still adds nothing in the arrangements where a container is there.
         contentWindowInsets = ScaffoldDefaults.contentWindowInsets.only(WindowInsetsSides.Bottom),
-        snackbarHost = { VectorSnackbarHost(snackbars) },
+        snackbarHost = { SharedSnackbarHost(snackbars) },
     ) { padding ->
         val listState = rememberLazyListState()
         var headerHeightPx by remember { mutableIntStateOf(0) }
@@ -311,12 +318,12 @@ fun HomeScreen(
             )
 
             StatusHeader(
-                state = status.state,
-                version = status.versionLabel,
-                apiVersion = status.apiVersion,
-                hasUpdate = frameworkUpdate.hasUpdate,
-                onOpenUpdate = onOpenUpdate,
+                brand = stringResource(R.string.app_name),
+                statusWord = stringResource(status.state.statusWordRes()),
+                tone = status.state.toTone(),
                 ambience = AmbienceKind.from(ambienceKey),
+                ambienceSettings = VectorAmbienceSettings,
+                statusContentDescription = stringResource(R.string.status_open_details),
                 hintStatus = hintStatus,
                 onOpenStatus = {
                     // Counted before the navigation, not after arriving: the tap is what proves the
@@ -324,9 +331,36 @@ fun HomeScreen(
                     viewModel.noteStatusBadgeOpened()
                     onOpenStatus()
                 },
+                appearanceLabel = stringResource(R.string.appearance_title),
                 onOpenAppearance = { showAppearance = true },
+                languageLabel = stringResource(R.string.language_title),
                 onOpenLanguage = { showLanguage = true },
                 onBrandTap = ::onBrandTap,
+                detail = { contentColor ->
+                    val detailText =
+                        buildList {
+                                status.versionLabel?.let { add(it) }
+                                status.apiVersion?.let { add("API $it") }
+                            }
+                            .joinToString("  ·  ")
+                    if (detailText.isNotEmpty()) {
+                        // The version line becomes the way in to the update, because it is the thing
+                        // the mark is attached to. Tappable whether or not there is an update, so
+                        // "you are up to date" stays reachable.
+                        UpdatableVersion(
+                            text = detailText,
+                            hasUpdate = frameworkUpdate.hasUpdate,
+                            color = contentColor.copy(alpha = 0.75f),
+                            markColor = contentColor,
+                            modifier =
+                                Modifier.clickable(
+                                    interactionSource = remember { MutableInteractionSource() },
+                                    indication = null,
+                                    onClick = onOpenUpdate,
+                                ),
+                        )
+                    }
+                },
                 modifier =
                     Modifier.onSizeChanged { headerHeightPx = it.height }
                         .graphicsLayer {
@@ -340,7 +374,12 @@ fun HomeScreen(
     }
 
     if (showLanguage) {
-        LanguageSheet(onOpen = ::open, onDismiss = { showLanguage = false })
+        LanguageSheet(
+            controller = VectorLocaleController,
+            onDismiss = { showLanguage = false },
+            onHelpTranslate = { open(CROWDIN_URL) },
+            onOpenUrl = ::open,
+        )
     }
 
     if (showAppearance) {
@@ -426,7 +465,7 @@ private fun LauncherPrompt(
     onNever: () -> Unit,
     onLater: () -> Unit,
 ) {
-    VectorAlertDialog(
+    SharedAlertDialog(
         onDismissRequest = onLater,
         icon = { Icon(Icons.AutoMirrored.Rounded.AddToHomeScreen, contentDescription = null) },
         title = { Text(stringResource(R.string.launcher_prompt_title)) },
@@ -883,7 +922,7 @@ private fun ContributorRow(
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 modifier =
-                    Modifier.combinedClickable(
+                    Modifier.contextClickable(
                             onClick = { if (hasProfile) onClick(person) },
                             onLongClick = {
                                 haptics.performHapticFeedback(HapticFeedbackType.LongPress)
@@ -918,7 +957,7 @@ private fun ContributorRow(
                 )
                 Text(
                     text = person.commits.toString(),
-                    style = VectorMono,
+                    style = Mono,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
@@ -929,47 +968,14 @@ private fun ContributorRow(
 @Composable
 private fun ProjectFooter(feed: CommunityFeed, onClick: () -> Unit) {
     val repo = feed.repo ?: return
-    Box(
-        modifier = Modifier.fillMaxWidth().clickable { onClick() },
-        // Centred: it is a standing fact about the project rather than a list item, and centring
-        // reads as a footer rather than as one more left-aligned row in the stack above.
-        contentAlignment = Alignment.Center,
-    ) {
-        val locale = currentLocale()
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(16.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            FooterStat(Icons.Rounded.Star, compactCount(repo.stars, locale))
-            FooterStat(Icons.AutoMirrored.Rounded.CallSplit, compactCount(repo.forks, locale))
-            FooterStat(Icons.Rounded.BugReport, repo.openIssues.toString())
-            repo.license?.spdxId?.let {
-                Text(
-                    text = it,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun FooterStat(icon: androidx.compose.ui.graphics.vector.ImageVector, value: String) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Icon(
-            icon,
-            contentDescription = null,
-            modifier = Modifier.height(14.dp),
-            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Spacer(Modifier.width(4.dp))
-        Text(
-            text = value,
-            style = MaterialTheme.typography.labelMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-    }
+    // The shared project footer — the same row LSPatch's Home shows, over its own repo.
+    RepoStatsRow(
+        stars = repo.stars,
+        forks = repo.forks,
+        openIssues = repo.openIssues,
+        license = repo.license?.spdxId,
+        onClick = onClick,
+    )
 }
 
 /** Taps must land within this window of each other to count towards the same run. */

@@ -1,34 +1,25 @@
 package org.matrix.vector.manager.ui.screens.update
 
+import org.matrix.vector.ui.R as UiR
 import org.matrix.vector.manager.data.repository.FrameworkUpdateState
 import org.matrix.vector.manager.data.repository.divergesFrom
 import androidx.compose.foundation.clickable
-import org.matrix.vector.manager.ui.theme.currentLocale
-import org.matrix.vector.manager.ui.theme.LocalizedOverlay
-import org.matrix.vector.manager.ui.components.SheetHeading
-import org.matrix.vector.manager.ui.components.sheetRowColors
+import org.matrix.vector.ui.locale.currentLocale
 import org.matrix.vector.manager.data.repository.ReleaseDirection
 import org.matrix.vector.manager.data.github.FrameworkRelease
+import org.matrix.vector.manager.data.github.GitHubRepository
 import java.util.Date
 import java.text.DateFormat
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.material3.SheetValue
-import androidx.compose.material3.rememberBottomSheetState
-import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.ListItem
-import androidx.compose.material.icons.rounded.RadioButtonUnchecked
-import androidx.compose.material.icons.rounded.RadioButtonChecked
-import androidx.compose.material.icons.rounded.History
 import org.matrix.vector.manager.data.github.ZipVariant
 import org.matrix.vector.manager.data.github.CanaryArtifact
-import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.material3.SingleChoiceSegmentedButtonRow
-import androidx.compose.material3.SegmentedButtonDefaults
-import androidx.compose.material3.SegmentedButton
-import androidx.compose.animation.AnimatedContent
+import org.matrix.vector.ui.update.VariantPicker
+import org.matrix.vector.ui.update.VariantChoice
+import org.matrix.vector.ui.update.VersionHistoryItem
+import org.matrix.vector.ui.update.VersionHistorySheet
+import org.matrix.vector.ui.update.VersionStatus
+import org.matrix.vector.ui.update.formatSize
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Box
@@ -52,6 +43,7 @@ import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.automirrored.rounded.OpenInNew
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.ErrorOutline
+import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.RestartAlt
 import androidx.compose.material.icons.rounded.SystemUpdateAlt
 import androidx.compose.material3.Button
@@ -80,8 +72,12 @@ import kotlinx.coroutines.launch
 import org.matrix.vector.ipc.IFrameworkInstallReceiver
 import org.matrix.vector.manager.R
 import org.matrix.vector.manager.data.repository.FlashStep
-import org.matrix.vector.manager.ui.screens.repo.StoreHtmlPane
-import org.matrix.vector.manager.ui.theme.VectorLogLine
+import org.matrix.vector.ui.store.StoreHtmlPane
+import org.matrix.vector.ui.store.releaseMarkdownToHtml
+import org.matrix.vector.manager.di.ServiceLocator
+import org.matrix.vector.manager.ui.screens.web.fetchStoreSubresource
+import org.matrix.vector.manager.ui.screens.web.forWebView
+import org.matrix.vector.ui.theme.LogLine
 
 /**
  * What is in the update, and what happened when it was installed.
@@ -174,7 +170,7 @@ fun FrameworkUpdateScreen(
                         IconButton(onClick = { onOpenUrl(url) }) {
                             Icon(
                                 Icons.AutoMirrored.Rounded.OpenInNew,
-                                contentDescription = stringResource(R.string.store_open_release),
+                                contentDescription = stringResource(UiR.string.store_open_release),
                             )
                         }
                     }
@@ -211,7 +207,7 @@ fun FrameworkUpdateScreen(
                 val html =
                     remember(release?.notesMarkdown) {
                         release?.notesMarkdown?.takeIf { it.isNotBlank() }?.let {
-                            releaseMarkdownToHtml(it)
+                            releaseMarkdownToHtml(it, GitHubRepository.REPO_URL)
                         }
                     }
                 when {
@@ -220,6 +216,10 @@ fun FrameworkUpdateScreen(
                             html = html,
                             modifier = Modifier.fillMaxSize(),
                             onOpenUrl = onOpenUrl,
+                            // Same sandbox the store README gets: subresources through the app's
+                            // client, and a context that forces the theme and network permission.
+                            fetchSubresource = { fetchStoreSubresource(ServiceLocator.http, it) },
+                            contextForWebView = { ctx, dark -> ctx.forWebView(dark) },
                         )
                     release == null -> Empty(stringResource(R.string.update_none))
                     else -> Empty(stringResource(R.string.update_no_notes))
@@ -282,7 +282,7 @@ private fun InstallLog(lines: List<String>, terminal: Boolean) {
         items(lines) { line ->
             Text(
                 text = line,
-                style = VectorLogLine,
+                style = LogLine,
                 color = MaterialTheme.colorScheme.onSurface,
                 // Installers print progress bars and paths that are wider than any phone; wrapping
                 // them turns one line of output into four and makes the log unreadable.
@@ -415,8 +415,19 @@ private fun UpdateBar(
             FlashStep.Idle ->
                 Column {
                     // Above the button and only while idle: it is the question the button answers,
-                    // and once a flash is running the choice has already been made.
-                    VariantPicker(zips = zips, chosen = chosen, onChoose = onChoose)
+                    // and once a flash is running the choice has already been made. The picker is
+                    // the shared one in manager-ui; zips map to it by their variant key, and the
+                    // chosen key maps back to the ZipVariant the view model persists.
+                    VariantPicker(
+                        choices =
+                            zips.map {
+                                VariantChoice(it.variant.key, it.sizeInBytes, it.name)
+                            },
+                        selectedKey = chosen?.variant?.key,
+                        onSelect = { key ->
+                            ZipVariant.entries.firstOrNull { it.key == key }?.let(onChoose)
+                        },
+                    )
                     // Only when root is genuinely the problem. Tying this to the button's disabled
                     // state instead would tell a perfectly rooted device with nothing to install
                     // that it had no root.
@@ -493,106 +504,6 @@ private fun failureText(code: Int): String =
         else -> stringResource(R.string.update_failed_exit, code)
     }
 
-private fun formatSize(bytes: Long): String =
-    when {
-        bytes >= 1_048_576 -> "%.1f MB".format(bytes / 1_048_576.0)
-        bytes >= 1024 -> "%.0f kB".format(bytes / 1024.0)
-        else -> "$bytes B"
-    }
-
-/**
- * Which of the release's builds to install.
- *
- * CI publishes two zips per release, Release and Debug, and the choice has to be the reader's: the
- * troubleshooting screen tells them a debug build is what maintainers need to help, so the app has
- * to be able to install one.
- *
- * A segmented row rather than checkboxes, because this is one-of-two rather than on-and-off: two
- * checkboxes permit neither and both, and a single "install the debug build" makes the ordinary
- * choice an unlabelled absence. It is the same control the theme selector uses, for the same
- * reason — the shared outline says "it is one of these".
- *
- * The size sits on each segment because it is the part of the decision that is otherwise a
- * surprise, and it is the size the release itself reports rather than an assumption about which
- * build is bigger. The line beneath says what the choice means and changes with it, so the answer
- * arrives at the moment the question is asked.
- *
- * One zip means no control at all — nobody should be asked to choose between one thing — and an
- * unrecognised name keeps its own file name rather than being labelled as something it may not be.
- */
-@Composable
-private fun VariantPicker(
-    zips: List<CanaryArtifact>,
-    chosen: CanaryArtifact?,
-    onChoose: (ZipVariant) -> Unit,
-) {
-    if (zips.size < 2) return
-    val colors = MaterialTheme.colorScheme
-    // Release first, whatever order the release listed its assets in, so the default sits under the
-    // reader's thumb rather than wherever GitHub happened to put it.
-    val ordered = zips.sortedBy { it.variant.ordinal }
-
-    SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
-        ordered.forEachIndexed { index, zip ->
-            SegmentedButton(
-                selected = zip.name == chosen?.name,
-                onClick = { onChoose(zip.variant) },
-                shape = SegmentedButtonDefaults.itemShape(index = index, count = ordered.size),
-                icon = {},
-            ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(
-                        text =
-                            when (zip.variant) {
-                                ZipVariant.Release -> stringResource(R.string.update_variant_release)
-                                ZipVariant.Debug -> stringResource(R.string.update_variant_debug)
-                                ZipVariant.Other -> zip.name
-                            },
-                        style = MaterialTheme.typography.labelLarge,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    Text(
-                        text = formatSize(zip.sizeInBytes),
-                        style = MaterialTheme.typography.labelSmall,
-                        color = colors.onSurfaceVariant,
-                    )
-                }
-            }
-        }
-    }
-
-    val why =
-        when (chosen?.variant) {
-            ZipVariant.Debug -> stringResource(R.string.update_variant_debug_why)
-            ZipVariant.Release -> stringResource(R.string.update_variant_release_why)
-            else -> null
-        }
-    if (why != null) {
-        Spacer(Modifier.height(6.dp))
-        // Crossfaded so the sentence reads as the answer to the tap that just happened rather
-        // than as text that was always there.
-        AnimatedContent(targetState = why, label = "variant") { text ->
-            Text(
-                text = text,
-                style = MaterialTheme.typography.labelMedium,
-                color = colors.onSurfaceVariant,
-            )
-        }
-        Spacer(Modifier.height(10.dp))
-    }
-}
-
-/**
- * How much of a version row the status on its right may take.
- *
- * Wide enough for "Installed" and "Older" on one line in every language shipped, and narrow enough
- * that what is left still holds a build's name and its date without wrapping on a phone. The
- * divergence clause is longer than that and wraps inside this width, which is the point of fixing
- * it: one row's wordier status must not move where the next row's name begins.
- */
-private val STATUS_WIDTH = 96.dp
-
 /**
  * Every build on this channel, so "no update available" is not a dead end.
  *
@@ -609,7 +520,6 @@ private val STATUS_WIDTH = 96.dp
  * commit at all. Marking on the number alone would put a confident "Installed" against a row the
  * bar two lines up is calling divergent.
  */
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun VersionsSheet(
     history: List<FrameworkRelease>,
@@ -618,106 +528,55 @@ private fun VersionsSheet(
     onSelect: (FrameworkRelease) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    val sheetState = rememberBottomSheetState(initialValue = SheetValue.Hidden)
-    val colors = MaterialTheme.colorScheme
     val locale = currentLocale()
+    // Resolved once, out of the map below: stringResource is @Composable and cannot be called from
+    // a plain transform lambda.
+    val heading = stringResource(R.string.update_versions)
+    val canaryLabel = stringResource(R.string.update_channel_canary)
+    val releaseLabel = stringResource(R.string.update_channel_release)
+    val installedLabel = stringResource(R.string.update_installed)
+    val sameNumberLabel = stringResource(R.string.update_same_number)
+    val olderLabel = stringResource(R.string.update_older)
+    val dateFormat = DateFormat.getDateInstance(DateFormat.MEDIUM, locale)
 
-    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState) {
-        LocalizedOverlay {
-            Column(Modifier.verticalScroll(rememberScrollState()).padding(bottom = 24.dp)) {
-                SheetHeading(stringResource(R.string.update_versions), Icons.Rounded.History)
-                history.forEach { release ->
-                    val sameNumber = release.versionCode == update.installedVersionCode
-                    // A build that carries this number but was not made from this release: another
-                    // branch, or a working tree with changes in it.
-                    val diverged = update.divergesFrom(release)
-                    val installed = sameNumber && !diverged
-                    val older = release.versionCode < update.installedVersionCode
-                    ListItem(
-                        modifier =
-                            Modifier.clickable {
-                                onSelect(release)
-                                onDismiss()
-                            },
-                        supportingContent = {
-                            Text(
-                                listOfNotNull(
-                                        DateFormat.getDateInstance(DateFormat.MEDIUM, locale)
-                                            .format(Date(release.epochSeconds * 1000)),
-                                        if (release.isCanary) {
-                                            stringResource(R.string.update_channel_canary)
-                                        } else {
-                                            stringResource(R.string.update_channel_release)
-                                        },
-                                    )
-                                    .joinToString("  ·  "),
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                        },
-                        leadingContent = {
-                            // The one that is running, marked the way the activity feed marks the
-                            // commit you are on — a filled dot against hollow ones.
-                            Icon(
-                                if (installed) Icons.Rounded.RadioButtonChecked
-                                else Icons.Rounded.RadioButtonUnchecked,
-                                contentDescription = null,
-                                tint =
-                                    when {
-                                        installed -> colors.primary
-                                        // Not filled and not the accent: this row is where the
-                                        // reader *appears* to be and is not.
-                                        diverged -> colors.tertiary
-                                        release.versionCode == selected?.versionCode ->
-                                            colors.onSurface
-                                        else -> colors.outline
-                                    },
-                            )
-                        },
-                        // A column of its own width, kept even when this row has nothing to say.
-                        // The status is one word on most rows and a whole clause on the divergent
-                        // one; sized to its content it would take the room the build's name needs
-                        // and wrap that row alone, and a slot that disappears when empty would
-                        // start each row's name in a different place. The label wraps inside its
-                        // column instead, where it costs nothing: three lines of it are still
-                        // shorter than the two the name and its date already occupy.
-                        trailingContent = {
-                            val label =
-                                when {
-                                    installed -> stringResource(R.string.update_installed)
-                                    diverged -> stringResource(R.string.update_same_number)
-                                    older -> stringResource(R.string.update_older)
-                                    else -> null
-                                }
-                            Box(
-                                modifier = Modifier.width(STATUS_WIDTH),
-                                contentAlignment = Alignment.CenterEnd,
-                            ) {
-                                if (label != null) {
-                                    Text(
-                                        label,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        textAlign = TextAlign.End,
-                                        color =
-                                            when {
-                                                installed -> colors.primary
-                                                diverged -> colors.tertiary
-                                                else -> colors.onSurfaceVariant
-                                            },
-                                    )
-                                }
-                            }
-                        },
-                        colors = sheetRowColors,
-                    ) {
-                        // One line each, always. What names the build is the same shape in every
-                        // row — "Vector v2.0 canary 3060", then its date and channel — and a row
-                        // that wraps because of what is beside it reads as a different kind of
-                        // entry when it is not.
-                        Text(release.title, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    }
+    val items =
+        history.map { release ->
+            val sameNumber = release.versionCode == update.installedVersionCode
+            // A build that carries this number but was not made from this release: another branch,
+            // or a working tree with changes in it.
+            val diverged = update.divergesFrom(release)
+            val status =
+                when {
+                    sameNumber && !diverged -> VersionStatus.Installed
+                    diverged -> VersionStatus.Diverged
+                    release.versionCode < update.installedVersionCode -> VersionStatus.Older
+                    else -> VersionStatus.None
                 }
-            }
+            VersionHistoryItem(
+                id = release.tag,
+                title = release.title,
+                subtitle =
+                    listOf(
+                            dateFormat.format(Date(release.epochSeconds * 1000)),
+                            if (release.isCanary) canaryLabel else releaseLabel,
+                        )
+                        .joinToString("  ·  "),
+                statusLabel =
+                    when (status) {
+                        VersionStatus.Installed -> installedLabel
+                        VersionStatus.Diverged -> sameNumberLabel
+                        VersionStatus.Older -> olderLabel
+                        VersionStatus.None -> null
+                    },
+                status = status,
+                selected = release.versionCode == selected?.versionCode,
+            )
         }
-    }
+
+    VersionHistorySheet(
+        heading = heading,
+        items = items,
+        onSelect = { id -> history.firstOrNull { it.tag == id }?.let(onSelect) },
+        onDismiss = onDismiss,
+    )
 }

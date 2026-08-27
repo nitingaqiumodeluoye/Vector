@@ -25,14 +25,16 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import org.matrix.vector.manager.R
+import org.matrix.vector.ui.R as UiR
 import org.matrix.vector.manager.data.log.CrashRecorder
 import org.matrix.vector.manager.data.log.CrashReport
-import org.matrix.vector.manager.ui.components.SnackbarTone
-import org.matrix.vector.manager.ui.components.StackTrace
-import org.matrix.vector.manager.ui.components.stackTraceItems
-import org.matrix.vector.manager.ui.components.VectorSnackbarHost
-import org.matrix.vector.manager.ui.components.copyToClipboard
-import org.matrix.vector.manager.ui.components.show
+import org.matrix.vector.ui.SnackbarTone
+import org.matrix.vector.ui.logs.StackTrace
+import org.matrix.vector.ui.logs.stackTraceItems
+import org.matrix.vector.ui.SharedSnackbarHost
+import org.matrix.vector.manager.BuildConfig
+import org.matrix.vector.ui.copyToClipboard
+import org.matrix.vector.ui.show
 
 /**
  * The newest crash, read as a list rather than as a wall of text.
@@ -50,11 +52,11 @@ fun CrashTraceScreen(onNavigateBack: () -> Unit) {
     val report = remember { CrashRecorder.newest(context) }
     val snackbars = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
-    val copied = stringResource(R.string.copied)
-    val frameCopied = stringResource(R.string.crash_frame_copied)
+    val copied = stringResource(UiR.string.copied)
+    val frameCopied = stringResource(UiR.string.crash_frame_copied)
 
     Scaffold(
-        snackbarHost = { VectorSnackbarHost(snackbars) },
+        snackbarHost = { SharedSnackbarHost(snackbars) },
         topBar = {
             TopAppBar(
                 title = { Text(stringResource(R.string.crash_trace)) },
@@ -74,13 +76,13 @@ fun CrashTraceScreen(onNavigateBack: () -> Unit) {
                     // getting off the device by hand.
                     IconButton(
                         onClick = {
-                            copyToClipboard(context, CrashRecorder.read(context).orEmpty())
+                            copyToClipboard(context, CrashRecorder.read(context).orEmpty(), BuildConfig.MANAGER_PACKAGE_NAME)
                             scope.launch { snackbars.show(copied, SnackbarTone.Success) }
                         }
                     ) {
                         Icon(
                             Icons.Rounded.ContentCopy,
-                            contentDescription = stringResource(R.string.action_copy_all),
+                            contentDescription = stringResource(UiR.string.action_copy_all),
                         )
                     }
                 },
@@ -115,7 +117,7 @@ fun CrashTraceScreen(onNavigateBack: () -> Unit) {
                 Spacer(Modifier.height(12.dp))
             }
             stackTraceItems(report.sections) { frame ->
-                copyToClipboard(context, frame.line)
+                copyToClipboard(context, frame.line, BuildConfig.MANAGER_PACKAGE_NAME)
                 scope.launch { snackbars.show(frameCopied, SnackbarTone.Success) }
             }
         }

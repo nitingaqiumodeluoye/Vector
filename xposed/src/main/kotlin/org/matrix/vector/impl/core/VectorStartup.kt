@@ -131,6 +131,18 @@ object VectorStartup {
         VectorDeopter.deoptBootMethods()
     }
 
+    /**
+     * Registers a pre-built [LoadedApk] whose constructor ran before the hooks were installed -- the
+     * LSPatch rootless target being the one case. Once tracked, [LoadedApkCreateAppFactoryHooker] and
+     * [LoadedApkCreateCLHooker] dispatch its `onPackageLoaded`/`onPackageReady` (and legacy
+     * `handleLoadPackage`) exactly once when its class loader is realized, with `onPackageLoaded`
+     * running *before* the app's `AppComponentFactory` static initializer.
+     */
+    @JvmStatic
+    fun trackLoadedApk(loadedApk: Any) {
+        LoadedApkTracker.activeApks.add(loadedApk)
+    }
+
     @JvmStatic
     fun bootstrap(isSystem: Boolean, systemServerStarted: Boolean) {
         systemProcess = isSystem

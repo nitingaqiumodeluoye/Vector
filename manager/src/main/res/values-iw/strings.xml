@@ -7,7 +7,6 @@
 
     <string name="nav_home">בית</string>
     <string name="nav_modules">מודולים</string>
-    <string name="nav_store">קטלוג</string>
     <string name="nav_logs">יומנים</string>
 
     <string name="panels_done">סיום</string>
@@ -50,9 +49,6 @@
     <string name="info_not_injected">לא הוזרק</string>
     <string name="status_notification">התראת מצב</string>
     <string name="status_notification_summary">התראה קבועה שמראה ש-Vector פועל.</string>
-    <string name="action_copy_all">העתקת הכול</string>
-    <string name="copied">הועתק ללוח</string>
-
     <string name="home_quarter_title">פעילות אחרונה</string>
     <plurals name="home_commit_count">
         <item quantity="one">קומיט אחד</item>
@@ -152,8 +148,6 @@
     <string name="settings_navigation">ניווט</string>
     <string name="settings_floating_nav">ניווט צף</string>
     <string name="settings_floating_nav_summary">מחליף את הסרגל בכדור קטן שאפשר לגרור לכל מקום. לחיצה ארוכה פורשת את המקטעים במניפה, והקשה משאירה אותם פתוחים.</string>
-    <string name="settings_rearrange_panels">סידור המקטעים מחדש</string>
-    <string name="settings_rearrange_panels_summary">אפשר לשנות את סדרם, או להסתיר את מה שאף פעם לא נפתח.</string>
 
     <string name="settings_activity">זרם הפעילות</string>
     <plurals name="settings_window_months">
@@ -290,7 +284,6 @@
     <string name="language_system">ברירת המחדל של המערכת</string>
     <string name="language_system_summary">לפי השפה שמוגדרת בטלפון</string>
 
-    <string name="language_translated_by">תורגם על ידי %1$s</string>
     <string name="language_help_short">תרגום</string>
     <string name="language_help">עזרו לתרגם את Vector</string>
 
@@ -311,16 +304,9 @@
     <string name="update_failed_start">לא ניתן היה להפעיל את תוכנית ההתקנה.</string>
     <string name="update_failed_download">לא ניתן היה להוריד את העדכון.</string>
     <string name="update_failed_exit">תוכנית ההתקנה נכשלה (קוד %1$d).</string>
-    <string name="store_mute_updates">התעלמות מעדכונים של המודול הזה</string>
-    <string name="store_mute_updates_summary">הוא יפסיק להיחשב מיושן, כאן וברשימת המודולים</string>
-    <string name="store_options">אפשרויות</string>
     <string name="scope_framework_shared">תהליך אחד שכל המשתמשים חולקים, ולכן זה משפיע על כל המכשיר</string>
     <string name="scope_self_hook">המודול הזה נטען לתוך האפליקציה של עצמו, וכך הוא מדווח שהוא פעיל</string>
     <string name="update_no_output">תוכנית ההתקנה לא הדפיסה דבר.</string>
-    <string name="update_variant_release">יציבה</string>
-    <string name="update_variant_debug">ניפוי שגיאות</string>
-    <string name="update_variant_release_why">הגרסה ליום־יום</string>
-    <string name="update_variant_debug_why">יומנים מפורטים, לדיווח על תקלה</string>
     <string name="update_versions">כל הגרסאות</string>
     <string name="update_installed">מותקנת</string>
     <string name="update_older">ישנה יותר</string>
@@ -424,7 +410,6 @@
         <item quantity="many">%1$d מסגרות נוספות, זהות לאלה שלמעלה</item>
         <item quantity="other">%1$d מסגרות נוספות, זהות לאלה שלמעלה</item>
     </plurals>
-    <string name="crash_frame_copied">המסגרת הועתקה</string>
     <string name="crash_unreadable">לא הצלחנו לקרוא את הקריסה הזאת. העתיקו אותה וצרפו אותה לדיווח כמות שהיא.</string>
     <string name="force_launcher_icons">למנוע מאפליקציות להסתיר את הסמל שלהן במסך הבית</string>
     <string name="force_launcher_icons_summary">החל מ-Android 10, אפליקציה שמסתירה את סמל מסך הבית שלה מקבלת סמל חלופי שפותח את פרטי האפליקציה שלה. כבו את האפשרות הזאת כדי לתת לה להישאר מוסתרת — ייתכן שאפליקציית מסך הבית תתעדכן רק לאחר הפעלה מחדש. אפליקציות שמעולם לא היה להן סמל במסך הבית, ובהן רוב המודולים, אינן מושפעות.</string>
@@ -440,15 +425,6 @@
     <string name="scope_framework_restart_title">מסגרת המערכת עדיין לא החילה את זה</string>
     <string name="scope_framework_restart_body">מסגרת המערכת נטענת פעם אחת בלבד, כשאנדרואיד עולה. השינוי הזה יגיע אליה רק כשהמסגרת תופעל מחדש — כל האפליקציות הפועלות נסגרות, והטלפון עצמו נשאר דלוק.</string>
     <string name="scope_framework_restart_later">מאוחר יותר</string>
-    <string name="settings_network">רשת</string>
-    <string name="settings_doh">פענוח שמות דרך HTTPS</string>
-    <string name="settings_doh_summary">מפענח שמות דרך Cloudflare במקום דרך המפענח של הרשת. לרשתות שחוסמות או משבשות DNS.</string>
-    <string name="settings_doh_untested">עדיין לא פוענח אף שם.</string>
-    <string name="settings_doh_bypassed">לא בשימוש: מוגדר פרוקסי, ולכן הוא מפענח את השמות.</string>
-    <string name="settings_doh_working">עובד — %1$s פוענח דרך Cloudflare.</string>
-    <string name="settings_doh_fell_back">לא ניתן היה להגיע ל-Cloudflare (%1$s), ולכן ייעשה שימוש במפענח של הרשת בהמשך ההפעלה הזו.</string>
-    <string name="settings_doh_retry">ניסיון נוסף</string>
-
     <string name="launcher_title">איך פותחים את Vector</string>
     <string name="launcher_body">Vector אינו מותקן כאפליקציה, ולכן אין למסך הבית מה להציג. אלה הדרכים לחזור אליו.</string>
     <string name="launcher_shortcut">קיצור דרך במסך הבית</string>

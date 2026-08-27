@@ -64,18 +64,19 @@ import androidx.compose.ui.draw.alpha
 import android.content.res.Configuration
 import java.util.Locale
 import org.matrix.vector.manager.R
+import org.matrix.vector.ui.R as UiR
 import org.matrix.vector.manager.data.log.CrashRecorder
 import org.matrix.vector.manager.data.model.ManagerCopy
 import org.matrix.vector.manager.data.model.XposedApi
 import org.matrix.vector.manager.data.log.CrashReport
 import org.matrix.vector.manager.data.model.buildStamp
 import org.matrix.vector.manager.data.repository.ManagerInstallStep
-import org.matrix.vector.manager.ui.components.SnackbarTone
-import org.matrix.vector.manager.ui.components.VectorSnackbarHost
-import org.matrix.vector.manager.ui.components.copyToClipboard
-import org.matrix.vector.manager.ui.components.show
+import org.matrix.vector.ui.SnackbarTone
+import org.matrix.vector.ui.SharedSnackbarHost
+import org.matrix.vector.ui.copyToClipboard
+import org.matrix.vector.ui.show
 import kotlinx.coroutines.launch
-import org.matrix.vector.manager.ui.theme.VectorMono
+import org.matrix.vector.ui.theme.Mono
 
 /**
  * Everything a bug report needs about this device, on one page.
@@ -129,12 +130,12 @@ fun SystemStatusScreen(
     val daemonAlive = status.daemonUsable
     val snackbars = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
-    val copied = stringResource(R.string.copied)
+    val copied = stringResource(UiR.string.copied)
     val shortcutRefused = stringResource(R.string.launcher_shortcut_refused)
     val installDone = stringResource(R.string.launcher_install_done)
 
     Scaffold(
-        snackbarHost = { VectorSnackbarHost(snackbars) },
+        snackbarHost = { SharedSnackbarHost(snackbars) },
         topBar = {
             TopAppBar(
                 title = { Text(stringResource(R.string.system_status)) },
@@ -162,13 +163,14 @@ fun SystemStatusScreen(
                                             "\n  ${it.label}: ${it.value}${it.detail.orEmpty()}"
                                         }
                                 },
+                                BuildConfig.MANAGER_PACKAGE_NAME,
                             )
                             scope.launch { snackbars.show(copied, SnackbarTone.Success) }
                         }
                     ) {
                         Icon(
                             Icons.Rounded.ContentCopy,
-                            contentDescription = stringResource(R.string.action_copy_all),
+                            contentDescription = stringResource(UiR.string.action_copy_all),
                         )
                     }
                 },
@@ -616,7 +618,7 @@ private fun CrashFact(
         Text(
             value,
             style =
-                if (monospace) VectorMono.copy(fontSize = 14.sp)
+                if (monospace) Mono.copy(fontSize = 14.sp)
                 else MaterialTheme.typography.bodyMedium,
             color = if (error) colors.error else colors.onSurface,
         )
@@ -665,7 +667,7 @@ private fun InfoRow(row: InfoItem) {
                         }
                     },
                 style =
-                    if (row.monospace) VectorMono.copy(fontSize = 15.sp)
+                    if (row.monospace) Mono.copy(fontSize = 15.sp)
                     else MaterialTheme.typography.bodyLarge,
                 color =
                     when (row.health) {

@@ -3,7 +3,6 @@
 
     <string name="nav_home">Start</string>
     <string name="nav_modules">Module</string>
-    <string name="nav_store">Katalog</string>
     <string name="nav_logs">Protokolle</string>
 
     <string name="panels_done">Fertig</string>
@@ -46,9 +45,6 @@
     <string name="info_not_injected">Nicht injiziert</string>
     <string name="status_notification">Statusbenachrichtigung</string>
     <string name="status_notification_summary">Eine dauerhafte Benachrichtigung, die anzeigt, dass Vector läuft.</string>
-    <string name="action_copy_all">Alles kopieren</string>
-    <string name="copied">In die Zwischenablage kopiert</string>
-
     <string name="home_quarter_title">Letzte Aktivität</string>
     <plurals name="home_commit_count">
         <item quantity="one">%1$d Commit</item>
@@ -138,8 +134,6 @@
     <string name="settings_navigation">Navigation</string>
     <string name="settings_floating_nav">Schwebende Navigation</string>
     <string name="settings_floating_nav_summary">Ersetzt die Leiste durch einen kleinen Ball, den du überallhin ziehen kannst. Halte ihn gedrückt, um die Bereiche aufzufächern, oder tippe ihn an, damit sie offen bleiben.</string>
-    <string name="settings_rearrange_panels">Bereiche neu anordnen</string>
-    <string name="settings_rearrange_panels_summary">Ändere ihre Reihenfolge oder blende aus, was du nie öffnest.</string>
 
     <string name="settings_activity">Aktivitätsverlauf</string>
     <plurals name="settings_window_months">
@@ -266,7 +260,6 @@
     <string name="language_system">Systemstandard</string>
     <string name="language_system_summary">Der auf dem Telefon eingestellten Sprache folgen</string>
 
-    <string name="language_translated_by">Übersetzt von %1$s</string>
     <string name="language_help_short">Übersetzen</string>
     <string name="language_help">Vector übersetzen helfen</string>
 
@@ -287,16 +280,9 @@
     <string name="update_failed_start">Das Installationsprogramm ließ sich nicht starten.</string>
     <string name="update_failed_download">Das Update konnte nicht geladen werden.</string>
     <string name="update_failed_exit">Das Installationsprogramm ist fehlgeschlagen (Exit %1$d).</string>
-    <string name="store_mute_updates">Updates für dieses Modul ignorieren</string>
-    <string name="store_mute_updates_summary">Es gilt hier und in der Modulliste nicht mehr als veraltet</string>
-    <string name="store_options">Optionen</string>
     <string name="scope_framework_shared">Ein Prozess, den sich alle Benutzer teilen — das betrifft das ganze Gerät</string>
     <string name="scope_self_hook">Dieses Modul wird in seine eigene App geladen — so meldet es, dass es aktiv ist</string>
     <string name="update_no_output">Das Installationsprogramm hat nichts ausgegeben.</string>
-    <string name="update_variant_release">Release</string>
-    <string name="update_variant_debug">Debug</string>
-    <string name="update_variant_release_why">Der Build für den Alltag</string>
-    <string name="update_variant_debug_why">Ausführliche Protokolle, für einen Fehlerbericht</string>
     <string name="update_versions">Alle Versionen</string>
     <string name="update_installed">Installiert</string>
     <string name="update_older">Älter</string>
@@ -398,7 +384,6 @@
         <item quantity="one">%1$d weiterer Frame, wie oben</item>
         <item quantity="other">%1$d weitere Frames, wie oben</item>
     </plurals>
-    <string name="crash_frame_copied">Frame kopiert</string>
     <string name="crash_unreadable">Dieser Absturz ließ sich nicht lesen. Kopiere ihn und hänge ihn unverändert an den Bericht an.</string>
     <string name="force_launcher_icons">Apps daran hindern, ihr Launcher-Symbol zu verstecken</string>
     <string name="force_launcher_icons_summary">Seit Android 10 bekommt eine App, die ihr eigenes Launcher-Symbol versteckt, eines zurück, das ihre App-Info-Seite öffnet. Schalte das aus, damit sie versteckt bleiben kann — dein Launcher merkt das womöglich erst nach einem Neustart. Apps, die nie ein Launcher-Symbol hatten, darunter die meisten Module, sind nicht betroffen.</string>
@@ -414,15 +399,6 @@
     <string name="scope_framework_restart_title">Das Framework hat das noch nicht übernommen</string>
     <string name="scope_framework_restart_body">Das System-Framework wird einmal geladen, wenn Android startet. Diese Änderung erreicht es erst, wenn das Framework neu startet — alle laufenden Apps werden beendet, das Telefon selbst bleibt an.</string>
     <string name="scope_framework_restart_later">Später</string>
-    <string name="settings_network">Netzwerk</string>
-    <string name="settings_doh">Namen über HTTPS auflösen</string>
-    <string name="settings_doh_summary">Löst Namen über Cloudflare auf statt über den Resolver des Netzwerks. Für Netzwerke, die DNS blockieren oder verfälschen.</string>
-    <string name="settings_doh_untested">Bisher wurden keine Namen aufgelöst.</string>
-    <string name="settings_doh_bypassed">Nicht in Verwendung: Ein Proxy ist eingerichtet und übernimmt die Auflösung.</string>
-    <string name="settings_doh_working">Funktioniert — %1$s wurde über Cloudflare aufgelöst.</string>
-    <string name="settings_doh_fell_back">Cloudflare ist nicht erreichbar (%1$s); für den Rest dieser Sitzung wird der Resolver des Netzwerks verwendet.</string>
-    <string name="settings_doh_retry">Erneut versuchen</string>
-
     <string name="launcher_title">Wie du Vector öffnest</string>
     <string name="launcher_body">Vector ist nicht als App installiert, dein Launcher hat also nichts anzuzeigen. Das sind die Wege zurück.</string>
     <string name="launcher_shortcut">Verknüpfung auf dem Startbildschirm</string>
