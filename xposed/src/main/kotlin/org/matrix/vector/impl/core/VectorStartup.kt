@@ -129,6 +129,28 @@ object VectorStartup {
     ) {
         VectorServiceClient.init(service, processName ?: "android")
         VectorDeopter.deoptBootMethods()
+
+        // Prefetch legacy module metadata on a background thread. loadLegacyModules() later
+        // calls VectorServiceClient.getLegacyModules() synchronously on the app main thread
+        // during pre-attach; when the binder thread pool is not yet ready that round-trip can
+        // stall launch by ~2.2s. The prefetch runs its own binder call off the main thread and
+        // fills the VectorServiceClient cache, so getLegacyModules() returns from cache instead
+        // of blocking the main thread. Module code is not loaded early.
+        if (service != null) {
+            Thread(
+                    {
+                        runCatching { VectorServiceClient.prefetchLegacyModules() }
+                            .onFailure {
+                                Utils.logE("Vector legacy module prefetch failed", it)
+                            }
+                    },
+                    "Vector-LegacyModulePrefetch",
+                )
+                .apply {
+                    isDaemon = true
+                    start()
+                }
+        }
     }
 
     /**
