@@ -1,7 +1,7 @@
 package org.matrix.vector.impl.hooks;
 
-import io.github.libxposed.api.XposedInterface.CtorInvoker;
-import io.github.libxposed.api.XposedInterface.Invoker;
+import de.wwb.android.wbosed.api.WbInterface.CtorInvoker;
+import de.wwb.android.wbosed.api.WbInterface.Invoker;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Executable;
