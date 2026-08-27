@@ -8,6 +8,30 @@
 
 #include "hook_engine_internal.h"
 
+/* --- Anonymous exec VMA naming --- */
+
+/*
+ * Give an anonymous executable mapping a wwb_ VMA name so /proc/self/maps scanners
+ * (e.g. hunter's "missing page / suspicious execution") do not see it as an empty
+ * "[anon:]" page. Pools are later re-named to their specific wwb_hook_pool /
+ * wwb_hook_exec by their callers; single near-range trampolines that bypass pool
+ * naming are named wwb_hook_exec here. prctl(PR_SET_VMA_ANON_NAME) is a VMA
+ * attribute, so it works regardless of whether the page is still RWX or has been
+ * mprotect'ed to r-xp.
+ */
+#ifndef PR_SET_VMA
+#define PR_SET_VMA 0x53564d41
+#endif
+#ifndef PR_SET_VMA_ANON_NAME
+#define PR_SET_VMA_ANON_NAME 0
+#endif
+static void hook_name_exec_vma(void* base, size_t size) {
+    if (!base || base == MAP_FAILED || size == 0) return;
+    (void)prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME,
+                (unsigned long)base, (unsigned long)size,
+                (unsigned long)"wwb_hook_exec");
+}
+
 /* --- Page permission helpers --- */
 
 /*
@@ -737,6 +761,7 @@ void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range) {
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         hook_log("hook_mmap_near_range: generic exec mmap base=%p size=%zu errno=%d",
                  ptr, alloc_size, ptr == MAP_FAILED ? errno : 0);
+        if (ptr != MAP_FAILED) hook_name_exec_vma(ptr, alloc_size);
         return ptr;
     }
 
@@ -882,6 +907,7 @@ void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range) {
                 }
                 hook_log("hook_mmap_near_range: OK at %p for target %p (range=±%lld, gap#%d step=%d)",
                          ptr, target, (long long)max_range, i, steps);
+                hook_name_exec_vma(ptr, alloc_size);
                 return ptr;
             }
             if (errno == EEXIST || errno == EACCES || errno == EPERM) {
@@ -907,6 +933,7 @@ void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range) {
                 if (d >= -max_range && d < max_range) {
                     hook_log("hook_mmap_near_range: OK (hint) at %p for target %p (range=±%lld)",
                              ptr, target, (long long)max_range);
+                    hook_name_exec_vma(ptr, alloc_size);
                     return ptr;
                 }
                 munmap(ptr, alloc_size);
