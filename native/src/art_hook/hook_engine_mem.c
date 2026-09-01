@@ -277,6 +277,24 @@ static int find_containing_vma(uintptr_t addr, uintptr_t* vma_start, size_t* vma
     return found ? 0 : -1;
 }
 
+static void log_vma_for_addr(const char* stage, void* address) {
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return;
+    const uintptr_t needle = (uintptr_t)address;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        uintptr_t start = 0, end = 0;
+        char perms[8] = "";
+        if (sscanf(line, "%lx-%lx %7s", &start, &end, perms) >= 3 &&
+            needle >= start && needle < end) {
+            hook_log("[wxshadow-vma] stage=%s addr=%p range=%p-%p perms=%s map=%s",
+                     stage, address, (void*)start, (void*)end, perms, line);
+            break;
+        }
+    }
+    fclose(f);
+}
+
 /*
  * Split PMD block / contiguous PTE group by mprotect on the ENTIRE
  * containing VMA + COW write.  Operating on the full VMA boundary
@@ -345,6 +363,7 @@ int wxshadow_patch(void* addr, const void* buf, size_t len) {
     uint64_t stage_start = perf_start;
 
     hook_log("[wxshadow_patch] enter addr=%p buf=%p len=%zu pid=%d", addr, buf, len, getpid());
+    log_vma_for_addr("before", addr);
     ret = prctl(PR_WXSHADOW_PATCH, 0, (uintptr_t)addr, (uintptr_t)buf, len);
     hook_log("[wxshadow_patch] prctl pid=0 ret=%d errno=%d addr=%p len=%zu", ret, errno, addr, len);
     if (stage_start != 0) {
@@ -410,6 +429,7 @@ int wxshadow_patch(void* addr, const void* buf, size_t len) {
     }
 
     hook_log("wxshadow stealth patch OK: addr=%p len=%zu", addr, len);
+    log_vma_for_addr("after", addr);
     if (perf_start != 0) {
         hook_log("[perf] wxshadow_patch end addr=%p len=%zu result=0 elapsedUs=%llu",
                  addr, len, (unsigned long long)hook_perf_elapsed_us(perf_start));

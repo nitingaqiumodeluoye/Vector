@@ -2554,6 +2554,8 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
     if (!g_engine.initialized || !target) {
         return NULL;
     }
+    hook_log("[art-router-trace] install begin target=%p quickcode=%u stealth=%d skip_resolve=%d pre_scan=%d",
+             target, quickcode_offset, stealth, skip_resolve, pre_scan);
     if (perf_start != 0) {
         hook_log("[perf] art_router begin target=%p stealth=%d pre_scan=%d skip_resolve=%d",
                  target, stealth, pre_scan, skip_resolve);
@@ -2584,6 +2586,8 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
     HookEntry* existing = find_hook(target);
     if (existing) {
         void* trampoline = existing->trampoline;
+        hook_log("[art-router-trace] install existing target=%p trampoline=%p thunk=%p",
+                 target, trampoline, existing->thunk);
         hook_unlock(&g_engine.lock);
         if (perf_start != 0) {
             hook_log("[perf] art_router end target=%p result=existing elapsedUs=%llu",
@@ -2626,6 +2630,8 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
         hook_unlock(&g_engine.lock);
         return NULL;
     }
+    hook_log("[art-router-trace] trampoline ready target=%p trampoline=%p thunk=%p",
+             target, entry->trampoline, entry->thunk);
     if (stage_start != 0) {
         hook_log("[perf] art_router stage=build_trampoline target=%p elapsedUs=%llu",
                  target, (unsigned long long)hook_perf_elapsed_us(stage_start));
@@ -2675,6 +2681,8 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
 
     hook_log("[art_router] installed: target=%p, thunk=%p, trampoline=%p",
              target, entry->thunk, trampoline);
+    hook_log("[art-router-trace] install published target=%p patch_dest=%p trampoline=%p",
+             target, patch_dest, trampoline);
     if (perf_start != 0) {
         hook_log("[perf] art_router end target=%p result=installed elapsedUs=%llu",
                  target, (unsigned long long)hook_perf_elapsed_us(perf_start));

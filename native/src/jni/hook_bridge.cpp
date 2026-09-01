@@ -607,10 +607,12 @@ VECTOR_DEF_NATIVE_METHOD(jboolean, HookBridge, initializeArtBootstrap) {
 }
 
 VECTOR_DEF_NATIVE_METHOD(void, HookBridge, setSystemProcess, jboolean is_system) {
+    LOGI("[art-init-branch] setSystemProcess pid={} system={}", getpid(), is_system == JNI_TRUE);
     art::SetSystemProcess(is_system == JNI_TRUE);
 }
 
 VECTOR_DEF_NATIVE_METHOD(jboolean, HookBridge, completeArtBootstrap) {
+    LOGI("[art-init-branch] JNI completeArtBootstrap pid={} tid={}", getpid(), gettid());
     return art::CompleteInitialization(env) ? JNI_TRUE : JNI_FALSE;
 }
 
@@ -908,6 +910,13 @@ VECTOR_DEF_NATIVE_METHOD(jobject, HookBridge, invokeOriginalMethod, jobject hook
                                [&hook_item](const auto &it) { hook_item = it.second.get(); });
 
     if (hook_item && hook_item->art_state) {
+        LOGI("[orig-call-trace] method={} art_method={} clone={} entry={} quick_trampoline={} native_entry={}",
+             reinterpret_cast<void *>(target),
+             hook_item->art_state->original_art_method,
+             hook_item->art_state->original_clone,
+             hook_item->art_state->original_entry,
+             hook_item->art_state->quick_trampoline,
+             hook_item->art_state->native_entry_hook);
         return art::InvokeOriginal(env, *hook_item->art_state, thiz, args);
     }
 

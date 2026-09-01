@@ -265,7 +265,16 @@ private:
             },
         .inline_unhooker = [](auto target) { return UnhookInline(target) == 0; },
         .art_symbol_resolver =
-            [](auto symbol) { return ElfSymbolCache::GetArt()->getSymbAddress(symbol); },
+            [](auto symbol) {
+                const auto *art = ElfSymbolCache::GetArt();
+                auto address = art ? art->getSymbAddress(symbol) : nullptr;
+                if (!symbol.empty() && symbol ==
+                                  "_ZN3art7Runtime15DisableVerifierEv") {
+                    LOGI("[lsplant-art-resolver] symbol={} address={} cache={}",
+                         symbol, address, static_cast<const void *>(art));
+                }
+                return address;
+            },
         .art_symbol_prefix_resolver =
             [](auto symbol) { return ElfSymbolCache::GetArt()->getSymbPrefixFirstAddress(symbol); },
         .generated_class_name = "Vector_",
@@ -439,6 +448,7 @@ void VectorModule::preAppSpecialize(zygisk::AppSpecializeArgs *args) {
     LOGI("preAppSpecialize candidate '{}' uid={} app_id={} child_zygote={} has_app_data_dir={}",
          nice_name_str.get(), args->uid, app_id, is_child_zygote,
          args->app_data_dir != nullptr);
+
 
     // An app without a data directory cannot be a target.
     if (!args->app_data_dir) {

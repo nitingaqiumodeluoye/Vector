@@ -255,6 +255,9 @@ void *InstallArtRouterWithFallback(void *target, uint32_t quickcode_offset,
                                    JNIEnv *env, void **out_hooked_target,
                                    int skip_resolve, uint64_t current_pc_hint,
                                    int use_blr, int pre_scan) {
+    LOGI("[art-router-diag] install target={} offset={} skip_resolve={} pc_hint={} use_blr={} pre_scan={} stealth={}",
+         target, quickcode_offset, skip_resolve,
+         reinterpret_cast<void *>(current_pc_hint), use_blr, pre_scan, ArtStealthFlag());
     void *trampoline = hook_install_art_router(
         target, quickcode_offset, ArtStealthFlag(), env, out_hooked_target,
         skip_resolve, current_pc_hint, use_blr, pre_scan);
@@ -473,6 +476,46 @@ bool IsMappedExecutable(uintptr_t address) {
     return executable;
 }
 
+bool IsReadable(uintptr_t address, size_t size);
+
+void LogArtEntryDiagnostic(const char *stage, uintptr_t address) {
+    address &= kPacStripMask;
+    if (address < 0x1000) {
+        LOGI("[art-entry-diag] stage={} addr=null", stage);
+        return;
+    }
+    FILE *maps = fopen("/proc/self/maps", "r");
+    char perms[5] = {};
+    uintptr_t start = 0;
+    uintptr_t end = 0;
+    char mapping[256] = {};
+    if (maps) {
+        char line[512];
+        while (fgets(line, sizeof(line), maps)) {
+            uintptr_t lo = 0;
+            uintptr_t hi = 0;
+            char p[5] = {};
+            char name[256] = {};
+            if (sscanf(line, "%lx-%lx %4s %*s %*s %*s %255[^\n]",
+                       &lo, &hi, p, name) >= 3 && address >= lo && address < hi) {
+                start = lo;
+                end = hi;
+                memcpy(perms, p, sizeof(perms));
+                memcpy(mapping, name, sizeof(mapping) - 1);
+                break;
+            }
+        }
+        fclose(maps);
+    }
+    uint32_t words[4] = {};
+    const bool readable = IsReadable(address, sizeof(words));
+    if (readable) memcpy(words, reinterpret_cast<const void *>(address), sizeof(words));
+    LOGI("[art-entry-diag] stage={} addr={} vma={}..{} perms={} map={} readable={} insn={:08x},{:08x},{:08x},{:08x}",
+         stage, reinterpret_cast<void *>(address), reinterpret_cast<void *>(start),
+         reinterpret_cast<void *>(end), perms[0] ? perms : "?", mapping,
+         readable, words[0], words[1], words[2], words[3]);
+}
+
 bool IsReadable(uintptr_t address, size_t size) {
     if (address < 0x1000 || size == 0) return false;
     const uintptr_t end = address + size - 1;
@@ -660,11 +703,29 @@ size_t InferMethodSize(JNIEnv *env, uintptr_t target) {
     return 32;
 }
 
+bool IsInArtModule(uintptr_t address);
+
 void *ResolveArtSymbol(const char *name) {
+    const bool trace = name && strcmp(name, "_ZN3art7Runtime15DisableVerifierEv") == 0;
     if (const auto *art = ElfSymbolCache::GetArt()) {
-        if (void *address = art->getSymbAddress<void *>(name)) return address;
+        if (void *address = art->getSymbAddress<void *>(name)) {
+            if (trace) {
+                LOGI("[art-router-diag] ResolveArtSymbol name={} address={} cache={} exec={} art={}",
+                     name, address, static_cast<const void *>(art),
+                     IsMappedExecutable(reinterpret_cast<uintptr_t>(address)),
+                     IsInArtModule(reinterpret_cast<uintptr_t>(address)));
+            }
+            return address;
+        }
     }
-    return dlsym(RTLD_DEFAULT, name);
+    void *address = dlsym(RTLD_DEFAULT, name);
+    if (trace) {
+        LOGI("[art-router-diag] ResolveArtSymbol name={} address={} source=dlsym exec={} art={}",
+             name, address,
+             address && IsMappedExecutable(reinterpret_cast<uintptr_t>(address)),
+             address && IsInArtModule(reinterpret_cast<uintptr_t>(address)));
+    }
+    return address;
 }
 
 bool ProbeArtThreadLayout(JNIEnv *env) {
@@ -2411,6 +2472,9 @@ bool InitializeBaseImpl(JNIEnv *env) {
     g_art_stealth_mode = SelectArtStealthMode();
     hook_set_stealth_mode(ArtStealthFlag());
     DiscoverClassLinkerTrampolines(env);
+    LogArtEntryDiagnostic("base-ready",
+                          reinterpret_cast<uintptr_t>(
+                              ResolveArtSymbol("_ZN3art7Runtime15DisableVerifierEv")));
     g_base_initialized = true;
     LOGI("WxShadow ART bootstrap base ready: stealth={} ArtMethod size={} flags={} data={} "
          "entry={} jni={} thread_current={} thread_layout={}",
@@ -2446,6 +2510,12 @@ bool EnsureInterpreterRouter(JNIEnv *env) {
 bool CompleteInitializationImpl(JNIEnv *env) {
     const uint64_t perf_start = ArtPerfEnabled() ? ArtPerfNowNs() : 0;
     if (g_initialized) return true;
+    const auto disable_verifier = reinterpret_cast<uintptr_t>(
+        ResolveArtSymbol("_ZN3art7Runtime15DisableVerifierEv"));
+    LOGI("[art-router-trace] DisableVerifier addr={} mapped_exec={} art_module={}",
+         reinterpret_cast<void *>(disable_verifier),
+         disable_verifier != 0 && IsMappedExecutable(disable_verifier),
+         disable_verifier != 0 && IsInArtModule(disable_verifier));
     // Source reference: rustFrida art_controller.rs Layer 1 skips shared
     // generic-JNI and Nterp unless Java.setStealth(1/2) explicitly selected a
     // stealth mode before ART hooks are installed. Vector's auto mode only
