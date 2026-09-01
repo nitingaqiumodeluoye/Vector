@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <utility>  // For std::move
 
@@ -40,15 +41,38 @@ ElfImage::ElfImage(std::string_view lib_name) : path_(lib_name) {
         return;
     }
     file_size_ = file_info.st_size;
-
-    file_map_ = mmap(nullptr, file_size_, PROT_READ, MAP_SHARED, fd, 0);
-    close(fd);
-
-    if (file_map_ == MAP_FAILED) {
-        PLOGE("mmap failed for {}", path_.c_str());
-        file_map_ = nullptr;
+    if (file_size_ == 0) {
+        close(fd);
         return;
     }
+
+    // Do NOT mmap the ELF file into this process: the resulting read-only file
+    // mapping would appear in /proc/self/maps as the lowest libart.so entry and
+    // break third-party address resolution (e.g. Jiagu shells computing
+    // "lowest libart map + st_value"), leading to SEGV_ACCERR on exec of a
+    // non-executable mapping. rustFrida parses the already-loaded ELF in memory
+    // and never creates such a file mapping. Keep the same parsing semantics by
+    // reading the file into a heap buffer instead.
+    file_map_ = malloc(file_size_);
+    if (file_map_ == nullptr) {
+        PLOGE("malloc failed for {}", path_.c_str());
+        close(fd);
+        return;
+    }
+    size_t total = 0;
+    while (total < file_size_) {
+        ssize_t n = pread(fd, static_cast<uint8_t *>(file_map_) + total,
+                          file_size_ - total, total);
+        if (n <= 0) {
+            PLOGE("pread failed for {}", path_.c_str());
+            free(file_map_);
+            file_map_ = nullptr;
+            close(fd);
+            return;
+        }
+        total += static_cast<size_t>(n);
+    }
+    close(fd);
 
     header_ = static_cast<ElfW(Ehdr) *>(file_map_);
     parseHeaders(header_);
@@ -63,7 +87,7 @@ ElfImage::ElfImage(std::string_view lib_name) : path_(lib_name) {
 
 ElfImage::~ElfImage() {
     if (file_map_ != nullptr) {
-        munmap(file_map_, file_size_);
+        free(file_map_);
     }
 }
 
