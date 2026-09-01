@@ -29,7 +29,9 @@ object AppAttachHooker : WbInterface.Hooker {
     override fun intercept(chain: WbInterface.Chain): Any? {
         // Execute the actual attach() method first
         val totalStartNs = System.nanoTime()
+        Utils.logI("[startup-trace] ActivityThread.attach intercept begin")
         val result = traceAttachStep("ActivityThread.attach.proceed") { chain.proceed() }
+        Utils.logI("[startup-trace] ActivityThread.attach.proceed returned")
         traceAttachStep("markAppAttachCompleted") { VectorStartup.markAppAttachCompleted() }
 
         // rawVector reaches module loading at this boundary, after the real attach() returns. The

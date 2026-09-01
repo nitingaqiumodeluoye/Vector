@@ -109,10 +109,12 @@ object VectorLifecycleManager {
                 }
             }
 
+        Log.i(TAG, "packageReady begin package=$packageName first=$isFirst")
         activeModules.forEach { module ->
             runCatching {
-                    Log.d(TAG, "dispatchPackageReady $param")
+                    Log.i(TAG, "packageReady callback begin package=$packageName module=${module.javaClass.name}")
                     module.onPackageReady(param)
+                    Log.i(TAG, "packageReady callback end package=$packageName module=${module.javaClass.name}")
                 }
                 .onFailure {
                     Log.e(
@@ -122,6 +124,7 @@ object VectorLifecycleManager {
                     )
                 }
         }
+        Log.i(TAG, "packageReady end package=$packageName")
     }
 
     fun dispatchSystemServerStarting(classLoader: ClassLoader) {

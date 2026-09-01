@@ -174,7 +174,15 @@ object LoadedApkCreateCLHooker : WbInterface.Hooker {
         if (isInitialLoad) {
             Utils.logI("[startup-trace] LoadedApk.createOrUpdateClassLoaderLocked begin")
         }
+        Utils.logI(
+            "[startup-trace] LoadedApk.createOrUpdateClassLoaderLocked proceed begin " +
+                "initial=$isInitialLoad args=${chain.args.size}"
+        )
         val result = chain.proceed()
+        Utils.logI(
+            "[startup-trace] LoadedApk.createOrUpdateClassLoaderLocked proceed returned " +
+                "initial=$isInitialLoad"
+        )
 
         try {
             val apkPackageName = loadedApk.getFieldValue<String>("mPackageName") ?: return result
