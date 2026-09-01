@@ -43,13 +43,26 @@ public final class HelloModule extends WbModule {
 
     @Override
     public void onPackageReady(WbModuleInterface.PackageReadyParam param) {
+        Log.i(TAG, "onPackageReady begin first=" + param.isFirstPackage()
+                + " package=" + param.getPackageName());
+        // LoadedApk is created for framework packages (for example "android") before the
+        // host application's package. This example is intended to run once for the process's
+        // main package; reflecting ActivityThread from the framework-package callback can trip
+        // protected hosts' anti-tamper code before their Application is initialized.
+        if (!param.isFirstPackage()) {
+            Log.i(TAG, "onPackageReady skipped non-first package=" + param.getPackageName());
+            return;
+        }
         if (!reported.compareAndSet(false, true)) {
+            Log.i(TAG, "onPackageReady skipped duplicate package=" + param.getPackageName());
             return;
         }
 
         String fallbackPackageName = param.getPackageName();
+        Log.i(TAG, "onPackageReady before Handler.post package=" + fallbackPackageName);
         Handler mainHandler = new Handler(Looper.getMainLooper());
         mainHandler.post(() -> reportPackageNameWhenReady(mainHandler, fallbackPackageName, 0));
+        Log.i(TAG, "onPackageReady after Handler.post package=" + fallbackPackageName);
     }
 
     private void reportPackageNameWhenReady(
@@ -57,6 +70,7 @@ public final class HelloModule extends WbModule {
             String fallbackPackageName,
             int attempt
     ) {
+        Log.i(TAG, "reportPackageNameWhenReady begin attempt=" + attempt);
         ResolvedPackage resolved = resolvePackageName(fallbackPackageName);
         if (resolved.application == null && attempt < MAX_APP_WAIT_ATTEMPTS) {
             mainHandler.postDelayed(
@@ -90,12 +104,15 @@ public final class HelloModule extends WbModule {
 
     private static ResolvedPackage resolvePackageName(String fallbackPackageName) {
         try {
+            Log.i(TAG, "resolvePackageName before Class.forName");
             Class<?> activityThreadClass = Class.forName(ACTIVITY_THREAD);
 
+            Log.i(TAG, "resolvePackageName before currentApplication");
             Application application = invokeStaticApplication(
                     activityThreadClass,
                     "currentApplication"
             );
+            Log.i(TAG, "resolvePackageName after currentApplication");
             if (application != null) {
                 return new ResolvedPackage(application, application.getPackageName());
             }
