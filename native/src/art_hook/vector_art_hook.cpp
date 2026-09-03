@@ -2627,6 +2627,23 @@ bool CompleteInitializationImpl(JNIEnv *env) {
         LOGI("[perf] art_controller end stealth={} elapsedUs={}",
              ArtStealthModeName(g_art_stealth_mode), ArtPerfElapsedUs(perf_start));
     }
+    {
+        // 诊断：导出 ART method router 命中/未命中状态，用于排查 AppAttachHooker 不触发。
+        // 未命中时 router 会记录最后一个 x0（进入桥的 ArtMethod）与 miss 计数；
+        // 若此进程从未有解释方法经过桥，miss=0，说明桥补丁未生效。
+        uint64_t miss = 0, last_miss_x0 = 0, hit = 0, last_hit_x0 = 0;
+        uint64_t qh = 0, rh = 0, dch = 0, last_dc_x0 = 0;
+        hook_art_router_get_debug(&last_miss_x0, &miss);
+        hook_art_router_get_hit_debug(&hit, &last_hit_x0);
+        hook_art_router_get_route_stats(&qh, &rh, &dch, &last_dc_x0, nullptr, nullptr,
+                                        nullptr, nullptr, nullptr, nullptr, nullptr,
+                                        nullptr, nullptr);
+        LOGI("WxShadow ART router debug: miss={} last_miss_x0={} hit={} last_hit_x0={} "
+             "quk_hit={} repl_hit={} docall_hit={} last_docall_x0={}",
+             miss, reinterpret_cast<void *>(last_miss_x0), hit,
+             reinterpret_cast<void *>(last_hit_x0), qh, rh, dch,
+             reinterpret_cast<void *>(last_dc_x0));
+    }
     return true;
 }
 

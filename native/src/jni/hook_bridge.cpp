@@ -520,11 +520,17 @@ static void VectorArtHookCallback(HookContext *ctx, void *raw_user_data) {
     hooked_methods.if_contains(target, [&item](const auto &entry) { item = entry.second.get(); });
     auto *state = item ? item->art_state_ptr.load(std::memory_order_acquire) : nullptr;
     if (!item || !state || !item->hooker_object || !item->hooker_callback) {
+        // 回调只会为已注册 hook 的方法进入；走到这里说明路由命中了注册项但状态已失效，
+        // 静默回退会掩盖 dispatch 问题（如 AppAttachHooker 不触发类问题），留痕。
+        LOGI("[java_hook] dispatch skip: no live state target={} item={} state={} hooker={}",
+             static_cast<void *>(target), item != nullptr, state != nullptr,
+             item ? item->hooker_object != nullptr : false);
         ctx->x[0] = 0;
         return;
     }
     auto *env = reinterpret_cast<JNIEnv *>(ctx->x[0]);
     if (!env) {
+        LOGI("[java_hook] dispatch skip: no JNIEnv target={}", static_cast<void *>(target));
         ctx->x[0] = 0;
         return;
     }
@@ -537,6 +543,9 @@ static void VectorArtHookCallback(HookContext *ctx, void *raw_user_data) {
     }
     auto object_class = env->FindClass("java/lang/Object");
     if (!object_class) {
+        LOGI("[java_hook] dispatch skip: FindClass(Object) failed target=%p",
+             static_cast<void *>(target));
+        env->ExceptionClear();
         ctx->x[0] = 0;
         return;
     }
@@ -565,6 +574,9 @@ static void VectorArtHookCallback(HookContext *ctx, void *raw_user_data) {
     env->DeleteLocalRef(values);
     env->DeleteLocalRef(object_class);
     if (env->ExceptionCheck()) {
+        LOGI("[java_hook] dispatch exception target={}", static_cast<void *>(target));
+        env->ExceptionDescribe();
+        env->ExceptionClear();
         ctx->x[0] = 0;
         return;
     }
@@ -874,18 +886,42 @@ VECTOR_DEF_NATIVE_METHOD(jboolean, HookBridge, replaceCallback, jboolean useMode
  * This can be necessary for some types of hooks to work correctly on JIT-compiled methods.
  */
 VECTOR_DEF_NATIVE_METHOD(jboolean, HookBridge, deoptimizeMethod, jobject hookMethod) {
+    if (!hookMethod) return JNI_FALSE;
+
+    // Path 1: a method already hooked through the WxShadow ART backend carries a
+    // full MethodState. Deoptimize through its original ArtMethod exactly like
+    // rustFrida art_controller.rs::deoptimize_method (instrumentation deopt).
     auto target = env->FromReflectedMethod(hookMethod);
     HookItem *hook_item = nullptr;
     hooked_methods.if_contains(target,
                                [&hook_item](const auto &it) { hook_item = it.second.get(); });
     if (hook_item && hook_item->art_state) {
         if (art::Deoptimize(env, *hook_item->art_state)) return JNI_TRUE;
-        // Keep the established LSPlant deopt path as a conservative fallback
-        // when a vendor ART build hides the instrumentation symbols.
-        return IsLsplantInitialized() && lsplant::Deoptimize(env, hookMethod) ? JNI_TRUE
-                                                                              : JNI_FALSE;
     }
-    return IsLsplantInitialized() && lsplant::Deoptimize(env, hookMethod);
+
+    // Path 2 (root-cause fix): the deopt targets (e.g. ActivityThread.main, the
+    // caller of ActivityThread.attach) are typically NOT hooked yet. rustFrida's
+    // deoptimize_method accepts an arbitrary ArtMethod pointer and does not require
+    // a prior hook; mirror that by decoding the reflected method into a bare
+    // ArtMethod and building a minimal MethodState containing only
+    // original_art_method — the single field art::Deoptimize consumes.
+    //
+    // Without this, VectorDeopter.deoptBootMethods() silently no-ops: the LSPlant
+    // fallback below is always false under the WxShadow backend (IsLsplantInitialized
+    // is false), so ActivityThread.main stays AOT-compiled, its direct baked `bl`
+    // into attach bypasses the shared resolution router, and AppAttachHooker misses
+    // on intermittent launches.
+    const uintptr_t art_method = art::DecodeArtMethod(env, hookMethod);
+    if (art_method != 0) {
+        MethodState minimal_state;
+        minimal_state.original_art_method = art_method;
+        if (art::Deoptimize(env, minimal_state)) return JNI_TRUE;
+    }
+
+    // Historical LSPlant deopt path (conservative fallback when a vendor ART build
+    // hides the instrumentation symbols; always false under the WxShadow backend).
+    return IsLsplantInitialized() && lsplant::Deoptimize(env, hookMethod) ? JNI_TRUE
+                                                                          : JNI_FALSE;
 }
 
 /**

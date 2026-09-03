@@ -80,6 +80,17 @@ object VectorInlinedCallers {
                     "getSharedPreferencesPath",
                     arrayOf(String::class.java),
                 ),
+                // ActivityThread.main 不再列入 boot-image deopt 目标。
+                // 历史：3228 曾尝试 deopt main 以让 attach 经 resolution router 触发，实测
+                // 结果 deopt 后 attach 仍未触发且出现首启慢。3236 恢复 HookBridge.deoptimizeMethod
+                // 对未 hook 方法（对齐 rustFrida deoptimize_method）后，这条 deopt 真正生效，
+                // 把 main 强制回解释执行：attach 虽能触发，但 forkCommon 后 main 的解释执行首启
+                // 延迟达 7.6s，并频繁触发 start_timeout 被杀（4 连冷启中 2 次）。
+                // 结论：attach 的 clone+replace entrypoint 替换在未 deopt 时即可快速触发
+                // （实测 8~14ms），deopt main 属有害冗余策略，予以移除。
+                //
+                // 若后续仍需定位 attach 偶发不触发（如 3235 的 12087），应检查 attach 的
+                // entrypoint 是否被 AOT direct-call 绕过，而非 deopt 整个 main。
             )
 
         callers[KEY_BOOT_IMAGE_MIUI_RES] =

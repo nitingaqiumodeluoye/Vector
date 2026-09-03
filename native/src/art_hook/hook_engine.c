@@ -12,6 +12,7 @@
 #include "hook_engine_internal.h"
 
 #ifdef ANDROID
+#include <sys/system_properties.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
@@ -186,14 +187,37 @@ static int should_force_stderr_hook_log(void) {
     return value && value[0] == '1';
 }
 
+#ifdef ANDROID
+// 应用进程无法通过环境变量注入开关（env 继承自 zygote），与 hook_bridge.cpp 的
+// debug.vector.art.perf 同模式：允许用系统属性在设备上打开引擎日志/trace。
+static int hook_switch_property(const char *name) {
+    char value[PROP_VALUE_MAX] = {0};
+    if (__system_property_get(name, value) > 0 &&
+        (value[0] == '1' || value[0] == 't' || value[0] == 'T')) {
+        return 1;
+    }
+    return 0;
+}
+#endif
+
 static int should_force_trace_file_hook_log(void) {
     const char *value = getenv("VECTOR_ART_HOOK_TRACE");
-    return value && value[0] == '1';
+    if (value && value[0] == '1') return 1;
+#ifdef ANDROID
+    if (hook_switch_property("debug.vector.hook.trace")) return 1;
+    if (hook_switch_property("persist.vector.hook.trace")) return 1;
+#endif
+    return 0;
 }
 
 static int should_force_android_hook_log(void) {
     const char *value = getenv("VECTOR_ART_HOOK_LOGCAT");
-    return value && value[0] == '1';
+    if (value && value[0] == '1') return 1;
+#ifdef ANDROID
+    if (hook_switch_property("debug.vector.hook.logcat")) return 1;
+    if (hook_switch_property("persist.vector.hook.logcat")) return 1;
+#endif
+    return 0;
 }
 
 static void hook_trace_file_write(const char* msg, size_t msg_len) {
