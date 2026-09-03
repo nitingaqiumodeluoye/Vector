@@ -246,9 +246,15 @@ public final class XposedInit {
 
         stepStartNs = System.nanoTime();
         Log.i(TAG, "[startup-trace] loadModules step begin: reflect.ActivityThread.mPackages");
-        var packages = (ArrayMap<?, ?>) XposedHelpers.getObjectField(at, "mPackages");
+        // 原生前置派发（forkCommon 阶段、ActivityThread 尚未创建）以 at == null 调用此处，
+        // 目的是让模块先于一切 app 代码加载；此时 mPackages 尚未填充，跳过清理即可。
+        // 该清理的作用是把已加载完成的模块从系统 loaded-packages 映射里移除，避免其被当成
+        // 普通应用再处理一次；原生前置路径下模块根本不在 mPackages 里，无需处理。
+        var packages = at != null
+                ? (ArrayMap<?, ?>) XposedHelpers.getObjectField(at, "mPackages")
+                : null;
         Log.i(TAG, "[startup-trace] loadModules step end: reflect.ActivityThread.mPackages"
-                + " size=" + packages.size()
+                + " size=" + (packages != null ? packages.size() : 0)
                 + " elapsedUs=" + ((System.nanoTime() - stepStartNs) / 1_000L));
 
         moduleList.forEach(module -> {
@@ -271,7 +277,7 @@ public final class XposedInit {
                     + " elapsedUs=" + ((System.nanoTime() - moduleStepStartNs) / 1_000L));
             if (!loaded) {
                 loadedModules.remove(module.packageName);
-            } else {
+            } else if (packages != null) {
                 moduleStepStartNs = System.nanoTime();
                 Log.i(TAG, "[startup-trace] module step begin label=mPackages.remove module="
                         + module.packageName);

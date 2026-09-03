@@ -56,15 +56,16 @@ object AppAttachHooker : WbInterface.Hooker {
             traceAttachStep("VectorStartup.completeAppBootstrapAfterAttach") {
                 VectorStartup.completeAppBootstrapAfterAttach()
             }
-            if (VectorStartup.arePreAttachLoadedApkHooksInstalled()) {
-                Utils.logI(
-                    "[startup-trace] first package lifecycle replay skipped: " +
-                        "pre-attach LoadedApk hooks installed"
-                )
-            } else {
-                traceAttachStep("VectorStartup.replayFirstPackageLifecycleAfterAttach[fallback]") {
-                    VectorStartup.replayFirstPackageLifecycleAfterAttach("ActivityThread.attach")
-                }
+            // rawVector 依赖预挂载 LoadedApk hooks 在 bindApplication 创建 ClassLoader 时派发
+            // 首包生命周期（onPackageLoaded 早于 AppComponentFactory 静态初始化）。但在后台
+            // dexopt 重编译 boot oat 的设备上，getPackageInfo/LoadedApk.<init>/
+            // createOrUpdateClassLoaderLocked 全部是编译代码，烘焙直连绕过入口点 router，
+            // 这些 hooks 不会触发（oatdump 实测）。改为无条件 replay：生命周期派发有
+            // per-package CAS 幂等保护（VectorLifecycleManager.loadedPackages/readyPackages），
+            // 在旧 oat 上 hooks 自然派发在先、replay 落空；在重编译设备上由 replay 兜底，
+            // 保证生命周期事件不丢失。replay 只派发生命周期、不重复 loadModules。
+            traceAttachStep("VectorStartup.replayFirstPackageLifecycleAfterAttach") {
+                VectorStartup.replayFirstPackageLifecycleAfterAttach("ActivityThread.attach")
             }
         }
 

@@ -40,6 +40,26 @@ public class Startup {
         try {
             traceStartupStep("VectorStartup.bootstrap", () ->
                     VectorStartup.bootstrap(XposedInit.startsSystemServer, systemServerStarted));
+            if (!XposedInit.startsSystemServer) {
+                // 设备适配（非 rawVector 偏差）：clone+replace 的 wxshadow ART hook 依赖 full
+                // controller 的 shared_resolution trampoline 在 ActivityThread.main 首次被
+                // reflection 调用时就绪。MIUI 后台 dexopt 把 boot 框架方法 (ActivityThread.main
+                // 等) 编译进 boot-framework.oat，编译后的 main 对 attach 是烘焙直连、绕过
+                // ArtMethod entrypoint router；若 resolution trampoline 只在 attach 之后
+                // (fallback 线程) 才装，main 走正常解析直接进编译码，attach hook 不触发
+                // (引擎 trace 实测 hit=0)。
+                //
+                // 落点选择：必须在 pre-attach LoadedApk hook 全部装完 (VectorStartup.bootstrap
+                // 结束) 之后、attach 被调用之前完成 full controller。若提前到 Main.forkCommon
+                // (装 LoadedApk hook 之前) 完成，后续安装 createOrUpdateClassLoaderLocked 等
+                // hook 时会在 pre-attach 阶段卡死 (实测 3234 连续两个 start_timeout 被杀)。
+                // 模块加载仍由 AppAttachHooker 在 attach 边界触发，不改其语义。
+                traceStartupStep("completeArtBootstrapEarly", () -> {
+                    if (!HookBridge.completeArtBootstrap()) {
+                        Utils.logE("Unable to complete WxShadow ART controller early");
+                    }
+                });
+            }
             traceStartupStep("XposedInit.loadLegacyModules", XposedInit::loadLegacyModules);
             traceStartupStep("VectorStartup.bootstrapArtDeferredFallback",
                     VectorStartup::bootstrapArtDeferredFallback);

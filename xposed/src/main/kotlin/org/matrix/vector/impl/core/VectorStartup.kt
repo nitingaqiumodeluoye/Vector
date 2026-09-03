@@ -27,8 +27,6 @@ import org.matrix.vector.nativebridge.HookBridge
  */
 object VectorStartup {
 
-    private const val WXSHADOW_MODULE_LOAD_COOLDOWN_MS = 750L
-
     private val noArtDeferredStarted = AtomicBoolean(false)
     private val noArtDeferredDispatched = AtomicBoolean(false)
     private val artDeferredFallbackStarted = AtomicBoolean(false)
@@ -694,44 +692,21 @@ object VectorStartup {
         }
 
         if (HookBridge.isWxShadowStealthMode()) {
-            // WxShadow keeps the ART controller lean around startup; the real thing we wait for
-            // is ClassLinker/GC leaving the controller-install window, i.e. the first UI turn.
-            // The source comment says the deferred callback "runs after the first UI turn", so
-            // drive the dispatch from that signal instead of a blind fixed cooldown: dispatch as
-            // soon as the first UI frame renders (ART has already run a full UI turn by then), and
-            // keep WXSHADOW_MODULE_LOAD_COOLDOWN_MS only as a hard cap for processes that never
-            // render a frame (background/service processes without an Activity). Whichever fires
-            // first wins; the AtomicBoolean guarantees dispatchLifecycle runs exactly once.
+            // 本函数仅在 ActivityThread.attach hook 错过 rawVector 边界时兜底（boot oat 重编译
+            // 等环境原因；main deopt 恢复后不应再出现）。一旦走到这里，越早派发越好：等待首
+            // 帧或固定 750ms 会把模块生命周期永远推到应用代码之后（应用在 bindApplication 里
+            // 就完成 JNI 初始化），违反 rawVector 契约。投递到主线程消息队列以与
+            // bindApplication 串行（mPackages 等非线程安全状态不能并发访问）；主线程当期消息
+            // 处理完后立即执行，不额外等待。exactly-once 由 AtomicBoolean 保证。
             val dispatched = AtomicBoolean(false)
-            val defer = Runnable {
+            Handler(Looper.getMainLooper()).post {
                 if (dispatched.compareAndSet(false, true)) {
                     dispatchLifecycle()
                 }
             }
-
-            val mainHandler = Handler(Looper.getMainLooper())
-            val firstFramePosted = runCatching {
-                Choreographer.getInstance().postFrameCallback { _ ->
-                    Utils.logI(
-                        "WxShadow module lifecycle triggered early on first UI frame " +
-                            "(before the ${WXSHADOW_MODULE_LOAD_COOLDOWN_MS}ms cap)"
-                    )
-                    mainHandler.post(defer)
-                }
-            }
-            if (firstFramePosted.isFailure) {
-                Utils.logE(
-                    "WxShadow Choreographer first-frame dispatch unavailable",
-                    firstFramePosted.exceptionOrNull(),
-                )
-            }
-
-            // Hard cap: a process with no renderable Activity (e.g. a :remote/service process)
-            // never produces a first frame, so fall back to the fixed cooldown.
-            mainHandler.postDelayed(defer, WXSHADOW_MODULE_LOAD_COOLDOWN_MS)
             Utils.logI(
-                "WxShadow deferred module lifecycle by <=${WXSHADOW_MODULE_LOAD_COOLDOWN_MS}ms " +
-                    "(signal-driven: first UI frame, hard cap)"
+                "WxShadow deferred module lifecycle queued on main looper " +
+                    "(attach-boundary replay; dispatch as soon as the current message completes)"
             )
         } else {
             dispatchLifecycle()
