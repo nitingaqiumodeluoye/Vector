@@ -1,0 +1,408 @@
+// RegisterNatives hook demo for the Vector framework.
+//
+// This module reproduces, in native C++, the same address-resolution semantics as rustFrida's
+// QuickJS `Jni.addr("RegisterNatives")` (quickjs-hook/src/jsapi/jni/jni_boot.js) and then hooks the
+// resolved JNI function through Vector's NativeAPIEntries.hookFunc.
+//
+// rustFrida resolution chain reproduced here (see _getAddress / _getAddressByIndex in jni_boot.js
+// and ensure_jni_initialized in jsapi/java/jni_core.rs):
+//   1. dl_iterate_phdr -> libart.so 的 load bias + PT_DYNAMIC
+//   2. 解析 .dynsym/.dynstr 找 JNI_GetCreatedJavaVMs       -> JavaVM*
+//      (比 dlsym: APEX libart 不进入 app namespace，dlsym(RTLD_DEFAULT) 也会 undefined symbol)
+//   3. deref(*vm)  -> JNIInvokeInterface function table
+//   4. table[6]    -> GetEnv(vm, &env, JNI_VERSION_1_6)   (JNI function table index)
+//   5. if GetEnv fails (thread not attached) table[4] -> AttachCurrentThread(vm, &env, NULL)
+//   6. deref(*env) -> JNINativeInterface function table
+//   7. table[215]  -> RegisterNatives (JNI function table index, matching _JNI_INDEX 215)
+//
+// Once resolved, the hook is installed with Vector's hookFunc(original, replace, backup). Vector's
+// ABI is raw replacement + backup trampoline (hook_install), so `replace` shares RegisterNatives'
+// exact signature and the caller obtains the original impl through `backup`.
+//
+// Expected logcat (tag VectorNativeHookDemo):
+//   [register-natives] resolved addr=... via=env-table (JNIEnv table[215])
+//   [register-natives] hooked addr=... trampoline=...
+//   [register-natives] clazz=... methods=1 jni=Foo.bar (II)V fn=0x...
+//   [register-natives] calling original RegisterNatives -> ret=0
+
+#include <android/log.h>
+#include <dlfcn.h>
+#include <elf.h>
+#include <jni.h>
+#include <link.h>
+
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <string>
+
+#define LOG_TAG "VectorNativeHookDemo"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+// ---------------------------------------------------------------------------
+// ABI mirror of vector::NativeAPIEntries (native/include/core/native_api.h).
+// ---------------------------------------------------------------------------
+struct NativeAPIEntries {
+    uint32_t version;
+    int (*hookFunc)(void *func, void *replace, void **backup);
+    int (*unhookFunc)(void *func);
+};
+
+using NativeOnModuleLoaded = void (*)(const char *name, void *handle);
+using NativeInit = NativeOnModuleLoaded (*)(const NativeAPIEntries *entries);
+
+namespace {
+
+// ARMv8.3 pointer authentication strips the upper bits of a signed pointer. mirror rustFrida's
+// PAC_STRIP_MASK before dereferencing or handing an address to the hook engine.
+constexpr uintptr_t kPacStripMask = 0x00FFFFFFFFFFFFFFULL;
+
+uintptr_t StripPac(uintptr_t value) {
+    if (value & 0xFF00000000000000ULL) {
+        value &= kPacStripMask;
+    }
+    return value;
+}
+
+// RegisterNatives signature (JNINativeInterface index 215).
+using RegisterNativesFn = jint (*)(JNIEnv *env, jclass clazz,
+                                   const JNINativeMethod *methods, jint nMethods);
+
+// JNI invocation table indices (JNIInvokeInterface). GetEnv = 6, AttachCurrentThread = 4.
+constexpr size_t kInvokeGetEnv = 6;
+constexpr size_t kInvokeAttachCurrentThread = 4;
+// JNI function table index for RegisterNatives (matches rustFrida _JNI_INDEX 215).
+constexpr size_t kJniRegisterNatives = 215;
+
+std::mutex g_hook_mutex;
+NativeAPIEntries g_entries{};
+RegisterNativesFn g_original_register_natives = nullptr;
+void *g_original_target = nullptr;  // address we passed to hookFunc (PAC-stripped)
+std::atomic<bool> g_hooked{false};
+
+// --- rustFrida-resolution helpers -------------------------------------------------
+//
+// On Android, libart.so is an APEX module whose exported symbols (JNI_GetCreatedJavaVMs is
+// GLOBAL PROTECTED in .dynsym at st_value=0x45f3c8) are NOT reachable through dlopen("libart.so")
+// or dlsym(RTLD_DEFAULT): the app's classloader-namespace permits only /data:/mnt/expand, and
+// RTLD_DEFAULT does not expose APEX symbols into the app's lookup scope. This is exactly why
+// rustFrida's libart_dlsym (resolve.rs) parses the ELF symbol table by hand instead of calling
+// dlopen/dlsym. We reproduce that here with dl_iterate_phdr + PT_DYNAMIC parsing.
+
+namespace {
+
+struct LibartElfInfo {
+    uintptr_t base = 0;
+    const ElfW(Dyn) *dynamic = nullptr;
+    size_t dynamic_count = 0;
+};
+
+int FindLibartCallback(struct dl_phdr_info *info, size_t /*size*/, void *data) {
+    auto *out = static_cast<LibartElfInfo *>(data);
+    if (out->base != 0) return 0;  // already found
+    const char *name = info->dlpi_name ? info->dlpi_name : "";
+    if (strstr(name, "libart.so") == nullptr) return 0;
+
+    out->base = static_cast<uintptr_t>(info->dlpi_addr);
+    for (ElfW(Half) i = 0; i < info->dlpi_phnum; ++i) {
+        const ElfW(Phdr) *phdr = &info->dlpi_phdr[i];
+        if (phdr->p_type == PT_DYNAMIC) {
+            // PT_DYNAMIC p_vaddr is load-bias-relative; dlpi_addr IS the load bias.
+            out->dynamic = reinterpret_cast<const ElfW(Dyn) *>(out->base + phdr->p_vaddr);
+            out->dynamic_count = phdr->p_memsz / sizeof(ElfW(Dyn));
+            break;
+        }
+    }
+    return 0;
+}
+
+// Resolve a symbol from libart.so's dynamic symbol table, mirroring rustFrida
+// elf_find_symbols_in_dynamic_memory (DT_SYMTAB traversal without gnu/sysv hash).
+uintptr_t DlsymLibartDynamic(const char *name) {
+    LibartElfInfo info;
+    dl_iterate_phdr(&FindLibartCallback, &info);
+    if (info.base == 0 || info.dynamic == nullptr) {
+        LOGE("cannot locate libart.so via dl_iterate_phdr");
+        return 0;
+    }
+
+    const ElfW(Sym) *symtab = nullptr;
+    const char *strtab = nullptr;
+    size_t strsz = 0;
+    // rustFrida dynamic_ptr(): DT_SYMTAB/DT_STRTAB d_ptr are load-bias-relative in the in-memory
+    // PT_DYNAMIC array (the linker leaves them unrelocated there); add load_bias when the value is
+    // below it. DT_STRSZ is a size, used verbatim.
+    auto dynamic_ptr = [info](uint64_t value) -> uintptr_t {
+        return value >= info.base ? static_cast<uintptr_t>(value)
+                                  : static_cast<uintptr_t>(info.base + value);
+    };
+    for (size_t i = 0; i < info.dynamic_count; ++i) {
+        const ElfW(Dyn) *d = &info.dynamic[i];
+        if (d->d_tag == DT_NULL) break;
+        if (d->d_tag == DT_SYMTAB) {
+            symtab = reinterpret_cast<const ElfW(Sym) *>(dynamic_ptr(d->d_un.d_ptr));
+        } else if (d->d_tag == DT_STRTAB) {
+            strtab = reinterpret_cast<const char *>(dynamic_ptr(d->d_un.d_ptr));
+        } else if (d->d_tag == DT_STRSZ) {
+            strsz = static_cast<size_t>(d->d_un.d_val);
+        }
+    }
+    if (symtab == nullptr || strtab == nullptr || strsz == 0) {
+        LOGE("libart dynamic symbol table incomplete (symtab=%p strtab=%p strsz=%zu)",
+             static_cast<const void *>(symtab), static_cast<const void *>(strtab), strsz);
+        return 0;
+    }
+
+    // Traverse dynsym. There is no explicit nsyms from PT_DYNAMIC alone, but the symbol table
+    // ends where .dynstr begins (symtab < strtab), so bound the scan by that distance and also
+    // stop when st_name runs past the string table.
+    size_t max_syms = (reinterpret_cast<uintptr_t>(strtab) >
+                       reinterpret_cast<uintptr_t>(symtab))
+                          ? (reinterpret_cast<uintptr_t>(strtab) -
+                             reinterpret_cast<uintptr_t>(symtab)) /
+                                sizeof(ElfW(Sym))
+                          : 65536;
+    for (size_t i = 0; i < max_syms; ++i) {
+        const ElfW(Sym) *sym = &symtab[i];
+        if (sym->st_name == 0) continue;
+        if (sym->st_name >= strsz) break;
+        const char *sym_name = strtab + sym->st_name;
+        if (strcmp(sym_name, name) == 0) {
+            // .dynsym st_value is load-bias-relative for ET_DYN; dlpi_addr is the load bias.
+            uintptr_t addr = info.base + sym->st_value;
+            LOGI("[register-natives] libart.dynsym %s -> base=%p st_value=%p addr=%p",
+                 name, reinterpret_cast<void *>(info.base),
+                 reinterpret_cast<void *>(static_cast<uintptr_t>(sym->st_value)),
+                 reinterpret_cast<void *>(addr));
+            return addr;
+        }
+    }
+    LOGE("symbol '%s' not found in libart .dynsym", name);
+    return 0;
+}
+
+}  // namespace
+
+// GetJavaVM via JNI_GetCreatedJavaVMs (mirrors rustFrida get_or_init_vm).
+JavaVM *GetJavaVm() {
+    static JavaVM *cached_vm = nullptr;
+    static std::mutex vm_mutex;
+    {
+        std::lock_guard<std::mutex> lock(vm_mutex);
+        if (cached_vm != nullptr) return cached_vm;
+    }
+
+    using JniGetCreatedJavaVMs = jint (*)(JavaVM **, jsize, jsize *);
+    uintptr_t get_vms_addr = DlsymLibartDynamic("JNI_GetCreatedJavaVMs");
+    if (get_vms_addr == 0) {
+        LOGE("failed to resolve JNI_GetCreatedJavaVMs from libart .dynsym");
+        return nullptr;
+    }
+    auto get_vms = reinterpret_cast<JniGetCreatedJavaVMs>(get_vms_addr);
+
+    JavaVM *vm = nullptr;
+    jsize count = 0;
+    if (get_vms(&vm, 1, &count) != JNI_OK || count == 0 || vm == nullptr) {
+        LOGE("JNI_GetCreatedJavaVMs failed (count=%d)", static_cast<int>(count));
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(vm_mutex);
+    cached_vm = vm;
+    return vm;
+}
+
+// GetEnv via the JNIInvokeInterface table[6] (mirrors rustFrida get_current_thread_env).
+JNIEnv *GetThreadEnv(JavaVM *vm) {
+    if (vm == nullptr) return nullptr;
+    auto table = *reinterpret_cast<void ***>(vm);  // *JavaVM -> JNIInvokeInterface
+    if (table == nullptr) return nullptr;
+
+    using GetEnvFn = jint (*)(JavaVM *, void **, jint);
+    auto get_env = reinterpret_cast<GetEnvFn>(table[kInvokeGetEnv]);
+    if (get_env == nullptr) return nullptr;
+
+    void *env = nullptr;
+    if (get_env(vm, &env, JNI_VERSION_1_6) == JNI_OK && env != nullptr) {
+        return reinterpret_cast<JNIEnv *>(env);
+    }
+    return nullptr;
+}
+
+// AttachCurrentThread via the JNIInvokeInterface table[4] (mirrors rustFrida attach_current_thread).
+JNIEnv *AttachThread(JavaVM *vm) {
+    if (vm == nullptr) return nullptr;
+    auto table = *reinterpret_cast<void ***>(vm);
+    if (table == nullptr) return nullptr;
+
+    using AttachFn = jint (*)(JavaVM *, void **, void *);
+    auto attach = reinterpret_cast<AttachFn>(table[kInvokeAttachCurrentThread]);
+    if (attach == nullptr) return nullptr;
+
+    void *env = nullptr;
+    if (attach(vm, &env, nullptr) == JNI_OK && env != nullptr) {
+        return reinterpret_cast<JNIEnv *>(env);
+    }
+    return nullptr;
+}
+
+// Resolve RegisterNatives exactly like rustFrida _getAddress(name):
+//   JNI_GetCreatedJavaVMs -> GetEnv (table[6]) -> fallback AttachCurrentThread (table[4])
+//   -> *env -> JNINativeInterface -> table[215].
+uintptr_t ResolveRegisterNativesAddress() {
+    JavaVM *vm = GetJavaVm();
+    if (vm == nullptr) {
+        LOGE("cannot obtain JavaVM*");
+        return 0;
+    }
+
+    JNIEnv *env = GetThreadEnv(vm);
+    if (env == nullptr) {
+        LOGW("GetEnv returned no env; attempting AttachCurrentThread");
+        env = AttachThread(vm);
+    }
+    if (env == nullptr) {
+        LOGE("unable to obtain JNIEnv* for current thread");
+        return 0;
+    }
+
+    auto fn_table = *reinterpret_cast<void ***>(env);  // *JNIEnv -> JNINativeInterface
+    if (fn_table == nullptr) {
+        LOGE("JNIEnv function table is null");
+        return 0;
+    }
+
+    uintptr_t raw = reinterpret_cast<uintptr_t>(fn_table[kJniRegisterNatives]);
+    return StripPac(raw);
+}
+
+// --- RegisterNatives replacement ---------------------------------------------------
+
+jint HookedRegisterNatives(JNIEnv *env, jclass clazz,
+                           const JNINativeMethod *methods, jint nMethods) {
+    LOGI("[register-natives] intercepted clazz=%p methods=%d", clazz,
+         static_cast<int>(nMethods));
+
+    for (jint i = 0; i < nMethods; ++i) {
+        const char *name = methods[i].name ? methods[i].name : "(null)";
+        const char *sig = methods[i].signature ? methods[i].signature : "(null)";
+        LOGI("[register-natives]   [%d] name='%s' sig='%s' fn=%p", static_cast<int>(i),
+             name, sig, reinterpret_cast<void *>(StripPac(
+                            reinterpret_cast<uintptr_t>(methods[i].fnPtr))));
+    }
+
+    RegisterNativesFn original = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_hook_mutex);
+        original = g_original_register_natives;
+    }
+    if (original == nullptr) {
+        LOGE("[register-natives] original RegisterNatives is unavailable");
+        return JNI_ERR;
+    }
+
+    jint ret = original(env, clazz, methods, nMethods);
+    LOGI("[register-natives] calling original RegisterNatives -> ret=%d",
+         static_cast<int>(ret));
+    return ret;
+}
+
+bool InstallHook() {
+    std::lock_guard<std::mutex> lock(g_hook_mutex);
+    if (g_hooked.load()) return true;
+    if (g_entries.hookFunc == nullptr) {
+        LOGE("hookFunc unavailable (NativeAPIEntries not initialized)");
+        return false;
+    }
+
+    uintptr_t addr = ResolveRegisterNativesAddress();
+    if (addr == 0) {
+        LOGE("failed to resolve RegisterNatives address");
+        return false;
+    }
+    LOGI("[register-natives] resolved addr=%p via=env-table (JNIEnv table[%zu])",
+         reinterpret_cast<void *>(addr), kJniRegisterNatives);
+
+    void *backup = nullptr;
+    int rc = g_entries.hookFunc(reinterpret_cast<void *>(addr),
+                                reinterpret_cast<void *>(&HookedRegisterNatives), &backup);
+    if (rc != 0 || backup == nullptr) {
+        LOGE("hookFunc failed rc=%d backup=%p", rc, backup);
+        return false;
+    }
+
+    g_original_target = reinterpret_cast<void *>(addr);
+    g_original_register_natives =
+        reinterpret_cast<RegisterNativesFn>(StripPac(reinterpret_cast<uintptr_t>(backup)));
+    g_hooked.store(true);
+    LOGI("[register-natives] hooked addr=%p trampoline=%p", reinterpret_cast<void *>(addr),
+         backup);
+    return true;
+}
+
+bool RemoveHook() {
+    std::lock_guard<std::mutex> lock(g_hook_mutex);
+    if (!g_hooked.load()) return true;
+    if (g_entries.unhookFunc == nullptr || g_original_target == nullptr) {
+        LOGW("unhookFunc unavailable or missing target");
+        return false;
+    }
+    int rc = g_entries.unhookFunc(g_original_target);
+    if (rc != 0) {
+        LOGE("unhookFunc failed rc=%d", rc);
+        return false;
+    }
+    g_original_register_natives = nullptr;
+    g_original_target = nullptr;
+    g_hooked.store(false);
+    LOGI("[register-natives] unhooked");
+    return true;
+}
+
+}  // namespace
+
+// Vector resolves this exported entrypoint after the linker loads the registered module ELF.
+// The returned callback is retained for the module's lifetime and is notification-only (it does
+// not install further hooks); keep the NativeOnModuleLoaded contract for ABI compatibility.
+extern "C" NativeOnModuleLoaded native_init(const NativeAPIEntries *entries) {
+    if (entries == nullptr) {
+        LOGE("cannot hook RegisterNatives: NativeAPIEntries is null");
+        return nullptr;
+    }
+    if (entries->version < 2) {
+        LOGW("NativeAPIEntries version=%u; expected >= 2", entries->version);
+    }
+
+    g_entries = *entries;
+    if (!InstallHook()) {
+        LOGE("RegisterNatives hook install failed");
+    }
+
+    // Notification-only callback kept to preserve the rawVector NativeOnModuleLoaded contract.
+    return [](const char *name, void *handle) {
+        LOGD("[module-load] name='%s' handle=%p", name ? name : "(null)", handle);
+    };
+}
+
+// JNI bridge used by the module's own process UI. startRecording installs the hook (idempotent),
+// stopRecording removes it — both are safe to call after native_init already installed it.
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_nathookdemo_NativeBridge_startRecording(JNIEnv *env, jobject thiz) {
+    (void)env;
+    (void)thiz;
+    LOGI("NativeBridge.startRecording() -> installing RegisterNatives hook");
+    return InstallHook() ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_nathookdemo_NativeBridge_stopRecording(JNIEnv *env, jobject thiz) {
+    (void)env;
+    (void)thiz;
+    LOGI("NativeBridge.stopRecording() -> removing RegisterNatives hook");
+    return RemoveHook() ? JNI_TRUE : JNI_FALSE;
+}

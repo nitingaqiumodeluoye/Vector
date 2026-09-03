@@ -1,0 +1,6 @@
+# Demo scope. Vector/libxposed convention: the virtual package name "system" targets
+# system_server ("android" is only the framework package of regular app processes, it does
+# NOT match system_server). The module's own app process is always injected by the framework.
+system
+com.android.settings
+com.example.nathookdemo

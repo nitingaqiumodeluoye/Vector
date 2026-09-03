@@ -1,0 +1,5 @@
+# Native library names declared by this module (one per line).
+# The daemon registers each name with Vector's native API BEFORE the entry classes run, so the
+# do_dlopen monitor can recognize the loader load triggered by System.loadLibrary("vector_nathook_demo")
+# and run native_init from the loaded ELF. The returned callback records later SO loads.
+libvector_nathook_demo.so

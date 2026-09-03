@@ -28,6 +28,7 @@ rootProject.name = "Vector"
 include(
     ":daemon",
     ":examples:lsp-hello",
+    ":examples:native-hook-demo",
     ":external:axml",
     ":external:apache",
     ":hiddenapi:stubs",
