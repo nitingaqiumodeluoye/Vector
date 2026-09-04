@@ -7,8 +7,13 @@ android {
 
     defaultConfig {
         applicationId = "com.example.nathookdemo"
-        versionCode = 11
-        versionName = "1.5.5"
+        versionCode = 21
+        versionName = "1.10.0"
+    }
+
+    // Enable AIDL support
+    buildFeatures {
+        aidl = true
     }
 
     // Build libvector_nathook_demo.so from src/main/cpp through the repo-wide CMake setup
@@ -33,4 +38,16 @@ android {
 dependencies {
     // The framework supplies these classes in the target process (WbModule / WbModuleInterface…).
     compileOnly(project(":xposed"))
+}
+
+// release（非 debuggable）构建：debuggable APK 永远 run-from-apk（系统拒绝 dex2oat），
+// 模块 dex 每次进程 fork 都要解释执行+验证+JIT，实测把宿主启动拖慢 5~10s（内核锁自旋+
+// 缺页风暴）。release 产物可用 debug 签名安装，换取 PM 的 dex2oat 编译资格。
+android {
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("debug")
+        }
+    }
 }

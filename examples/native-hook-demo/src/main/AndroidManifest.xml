@@ -6,8 +6,8 @@
         android:label="Vector Native Hook Demo"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.Light.DarkActionBar">
-        <!-- The UI only controls recording in the module's OWN process. The recorder is started
-             by native_init in every injected process (see the WbModule entry class). -->
+        
+        <!-- Main activity - process list -->
         <activity
             android:name=".MainActivity"
             android:exported="true">
@@ -16,5 +16,27 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        
+        <!-- Process detail activity -->
+        <activity
+            android:name=".ProcessDetailActivity"
+            android:exported="false"
+            android:label="RegisterNatives Data"
+            android:parentActivityName=".MainActivity" />
+        
+        <!-- ContentProvider for cross-process data transfer -->
+        <provider
+            android:name=".NativeHookContentProvider"
+            android:authorities="com.example.nathookdemo.provider"
+            android:exported="true"
+            android:grantUriPermissions="true" />
+
+        <!-- BroadcastReceiver for receiving hook records from injected target processes.
+             Target processes send an explicit broadcast directed at this component name,
+             so no intent-filter is required; exported=true allows cross-UID delivery. -->
+        <receiver
+            android:name=".HookReportReceiver"
+            android:exported="true" />
+        
     </application>
 </manifest>

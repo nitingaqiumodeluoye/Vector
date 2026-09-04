@@ -35,8 +35,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <string>
+#include <string_view>
+#include <unordered_set>
 
 #define LOG_TAG "VectorNativeHookDemo"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -84,6 +87,56 @@ NativeAPIEntries g_entries{};
 RegisterNativesFn g_original_register_natives = nullptr;
 void *g_original_target = nullptr;  // address we passed to hookFunc (PAC-stripped)
 std::atomic<bool> g_hooked{false};
+
+// --- RegisterNatives 热路径开销控制（v21）-----------------------------------
+//
+// 2026-09-04 com.xff.launch 案例：bindApplication 前期 MIUI/chromium 会高频重复
+// RegisterNatives 同一批类，旧实现每次都做 FindClass/读 /proc/self/cmdline/
+// 逐方法 LOGI/JNI 进 Java 构建对象数组，分配风暴触发 3 次 blocking GC 并抑制
+// JIT，导致宿主主线程整条 bindApplication 调用栈退化为纯解释执行（消息耗时
+// 15s；禁用模块后同路径仅 1.0s）。本节的三项缓存把重复注册收敛为 O(1)：
+//   1. g_seen_register_natives：指纹去重，重复注册不打日志、不进 Java 回调；
+//   2. Class/getName 反射元数据全局引用（进程内不变）；
+//   3. GetCurrentProcessName 结果缓存（模块实例与进程同生命周期）。
+struct RegisterNativesKey {
+    size_t hash;          // className 字符串指纹
+    uintptr_t firstFn;    // 首方法指针（PAC-stripped）：区分同类不同方法表的重注册
+    jint nMethods;
+    bool operator==(const RegisterNativesKey &o) const {
+        return hash == o.hash && firstFn == o.firstFn && nMethods == o.nMethods;
+    }
+};
+struct RegisterNativesKeyHash {
+    size_t operator()(const RegisterNativesKey &k) const {
+        return k.hash ^ (k.firstFn * 0x9E3779B97F4A7C15ULL) ^ static_cast<size_t>(k.nMethods);
+    }
+};
+std::mutex g_seen_mutex;
+std::unordered_set<RegisterNativesKey, RegisterNativesKeyHash> g_seen_register_natives;
+
+std::mutex g_reflect_mutex;
+jclass g_class_clazz = nullptr;          // global ref: java/lang/Class
+jmethodID g_get_name_method = nullptr;   // Class.getName
+
+jclass EnsureClassReflectionCache(JNIEnv *env) {
+    std::lock_guard<std::mutex> lock(g_reflect_mutex);
+    if (g_class_clazz == nullptr) {
+        jclass local = env->FindClass("java/lang/Class");
+        if (local != nullptr) {
+            g_class_clazz = static_cast<jclass>(env->NewGlobalRef(local));
+            env->DeleteLocalRef(local);
+            g_get_name_method =
+                env->GetMethodID(g_class_clazz, "getName", "()Ljava/lang/String;");
+        }
+    }
+    return g_class_clazz;
+}
+
+// Java VM and class references for calling back to Java layer
+JavaVM *g_vm = nullptr;
+jclass g_hook_data_bridge_class = nullptr;
+jmethodID g_on_register_natives_method = nullptr;
+std::mutex g_java_mutex;
 
 // --- rustFrida-resolution helpers -------------------------------------------------
 //
@@ -281,22 +334,204 @@ uintptr_t ResolveRegisterNativesAddress() {
     return StripPac(raw);
 }
 
+// --- Java callback helpers -------------------------------------------------------
+
+// Initialize Java references for callbacks
+bool InitializeJavaReferences(JNIEnv *env) {
+    std::lock_guard<std::mutex> lock(g_java_mutex);
+    
+    if (g_hook_data_bridge_class != nullptr) {
+        return true;  // Already initialized
+    }
+    
+    // Get VM reference
+    if (g_vm == nullptr) {
+        env->GetJavaVM(&g_vm);
+        if (g_vm == nullptr) {
+            LOGE("Failed to get JavaVM");
+            return false;
+        }
+    }
+    
+    // Find HookDataBridge class
+    jclass local_class = env->FindClass("com/example/nathookdemo/HookDataBridge");
+    if (local_class == nullptr) {
+        LOGE("Failed to find HookDataBridge class");
+        return false;
+    }
+    
+    g_hook_data_bridge_class = reinterpret_cast<jclass>(env->NewGlobalRef(local_class));
+    if (g_hook_data_bridge_class == nullptr) {
+        LOGE("Failed to create global reference for HookDataBridge");
+        return false;
+    }
+    env->DeleteLocalRef(local_class);
+    
+    // Find callback method
+    g_on_register_natives_method = env->GetStaticMethodID(
+        g_hook_data_bridge_class,
+        "onRegisterNativesIntercepted",
+        "(Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;[Ljava/lang/String;[JI)V");
+    
+    if (g_on_register_natives_method == nullptr) {
+        LOGE("Failed to find onRegisterNativesIntercepted method");
+        return false;
+    }
+    
+    LOGI("Java references initialized successfully");
+    return true;
+}
+
+// Get JNIEnv for current thread, attaching if necessary
+JNIEnv *GetJNIEnvForCallback() {
+    if (g_vm == nullptr) {
+        return nullptr;
+    }
+    
+    JNIEnv *env = nullptr;
+    jint result = g_vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6);
+    
+    if (result == JNI_EDETACHED) {
+        // Thread not attached, attach it
+        if (g_vm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+            LOGE("Failed to attach thread");
+            return nullptr;
+        }
+    } else if (result != JNI_OK) {
+        LOGE("GetEnv failed with code: %d", result);
+        return nullptr;
+    }
+    
+    return env;
+}
+
+// Call Java callback with hook data
+void CallJavaCallback(const char *processName, const char *className,
+                      const JNINativeMethod *methods, jint nMethods, jint result) {
+    std::lock_guard<std::mutex> lock(g_java_mutex);
+    
+    if (g_hook_data_bridge_class == nullptr || g_on_register_natives_method == nullptr) {
+        LOGW("Java references not initialized, skipping callback for %s.%s",
+             processName ? processName : "?", className ? className : "?");
+        return;
+    }
+    
+    JNIEnv *env = GetJNIEnvForCallback();
+    if (env == nullptr) {
+        LOGE("Failed to get JNIEnv for callback");
+        return;
+    }
+    
+    // Create Java strings
+    jstring j_process_name = env->NewStringUTF(processName != nullptr ? processName : "");
+    jstring j_class_name = env->NewStringUTF(className != nullptr ? className : "");
+    
+    // Create method arrays
+    jclass stringClass = env->FindClass("java/lang/String");
+    if (stringClass == nullptr) {
+        LOGE("FindClass(String) failed in callback");
+        env->ExceptionClear();
+        env->DeleteLocalRef(j_process_name);
+        env->DeleteLocalRef(j_class_name);
+        return;
+    }
+    
+    jint safeCount = nMethods > 0 ? nMethods : 0;
+    jobjectArray j_method_names = env->NewObjectArray(safeCount, stringClass, nullptr);
+    jobjectArray j_signatures = env->NewObjectArray(safeCount, stringClass, nullptr);
+    jlongArray j_function_pointers = env->NewLongArray(safeCount);
+    env->DeleteLocalRef(stringClass);
+    
+    if (j_method_names == nullptr || j_signatures == nullptr || j_function_pointers == nullptr) {
+        LOGE("Failed to allocate Java arrays for callback");
+        env->ExceptionClear();
+        if (j_method_names) env->DeleteLocalRef(j_method_names);
+        if (j_signatures) env->DeleteLocalRef(j_signatures);
+        if (j_function_pointers) env->DeleteLocalRef(j_function_pointers);
+        env->DeleteLocalRef(j_process_name);
+        env->DeleteLocalRef(j_class_name);
+        return;
+    }
+    
+    // Fill arrays
+    for (jint i = 0; i < safeCount; i++) {
+        const char *rawName = methods != nullptr ? methods[i].name : nullptr;
+        const char *rawSig = methods != nullptr ? methods[i].signature : nullptr;
+        const void *rawPtr = methods != nullptr ? methods[i].fnPtr : nullptr;
+        
+        jstring name = env->NewStringUTF(rawName != nullptr ? rawName : "");
+        jstring sig = env->NewStringUTF(rawSig != nullptr ? rawSig : "");
+        jlong fn_ptr = static_cast<jlong>(StripPac(
+            reinterpret_cast<uintptr_t>(rawPtr)));
+        
+        env->SetObjectArrayElement(j_method_names, i, name);
+        env->SetObjectArrayElement(j_signatures, i, sig);
+        env->SetLongArrayRegion(j_function_pointers, i, 1, &fn_ptr);
+        
+        if (name) env->DeleteLocalRef(name);
+        if (sig) env->DeleteLocalRef(sig);
+    }
+    
+    LOGI("Calling HookDataBridge callback: process=%s class=%s methods=%d ret=%d",
+         processName != nullptr ? processName : "?",
+         className != nullptr ? className : "?",
+         static_cast<int>(safeCount), static_cast<int>(result));
+    
+    // Call Java method
+    env->CallStaticVoidMethod(
+        g_hook_data_bridge_class,
+        g_on_register_natives_method,
+        j_process_name,
+        j_class_name,
+        j_method_names,
+        j_signatures,
+        j_function_pointers,
+        result);
+    
+    // Check for exceptions
+    if (env->ExceptionCheck()) {
+        LOGE("Exception in Java callback");
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+    
+    // Clean up local references
+    env->DeleteLocalRef(j_process_name);
+    env->DeleteLocalRef(j_class_name);
+    env->DeleteLocalRef(j_method_names);
+    env->DeleteLocalRef(j_signatures);
+    env->DeleteLocalRef(j_function_pointers);
+}
+
+// Get current process name. The module instance lives as long as the process, so the
+// cmdline read is cached after the first call (magic statics are thread-safe).
+std::string GetCurrentProcessName() {
+    static const std::string cached = [] {
+        // Read /proc/self/cmdline to get process name
+        FILE *fp = fopen("/proc/self/cmdline", "r");
+        if (fp == nullptr) {
+            return std::string("unknown");
+        }
+
+        char buffer[256] = {0};
+        if (fgets(buffer, sizeof(buffer), fp) == nullptr) {
+            fclose(fp);
+            return std::string("unknown");
+        }
+        fclose(fp);
+
+        // cmdline is null-terminated
+        return std::string(buffer);
+    }();
+    return cached;
+}
+
 // --- RegisterNatives replacement ---------------------------------------------------
 
 jint HookedRegisterNatives(JNIEnv *env, jclass clazz,
                            const JNINativeMethod *methods, jint nMethods) {
-    LOGI("[register-natives] intercepted clazz=%p methods=%d", clazz,
-         static_cast<int>(nMethods));
-
-    for (jint i = 0; i < nMethods; ++i) {
-        const char *name = methods[i].name ? methods[i].name : "(null)";
-        const char *sig = methods[i].signature ? methods[i].signature : "(null)";
-        LOGI("[register-natives]   [%d] name='%s' sig='%s' fn=%p", static_cast<int>(i),
-             name, sig, reinterpret_cast<void *>(StripPac(
-                            reinterpret_cast<uintptr_t>(methods[i].fnPtr))));
-    }
-
-    RegisterNativesFn original = nullptr;
+    // 原方法指针先行取出：任何提前返回路径都必须完成本次注册（hook 只做观察，不拦截）。
+    RegisterNativesFn original;
     {
         std::lock_guard<std::mutex> lock(g_hook_mutex);
         original = g_original_register_natives;
@@ -304,6 +539,66 @@ jint HookedRegisterNatives(JNIEnv *env, jclass clazz,
     if (original == nullptr) {
         LOGE("[register-natives] original RegisterNatives is unavailable");
         return JNI_ERR;
+    }
+
+    // 类名：反射元数据已缓存，此处只剩 1 次 CallObjectMethod。
+    const char *className = nullptr;
+    jstring classNameStr = nullptr;
+    jclass classClazz = EnsureClassReflectionCache(env);
+    jmethodID getNameMethod = g_get_name_method;
+    if (classClazz != nullptr && getNameMethod != nullptr) {
+        classNameStr = static_cast<jstring>(env->CallObjectMethod(clazz, getNameMethod));
+        if (classNameStr != nullptr) {
+            className = env->GetStringUTFChars(classNameStr, nullptr);
+        }
+    }
+
+    // 指纹去重（热路径第一道闸）：同一进程对同一类以相同方法表重复注册直接短路，
+    // 不打逐方法日志、不进 Java 回调（Java 侧 HookDataBridge/HookReportReceiver 的
+    // 指纹去重保留为第二道闸，防广播/Provider 双路重复）。
+    const RegisterNativesKey key{
+        std::hash<std::string_view>{}(className != nullptr ? className : "?"),
+        (methods != nullptr && nMethods > 0)
+            ? StripPac(reinterpret_cast<uintptr_t>(methods[0].fnPtr))
+            : 0,
+        nMethods};
+    {
+        std::lock_guard<std::mutex> lock(g_seen_mutex);
+        if (!g_seen_register_natives.insert(key).second) {
+            if (className != nullptr) {
+                env->ReleaseStringUTFChars(classNameStr, className);
+            }
+            if (classNameStr != nullptr) {
+                env->DeleteLocalRef(classNameStr);
+            }
+            return original(env, clazz, methods, nMethods);
+        }
+    }
+
+    // 仅首次注册输出 INFO 摘要；逐方法明细降为 DEBUG（默认不输出），避免
+    // chromium 这类单次注册数百方法时刷出数百行日志。
+    LOGI("[register-natives] intercepted clazz=%p methods=%d name=%s",
+         clazz, static_cast<int>(nMethods), className != nullptr ? className : "?");
+    for (jint i = 0; i < nMethods; ++i) {
+        const char *name = methods[i].name ? methods[i].name : "(null)";
+        const char *sig = methods[i].signature ? methods[i].signature : "(null)";
+        LOGD("[register-natives]   [%d] name='%s' sig='%s' fn=%p", static_cast<int>(i),
+             name, sig, reinterpret_cast<void *>(StripPac(
+                            reinterpret_cast<uintptr_t>(methods[i].fnPtr))));
+    }
+
+    // Get current process name（已缓存）
+    std::string processName = GetCurrentProcessName();
+
+    // Call Java callback
+    CallJavaCallback(processName.c_str(), className, methods, nMethods, 0);
+
+    // Clean up
+    if (className != nullptr) {
+        env->ReleaseStringUTFChars(classNameStr, className);
+    }
+    if (classNameStr != nullptr) {
+        env->DeleteLocalRef(classNameStr);
     }
 
     jint ret = original(env, clazz, methods, nMethods);
@@ -379,6 +674,15 @@ extern "C" NativeOnModuleLoaded native_init(const NativeAPIEntries *entries) {
     }
 
     g_entries = *entries;
+    
+    // Initialize Java references
+    JNIEnv *env = GetJNIEnvForCallback();
+    if (env != nullptr && InitializeJavaReferences(env)) {
+        LOGI("Java callback references initialized");
+    } else {
+        LOGW("Failed to initialize Java callback references");
+    }
+    
     if (!InstallHook()) {
         LOGE("RegisterNatives hook install failed");
     }
@@ -396,6 +700,10 @@ Java_com_example_nathookdemo_NativeBridge_startRecording(JNIEnv *env, jobject th
     (void)env;
     (void)thiz;
     LOGI("NativeBridge.startRecording() -> installing RegisterNatives hook");
+    
+    // Initialize Java references if not already done
+    InitializeJavaReferences(env);
+    
     return InstallHook() ? JNI_TRUE : JNI_FALSE;
 }
 
