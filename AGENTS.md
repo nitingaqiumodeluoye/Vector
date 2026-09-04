@@ -1,5 +1,12 @@
 # AGENTS.md
 
+## wxshadow KPM 源码位置
+
+wxshadow KPM（内核模块，`PR_WXSHADOW_PATCH` 的内核实现）的**最新源码在 SSH 服务器上**，
+本地 `E:/52/mkpms/kpms/wxshadow/` 可能不是最新。涉及内核 patch 路径
+（stop_machine/全局锁/IPI/TLB 击落等）的排查与修改前，必须先通过 SSH 到服务器拉取
+最新源码（learn-ssh 技能，`MSYS_NO_PATHCONV=1`），不要直接改本地副本。
+
 ## rawVector 与 rustFrida 双基准
 
 Vector 的整体运行流程与 hook 实现分别使用两套已验证源码作为基准，后续改造必须同时对照：
@@ -263,3 +270,34 @@ dlopen_ext ... /memfd:wwb_so (deleted) ... has bad ELF magic: 00000000
 禁止 Codex 主动启动任何目标或普通 App（包括 `am start`、`monkey`、点击启动入口或其它等效操作）。
 需要采集普通 App 的启动日志时，必须等待用户手动启动目标 App 后再读取最新日志。安装重启验证完成后，
 应向用户报告构建版本、安装结果和设备状态，不得顺带启动其它 App。
+
+## 模块 APK 必须使用非 debuggable 构建（release + debug 签名）
+
+被 Vector 注入的模块 APK（如 `examples/native-hook-demo`）是"被加载方"：宿主的每个进程
+fork 时都要重新加载它一遍。Android 规定 `debuggable=true` 的 APK 永远 `run-from-apk`
+（系统拒绝 dex2oat 编译，`cmd package compile` 也会返回 Success 但实际不生成 odex），
+导致模块 dex 每次进程启动都要全量解释执行 + 验证 + JIT。
+
+实测后果（2026-09-04，demo v16 debug 版 1.4MB dex）：
+- 宿主（com.demo.addapp）启动从 ~300ms 劣化到 5~10s，间歇性 start_timeout 被杀；
+- simpleperf 采样宿主主线程：92% CPU 在内核态（`_raw_spin_lock` ~34% + 缺页/VMA ~32% +
+  取指异常 hardening ~7%），不是锁死等，是解释执行/JIT 引发的内核风暴；
+- 模块 dex 越大越严重；小 dex（几百 KB）时开销无感，大 dex（≥1MB）必须非 debuggable。
+
+### 规则
+
+1. 模块 APK 一律使用 release 构建（非 debuggable），配 `signingConfig = signingConfigs
+   .getByName("debug")` 保证本地可安装。参考 `examples/native-hook-demo/build.gradle.kts`
+   末尾的 buildTypes.release 配置。
+2. 本地迭代可用 debug 构建快速验证功能，但涉及宿主启动性能的最终验证必须切回 release
+   并重新安装。
+3. release 安装后首次测速前，先触发编译并确认 odex 已生成：
+   ```bash
+   adb shell cmd package compile -m speed -f <模块包名>
+   # 确认不是 run-from-apk（run-from-apk = debuggable，编译被系统忽略）：
+   adb shell dumpsys package <模块包名> | grep -E 'arm64.*status'
+   # 确认 odex 存在（路径从 pm path 的目录拼接 /oat/arm64/base.odex）：
+   adb shell su -c 'ls -la "$(pm path <模块包名> | sed s/package://;s/base.apk/base.odex)"'
+   ```
+4. 排查"宿主启动慢/注入后变卡"时，先检查所有已启用模块 APK 是否 debuggable
+   （dumpsys 看 run-from-apk），再考虑 Vector 框架侧原因。
