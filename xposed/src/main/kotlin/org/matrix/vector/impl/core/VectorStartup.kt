@@ -386,8 +386,25 @@ object VectorStartup {
     @JvmStatic
     fun completeAppBootstrapAfterAttach() {
         if (systemProcess || !appPostAttachBootstrapCompleted.compareAndSet(false, true)) return
-        installPostAttachFrameworkInterceptors()
-        Utils.logI("[startup-trace] Vector post-attach framework bootstrap completed")
+        // 2026-09-04 实测：DexTrustHooker（DexFile#openDexFile）等 hook 的 Install() 反射段
+        // （Class.getName/getParameterTypes 等 JNI→Java 调用）会与全进程 blocking GC / safepoint
+        // 请求互等，实测阻塞主线程 0.4~5.4s（MIUIScout ANR 栈：main 卡在 Class.getName ←
+        // HookBridge.hookMethod(Native Method)；同窗口 Signal Catcher "Waiting for a blocking
+        // GC ObjectsAllocated"，GC 结束与主线程恢复同一毫秒）。这些 hook 是 Vector 自有监控
+        // （CrashDump/DexTrust），无 rawVector 时序契约约束；art hook 安装与执行线程无关
+        // （entrypoint 是进程级状态，engine 自带锁保证并发安全），移到后台线程避免冻结主
+        // 线程。CAS 已保证 exactly-once。
+        Thread(
+                {
+                    installPostAttachFrameworkInterceptors()
+                    Utils.logI("[startup-trace] Vector post-attach framework bootstrap completed")
+                },
+                "Vector-PostAttachBootstrap",
+            )
+            .apply {
+                isDaemon = true
+                start()
+            }
     }
 
     /**

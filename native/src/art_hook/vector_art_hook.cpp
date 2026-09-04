@@ -2912,6 +2912,14 @@ std::unique_ptr<MethodState> Install(JNIEnv *env, jobject reflected_method,
         }
     }
     const bool uses_shared_router = shared_router != nullptr;
+    if (perf_start != 0) {
+        // 诊断：定位 DexFile.openDexFile 类 hook 安装秒级卡顿（2026-09-04 复现 0.6~1.8s）。
+        // 本点覆盖：DecodeArtMethod / native route 分类 / entry 解析 / shared router 决策。
+        LOGI("[perf] art_method_install stage=route method={} entry={} shared_router={} elapsedUs={}",
+             reinterpret_cast<void *>(state->original_art_method),
+             reinterpret_cast<void *>(state->original_entry), uses_shared_router,
+             ArtPerfElapsedUs(perf_start));
+    }
     if (!state->native_entry_hook && !route_has_independent_code && !uses_shared_router) {
         LOGI("WxShadow ART route skipped for unclassified shared libart entry: method={} source={} target={} native={}",
              reinterpret_cast<void *>(state->original_art_method),
@@ -3000,6 +3008,12 @@ std::unique_ptr<MethodState> Install(JNIEnv *env, jobject reflected_method,
     env->DeleteLocalRef(declaring_class);
     env->DeleteLocalRef(executable_class);
     if (!state->declaring_class) return nullptr;
+    if (perf_start != 0) {
+        // 诊断：覆盖 Executable 反射段（getModifiers/getParameterTypes/getReturnType/declaring）。
+        LOGI("[perf] art_method_install stage=reflect method={} elapsedUs={}",
+             reinterpret_cast<void *>(state->original_art_method),
+             ArtPerfElapsedUs(perf_start));
+    }
 
     state->original_clone = reinterpret_cast<uintptr_t>(malloc(state->method_size));
     if (!state->original_clone || !IsReadable(state->original_art_method, state->method_size)) return nullptr;
@@ -3025,6 +3039,12 @@ std::unique_ptr<MethodState> Install(JNIEnv *env, jobject reflected_method,
     // matching rustFrida's install order. The live ArtMethod entry is changed
     // only after both copies exist, and MethodState::~MethodState restores it
     // if any later install or activation step fails.
+    if (perf_start != 0) {
+        // 诊断：覆盖 clone（original_clone/replacement malloc+memcpy）。
+        LOGI("[perf] art_method_install stage=clone method={} downgrade={} elapsedUs={}",
+             reinterpret_cast<void *>(state->original_art_method), downgrade_shared_entry,
+             ArtPerfElapsedUs(perf_start));
+    }
     if (downgrade_shared_entry &&
         !DowngradeMethodEntryToInterpreterBridge(*state)) {
         LOGW("WxShadow ART shared-entry downgrade unavailable: method={} "
@@ -3042,6 +3062,12 @@ std::unique_ptr<MethodState> Install(JNIEnv *env, jobject reflected_method,
     const bool router_preexisting = !uses_shared_router &&
                                     hook_get_trampoline(resolved_entry) != nullptr;
 
+    if (perf_start != 0) {
+        // 诊断：覆盖 entry 降级（interpreter bridge）。
+        LOGI("[perf] art_method_install stage=downgrade method={} elapsedUs={}",
+             reinterpret_cast<void *>(state->original_art_method),
+             ArtPerfElapsedUs(perf_start));
+    }
     const uint32_t replacement_flags =
         (original_flags & ~(kAccCriticalNative | kAccFastNative | kAccNterpFastPath)) |
         kAccNative | CompileDontBotherFlag();
@@ -3052,6 +3078,12 @@ std::unique_ptr<MethodState> Install(JNIEnv *env, jobject reflected_method,
     // used by Vector's HookItem registry.
     void *thunk = hook_create_native_trampoline(state->original_art_method, callback,
                                                  reinterpret_cast<void *>(key), 0);
+    if (perf_start != 0) {
+        // 诊断：覆盖 hook_create_native_trampoline（g_engine 锁 + exec pool hook_alloc + thunk 生成）。
+        LOGI("[perf] art_method_install stage=thunk method={} thunk={} elapsedUs={}",
+             reinterpret_cast<void *>(state->original_art_method), thunk,
+             ArtPerfElapsedUs(perf_start));
+    }
     if (!thunk) return nullptr;
     *reinterpret_cast<uintptr_t *>(state->replacement + state->data_offset) =
         reinterpret_cast<uintptr_t>(thunk);

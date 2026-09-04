@@ -278,6 +278,12 @@ static int find_containing_vma(uintptr_t addr, uintptr_t* vma_start, size_t* vma
 }
 
 static void log_vma_for_addr(const char* stage, void* address) {
+    // 诊断专用：读 /proc/self/maps 在 MIUI 上可达 1~2ms（数百行），多进程并发注入时
+    // 会加剧 seq_file 锁竞争（实测单次 wxshadow_patch 用户态 23ms，内核侧仅 120us）。
+    // 仅在 debug.vector.art.perf=1 时执行，生产路径直接返回。
+    if (!hook_perf_enabled()) {
+        return;
+    }
     FILE* f = fopen("/proc/self/maps", "r");
     if (!f) return;
     const uintptr_t needle = (uintptr_t)address;
