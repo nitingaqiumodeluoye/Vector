@@ -38,19 +38,24 @@ object VectorStartup {
     private val appPostAttachBootstrapCompleted = AtomicBoolean(false)
     @Volatile private var systemProcess = false
 
+    // 临时诊断开关：debug.vector.disable.hook，逗号分隔值
+    // 可选：attach / ctor / createappfactory / createcl，分别禁用对应框架 hook 安装
+    private fun isHookDisabled(vararg names: String): Boolean {
+        val raw = runCatching {
+            Class.forName("android.os.SystemProperties")
+                .getMethod("get", String::class.java, String::class.java)
+                .invoke(null, "debug.vector.disable.hook", "") as String
+        }.getOrDefault("")
+        if (raw.isEmpty()) return false
+        val items = raw.split(",").map { it.trim().lowercase() }
+        return names.any { it in items }
+    }
+
     private fun traceAnonymousExecMaps(stage: String) {
-        runCatching {
-                val mappings =
-                    File("/proc/self/maps").useLines { lines ->
-                        lines.filter { it.contains(" r-xp 00000000 00:00 0") }.toList()
-                    }
-                Utils.logI(
-                    "[exec-map-bootstrap] stage=$stage pid=${Process.myPid()} " +
-                        "count=${mappings.size}"
-                )
-                mappings.forEach { Utils.logI("[exec-map-bootstrap] stage=$stage map=$it") }
-            }
-            .onFailure { Utils.logE("[exec-map-bootstrap] stage=$stage failed", it) }
+        // Diagnostic-only: see VectorModuleManager.traceAnonymousExecMaps. Reading
+        // /proc/self/maps on the pre-attach bootstrap path amplifies cold-VM fault storms and
+        // contends for the process mmap semaphore with trampoline/thunk allocation. Disabled.
+        return
     }
 
     private data class DeferredAppState(
@@ -65,16 +70,6 @@ object VectorStartup {
     )
 
     private fun elapsedUs(startNs: Long): Long = (System.nanoTime() - startNs) / 1_000L
-
-    private fun describeExecutable(executable: Executable): String =
-        buildString {
-            append(executable.declaringClass.name)
-            append('#')
-            append(executable.name)
-            append('(')
-            append(executable.parameterTypes.joinToString(",") { it.name })
-            append(')')
-        }
 
     private inline fun <T> traceStartupStep(label: String, block: () -> T): T {
         val startNs = System.nanoTime()
@@ -99,18 +94,20 @@ object VectorStartup {
         executable: Executable,
         block: () -> Unit,
     ) {
-        val target = describeExecutable(executable)
+        // 2026-09-11 (user-approved): logcat 里不再输出反射目标全文（Duck Detector 的
+        // LSPosed logcat pattern 会命中 target=android.app.LoadedApk#... 这类可识别字符串，
+        // 成为 [WARNING] 的证据面）。保留 label/耗时以维持排障能力。
         val startNs = System.nanoTime()
-        Utils.logI("[startup-trace] hook begin: label=$label target=$target")
+        Utils.logI("[startup-trace] hook begin: label=$label")
         try {
             block()
             Utils.logI(
-                "[startup-trace] hook end: label=$label target=$target " +
+                "[startup-trace] hook end: label=$label " +
                     "elapsedUs=${elapsedUs(startNs)}"
             )
         } catch (t: Throwable) {
             Utils.logE(
-                "[startup-trace] hook failed: label=$label target=$target " +
+                "[startup-trace] hook failed: label=$label " +
                     "elapsedUs=${elapsedUs(startNs)}",
                 t,
             )
@@ -154,7 +151,7 @@ object VectorStartup {
     /**
      * Registers a pre-built [LoadedApk] whose constructor ran before the hooks were installed -- the
      * LSPatch rootless target being the one case. Once tracked, [LoadedApkCreateAppFactoryHooker] and
-     * [LoadedApkCreateCLHooker] dispatch its `onPackageLoaded`/`onPackageReady` (and legacy
+     * [LoadedPackageCreateCLHooker] dispatch its `onPackageLoaded`/`onPackageReady` (and legacy
      * `handleLoadPackage`) exactly once when its class loader is realized, with `onPackageLoaded`
      * running *before* the app's `AppComponentFactory` static initializer.
      */
@@ -251,6 +248,10 @@ object VectorStartup {
     }
 
     private fun installAppAttachInterceptor() {
+        if (isHookDisabled("attach")) {
+            Utils.logW("[startup-trace] ActivityThread.attach hook DISABLED by debug.vector.disable.hook")
+            return
+        }
         val activityThreadClass = Class.forName("android.app.ActivityThread")
         val methods = activityThreadClass.declaredMethods.filter { it.name == "attach" }
         methods.forEachIndexed { index, method ->
@@ -317,6 +318,10 @@ object VectorStartup {
     }
 
     private fun installLoadedApkInterceptors(phase: String) {
+        if (isHookDisabled("ctor") && isHookDisabled("createappfactory") && isHookDisabled("createcl")) {
+            Utils.logW("[startup-trace] all LoadedApk hooks DISABLED by debug.vector.disable.hook phase=$phase")
+            return
+        }
         traceStartupStep("installLoadedApkInterceptors[$phase].total") {
             // Application Load Interceptors
             val loadedApkClass =
@@ -327,14 +332,22 @@ object VectorStartup {
                 traceStartupStep("reflect.LoadedApk.constructors[$phase]") {
                     loadedApkClass.declaredConstructors.toList()
                 }
-            loadedApkConstructors.forEachIndexed { index, constructor ->
-                // Hook all constructors of LoadedApk to catch early instantiations securely
-                traceStartupHook("LoadedApkCtorHooker[$phase][$index]", constructor) {
-                    VectorHookBuilder(constructor).intercept(LoadedApkCtorHooker)
+            if (!isHookDisabled("ctor")) loadedApkConstructors.forEachIndexed { index, constructor ->
+                // Hook all constructors of LoadedApk to catch early instantiations securely.
+                // R1 oscillation (2026-09-11, user-approved): framework hooks return to the default
+                // process-wide WxShadow stealth, matching rustFrida prepare_hook_target semantics
+                // (WxShadow => sflag=1). The original livelock was mitigated by re-enabling
+                // same-page LDR literal relocation (hook_engine_mem.c disable_wxshadow_ldr_reloc=0);
+                // any residual r/x flip cost is the accepted lean-tradeoff of that decision.
+                // Duck-detector alignment: never mprotect-write boot-framework.oat code pages
+                // (that produced the 8 kB shared-dirty [DANGER]). Hooker label renamed to a
+                // LoadedApk synonym to avoid framework hooker names in logcat traces.
+                traceStartupHook("LoadedPackageCtorHooker[$phase][$index]", constructor) {
+                    VectorHookBuilder(constructor).intercept(LoadedPackageCtorHooker)
                 }
             }
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && !isHookDisabled("createappfactory")) {
                 val createAppFactoryMethods =
                     traceStartupStep("reflect.LoadedApk.createAppFactory[$phase]") {
                         loadedApkClass.declaredMethods.filter { it.name == "createAppFactory" }
@@ -349,16 +362,17 @@ object VectorStartup {
                 }
             }
 
-            val createClassLoaderMethods =
-                traceStartupStep(
+            val createClassLoaderMethods: List<java.lang.reflect.Method> =
+                if (isHookDisabled("createcl")) emptyList()
+                else traceStartupStep(
                     "reflect.LoadedApk.createOrUpdateClassLoaderLocked[$phase]"
                 ) {
                     loadedApkClass.declaredMethods
                         .filter { it.name == "createOrUpdateClassLoaderLocked" }
                 }
             createClassLoaderMethods.forEachIndexed { index, method ->
-                traceStartupHook("LoadedApkCreateCLHooker[$phase][$index]", method) {
-                    VectorHookBuilder(method).intercept(LoadedApkCreateCLHooker)
+                traceStartupHook("LoadedPackageCreateCLHooker[$phase][$index]", method) {
+                    VectorHookBuilder(method).intercept(LoadedPackageCreateCLHooker)
                 }
             }
 
@@ -743,12 +757,15 @@ object VectorStartup {
 
         val classLoader =
             loadedApk?.getFieldValue<ClassLoader>("mClassLoader")
-                ?: loadedApk?.getFieldValue<ClassLoader>("mDefaultClassLoader")
                 ?: ActivityThread.currentApplication()?.classLoader
                 ?: return null
 
-        val defaultClassLoader =
-            loadedApk?.getFieldValue<ClassLoader>("mDefaultClassLoader") ?: classLoader
+        // mDefaultClassLoader 在 Android 12 MIUI 是 hidden API（blocked+denied），
+        // 反射访问每条都会打印 "Accessing hidden field LoadedApk;->mDefaultClassLoader
+        // (blocked, reflection, denied)" 并返回 null（实测 xff denylist 进程 200 次循环
+        // 刷屏 100+ 条）。该字段在 API 29+ 已 deprecated 且语义等同 mClassLoader，
+        // 直接复用 mClassLoader，避免无意义的 denied 反射风暴。
+        val defaultClassLoader = classLoader
         val appComponentFactory =
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 loadedApk?.getFieldValue<Any>("mAppComponentFactory")

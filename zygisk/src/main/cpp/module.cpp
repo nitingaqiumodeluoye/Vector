@@ -15,6 +15,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include <zygisk.hpp>
@@ -128,21 +129,16 @@ static void ScheduleLateNameOwnZygiskRxVma() {
 // pathname/inode, so recording them around each native stage is the only reliable way
 // to distinguish Vector allocation from a later app/library initializer.
 static void TraceAnonymousExecMaps(const char *stage) {
-    FILE *maps = fopen("/proc/self/maps", "r");
-    if (!maps) {
-        LOGW("[exec-map-native] stage={} failed to open /proc/self/maps", stage);
-        return;
-    }
-    char line[512];
-    size_t count = 0;
-    while (fgets(line, sizeof(line), maps)) {
-        if (strstr(line, " r-xp 00000000 00:00 0")) {
-            ++count;
-            LOGI("[exec-map-native] stage={} map={}", stage, line);
-        }
-    }
-    fclose(maps);
-    LOGI("[exec-map-native] stage={} pid={} count={}", stage, getpid(), count);
+    // Diagnostic-only: reading /proc/self/maps fires a page-table walk and takes the
+    // process mmap semaphore on every call. This ran up to 8x on the postAppSpecialize
+    // hot path (entry/after-binder/after-fetch/after-load-dex/after-init-hooks/
+    // after-entry-class/before-fork-common/after-fork-common). On a cold VM (fresh
+    // TLB/icache + first-touch wxshadow pages) each scan degrades into a multi-second
+    // fault storm (perf: handle_pte_fault + do_el0_ia_bp_hardening + mmap_lock spin).
+    // Disabled by default; the corresponding Java-side tracers were disabled in the same
+    // way (VectorModuleManager/VectorStartup traceAnonymousExecMaps).
+    (void)stage;
+    return;
 }
 
 static long long StartupElapsedUs(
@@ -229,7 +225,14 @@ protected:
      *
      * This method is a pure virtual in the native::core::Context base class and
      * must be implemented here.
-     * It uses an InMemoryDexClassLoader to load our framework into the target process.
+     * It uses a BaseDexClassLoader to load our framework into the target process.
+     *
+     * Source reference: rustFrida ddda052 "use BaseDexClassLoader for dynamic managed help dex"
+     * (quickjs-hook/src/jsapi/java/java_hook_api/managed_install.rs). InMemoryDexClassLoader is
+     * a BaseDexClassLoader subclass with identical DexPathList/ByteBuffer[] semantics, but its
+     * runtime class name is a hunter-type detector signature ("dex load size" enum). Instantiating
+     * the public parent class directly keeps the rawVector load timing/flow while aligning the
+     * loader implementation with rustFrida.
      */
     void LoadDex(JNIEnv *env, PreloadedDex &&dex) override;
 
@@ -321,24 +324,63 @@ void VectorModule::LoadDex(JNIEnv *env, PreloadedDex &&dex) {
         return;
     }
 
-    // Create an InMemoryDexClassLoader instance.
-    auto in_memory_cl_class = lsplant::JNI_FindClass(env, "dalvik/system/InMemoryDexClassLoader");
-    if (!in_memory_cl_class) {
-        LOGE("Failed to find InMemoryDexClassLoader.");
+    // Create the loader instance directly as the public parent class. Source: rustFrida
+    // managed_install.rs: runtime class = dalvik.system.BaseDexClassLoader, so hunter-type
+    // InMemoryDexClassLoader enumeration stays at 0. API>=29 uses the 3-arg ctor (null
+    // librarySearchPath), API<29 uses the 2-arg ctor; parent stays the system loader
+    // (rawVector load timing predates app classloaders, matching rustFrida's fallback).
+    auto base_cl_class = lsplant::JNI_FindClass(env, "dalvik/system/BaseDexClassLoader");
+    if (!base_cl_class) {
+        LOGE("Failed to find BaseDexClassLoader.");
         return;
     }
-    auto init_mid = lsplant::JNI_GetMethodID(env, in_memory_cl_class.get(), "<init>",
-                                             "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V");
+    auto dex_buffers = lsplant::ScopedLocalRef(env,
+        env->NewObjectArray(1, byte_buffer_class.get(), dex_buffer.get()));
+    if (!dex_buffers) {
+        LOGE("Failed to create ByteBuffer[] for DEX.");
+        return;
+    }
+    jmethodID init_mid = nullptr;
+    const int api_level = []() {
+        static int cached = -1;
+        if (cached < 0) {
+            char value[PROP_VALUE_MAX] = {0};
+            __system_property_get("ro.build.version.sdk", value);
+            cached = atoi(value);
+        }
+        return cached;
+    }();
+    if (api_level < 1) {
+        LOGE("Failed to read ro.build.version.sdk.");
+        return;
+    }
+    if (api_level >= 29) {
+        init_mid = lsplant::JNI_GetMethodID(env, base_cl_class.get(), "<init>",
+            "([Ljava/nio/ByteBuffer;Ljava/lang/String;Ljava/lang/ClassLoader;)V");
+    } else {
+        init_mid = lsplant::JNI_GetMethodID(env, base_cl_class.get(), "<init>",
+            "([Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V");
+    }
     if (!init_mid) {
-        LOGE("Failed to find InMemoryDexClassLoader constructor.");
+        LOGE("Failed to find BaseDexClassLoader constructor.");
         return;
     }
 
-    auto new_cl =
-        lsplant::ScopedLocalRef(env, env->NewObject(in_memory_cl_class.get(), init_mid,
-                                                    dex_buffer.get(), system_classloader.get()));
+    jvalue ctor_args[3] = {};
+    if (api_level >= 29) {
+        // args: (ByteBuffer[], null librarySearchPath, parent) — matches rustFrida's
+        // api_level >= 29 branch. jvalue.l for both the Object refs and the null String.
+        ctor_args[0].l = dex_buffers.get();
+        ctor_args[1].l = nullptr;
+        ctor_args[2].l = system_classloader.get();
+    } else {
+        ctor_args[0].l = dex_buffers.get();
+        ctor_args[1].l = system_classloader.get();
+    }
+    auto new_cl = lsplant::ScopedLocalRef(env, env->NewObjectA(base_cl_class.get(), init_mid,
+        ctor_args));
     if (env->ExceptionCheck() || !new_cl) {
-        LOGE("Failed to create InMemoryDexClassLoader instance.");
+        LOGE("Failed to create BaseDexClassLoader instance.");
         env->ExceptionClear();
         return;
     }
@@ -438,6 +480,13 @@ void VectorModule::preAppSpecialize(zygisk::AppSpecializeArgs *args) {
     }
 
     IPCBridge::GetInstance().Initialize(env_);
+
+    // TEMP DIAGNOSTIC (3250): enable the in-process ART hook perf timers
+    // ([perf] art_method_install stage=... / [perf] java_hook ...) so the
+    // multi-second silent stalls inside LoadedApk* / createAppFactory hook
+    // installation can be attributed to a concrete sub-step (route / reflect /
+    // clone / downgrade / thunk / table_add). Remove after localization.
+    setenv("VECTOR_ART_HOOK_PERF", "1", 1);
 
     // --- Injection Decision Logic ---
     // Determine if the current process is a valid target for injection.

@@ -103,25 +103,12 @@ object VectorModuleManager {
     }
 
     private fun traceAnonymousExecMaps(stage: String, modulePackageName: String) {
-        runCatching {
-                val mappings =
-                    File("/proc/self/maps").useLines { lines ->
-                        lines
-                            .filter { it.contains(" r-xp 00000000 00:00 0") }
-                            .toList()
-                    }
-                Log.d(
-                    TAG,
-                    "[exec-map-trace] stage=$stage module=$modulePackageName " +
-                        "pid=${Process.myPid()} count=${mappings.size}",
-                )
-                mappings.forEach { mapping ->
-                    Log.d(TAG, "[exec-map-trace] stage=$stage map=$mapping")
-                }
-            }
-            .onFailure { error ->
-                Log.e(TAG, "[exec-map-trace] stage=$stage failed", error)
-            }
+        // Diagnostic-only: reading /proc/self/maps fires a page-table walk + takes the process
+        // mmap semaphore on every call. This was invoked up to 14x per module load on the fork/
+        // pre-attach hot path, and on a cold VM (fresh TLB/icache + first-touch shadow pages) it
+        // degenerates into a multi-second fault storm (perf: handle_pte_fault +
+        // do_el0_ia_bp_hardening + seq_path + mmap_lock contention). Disabled by default.
+        return
     }
 
     // Entries are weak on purpose: activeModules owns the only strong reference, and detach()

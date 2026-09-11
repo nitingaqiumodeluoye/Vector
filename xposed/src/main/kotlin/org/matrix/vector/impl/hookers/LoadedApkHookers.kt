@@ -88,8 +88,8 @@ internal object LoadedApkTracker {
         Collections.synchronizedSet(Collections.newSetFromMap(WeakHashMap()))
 }
 
-/** Tracks and prepares Application instances when their LoadedApk is instantiated. */
-object LoadedApkCtorHooker : WbInterface.Hooker {
+/** Tracks and prepares Application instances when their LoadedPackage is instantiated. */
+object LoadedPackageCtorHooker : WbInterface.Hooker {
     override fun intercept(chain: WbInterface.Chain): Any? {
         val startNs = System.nanoTime()
         val result = chain.proceed()
@@ -162,7 +162,7 @@ object LoadedApkCreateAppFactoryHooker : WbInterface.Hooker {
 }
 
 /** Modern API Phase: onPackageReady and Legacy Phase: handleLoadPackage */
-object LoadedApkCreateCLHooker : WbInterface.Hooker {
+object LoadedPackageCreateCLHooker : WbInterface.Hooker {
     // intercepting createOrUpdateClassLoaderLocked(List<String> addedPaths)
     override fun intercept(chain: WbInterface.Chain): Any? {
         val loadedApk = chain.thisObject ?: return chain.proceed()
@@ -189,8 +189,9 @@ object LoadedApkCreateCLHooker : WbInterface.Hooker {
             val appInfo =
                 loadedApk.getFieldValue<ApplicationInfo>("mApplicationInfo") ?: return result
             val classLoader = loadedApk.getFieldValue<ClassLoader>("mClassLoader") ?: return result
-            val defaultClassLoader =
-                loadedApk.getFieldValue<ClassLoader>("mDefaultClassLoader") ?: classLoader
+            // mDefaultClassLoader 是 hidden API（blocked+denied），反射永远失败并刷屏；
+            // 语义等同 mClassLoader，直接复用（见 VectorStartup.resolveDeferredAppState）。
+            val defaultClassLoader = classLoader
 
             val ctx = PackageContextHelper.resolve(loadedApk, apkPackageName)
 
@@ -225,7 +226,7 @@ object LoadedApkCreateCLHooker : WbInterface.Hooker {
                 }
             }
         } catch (t: Throwable) {
-            Utils.logE("LoadedApkCreateCLHooker failed in post-proceed phase", t)
+            Utils.logE("LoadedPackageCreateCLHooker failed in post-proceed phase", t)
         } finally {
             // Cleanup: Once the initial load is done, we remove it from activeApks.
             // Subsequent calls (Split APKs) will now be recognized as non-initial loads.
