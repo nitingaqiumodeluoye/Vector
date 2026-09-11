@@ -80,7 +80,8 @@ uintptr_t DecodeArtMethod(JNIEnv *env, jobject reflected_method);
 
 /** Install a clone+native-replacement route for one reflected executable. */
 std::unique_ptr<MethodState> Install(JNIEnv *env, jobject reflected_method,
-                                     NativeHookCallback callback, uintptr_t key);
+                                     NativeHookCallback callback, uintptr_t key,
+                                     int stealth_override);
 
 /** Publish the replacement in the router table after the owning HookItem is ready. */
 bool Activate(MethodState &state);

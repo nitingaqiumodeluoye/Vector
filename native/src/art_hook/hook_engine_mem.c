@@ -832,6 +832,17 @@ void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range) {
                 gs = (gs + page_size - 1) & ~(page_size - 1);
                 ge = ge & ~(page_size - 1);
 
+                /* 排除 boot.art image 前两页：hunter 类检测器的固定探测锚点落在
+                 * boot.art 前一页（0x708dd000），pool 若覆盖该页会把 fixed-probe
+                 * mmap 撞掉，报「missing page / suspicious execution」。
+                 * Source: rustFrida a1d09e7 quickjs-hook/src/hook_engine_mem.c 同名 guard。 */
+                if (strstr(line, "[anon:dalvik-") && strstr(line, "boot.art")) {
+                    if (ge > (uintptr_t)2 * page_size) {
+                        ge = (ge - 2 * page_size) & ~(page_size - 1);
+                        if (ge < (uintptr_t)gs) ge = (uintptr_t)gs;
+                    }
+                }
+
                 if (ge > gs && (ge - gs) >= alloc_size) {
                     int64_t d;
                     if (target_addr >= gs && target_addr < ge) d = 0;
@@ -1514,11 +1525,14 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
     }
 
     if (stealth == 1) {
-        /* Diagnostic mode:
-         * Temporarily disable same-page LDR literal relocation and only keep the
-         * core wxshadow patch. This isolates whether device reboots are caused by
-         * the page-wide relocate pass rather than the base shadow patch itself. */
-        const int disable_wxshadow_ldr_reloc = 1;
+        /* Same-page LDR literal relocation (rustFrida semantics):
+         *
+         * wxshadow 通过 R/X PTE 互斥保护页面。若同页上存在 PC-relative LDR literal
+         * (fetch 需要 X, data read 需要 R 在同一保护页)，会产生 exec/read fault 无限翻转
+         * (livelock)。rustFrida 的历史提交 0d9b7e3 为诊断设备重启临时禁用了 relocate，
+         * 但之后未恢复；恢复为无条件执行，修正同页 LDR literal livelock 导致的启动卡顿
+         * (dmesg 实测: exec fault / read fault 同页反复切换数百次)。 */
+        const int disable_wxshadow_ldr_reloc = 0;
 
         /* wxshadow 模式: shadow 页写入.
          * 1. aligned(32) 防止 buf 跨页 (copy_from_user_via_pte 不支持跨页)

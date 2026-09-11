@@ -23,6 +23,7 @@ object HookBridge {
         priority: Int,
         callback: Any?,
         allowArtBackend: Boolean,
+        stealthMode: Int,
     ): Boolean
 
     @JvmStatic

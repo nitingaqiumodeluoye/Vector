@@ -215,6 +215,21 @@ std::atomic<uintptr_t> g_implicit_suspend_trigger_offset{UINTPTR_MAX};
 std::once_flag g_classlinker_discovery_once;
 ClassLinkerTrampolines g_classlinker_trampolines;
 ArtStealthMode g_art_stealth_mode = ArtStealthMode::Normal;
+// Per-install stealth override. Set by art::Install when a caller (e.g. a framework
+// hook such as LoadedApk.<init>) requests non-stealth for a single method. -1 = use global.
+thread_local int g_art_stealth_override = -1;
+
+// RAII guard that scopes a per-install stealth override to the current thread and
+// restores the previous value on destruction (covers every return path out of Install).
+struct ScopedStealthOverride {
+    explicit ScopedStealthOverride(int override) : saved_(g_art_stealth_override) {
+        g_art_stealth_override = override;
+    }
+    ~ScopedStealthOverride() { g_art_stealth_override = saved_; }
+    ScopedStealthOverride(const ScopedStealthOverride &) = delete;
+    ScopedStealthOverride &operator=(const ScopedStealthOverride &) = delete;
+    int saved_;
+};
 bool g_is_system_process = false;
 bool g_is_manager_process = false;
 bool g_art_stealth_auto_selected = true;
@@ -248,6 +263,9 @@ const char *ArtStealthModeName(ArtStealthMode mode) {
 }
 
 int ArtStealthFlag() {
+    // Per-install override (e.g. framework hook requesting non-stealth) wins over the
+    // process-wide mode. -1 means "use the global mode".
+    if (g_art_stealth_override >= 0) return g_art_stealth_override;
     return static_cast<int>(g_art_stealth_mode);
 }
 
@@ -1218,6 +1236,14 @@ void OnGetOatQuickMethodHeader(HookContext *ctx, void *) {
 }
 
 bool InitializeOatHeaderLayer() {
+    // system_server-only (caller gates with g_is_system_process). This hook starts every
+    // oat-method code path (GetOatQuickMethodHeader), so under WxShadow its code page
+    // (code+literal-pool in same page) flips between --x and r-- forever during load
+    // (kernel fault storm: dmesg exec/read fault same-page hundreds of times) and blinds
+    // ActivityTaskManager for seconds -> stalls every later app launch (xff 36s delay).
+    // It exists only for the system_server replacement lifecycle, NOT as an anti-tamper
+    // target, so force non-stealth mprotect-RX here; app per-method/ interp hooks stay WxShadow.
+    ScopedStealthOverride scoped_oat_normal(0);
     constexpr const char *kCandidates[] = {
         "_ZN3art9ArtMethod23GetOatQuickMethodHeaderEm",
         "_ZN3art9ArtMethod23GetOatQuickMethodHeaderEj",
@@ -1254,6 +1280,13 @@ size_t InitializeGcSyncLayer() {
         LOGI("WxShadow ART GC sync skipped for app process");
         return 0;
     }
+
+    // system_server-only. These GC coordination hooks (CopyingPhase/CollectGarbageInternal/
+    // RunFlipFunction) contend with GC locks and, under WxShadow, their code pages with embedded
+    // literal pools flip between --x and r-- forever (kernel fault storm) soaking system_server CPU
+    // (manager/xff startup stalls). They back the system_server replacement lifecycle, NOT anti-tamper
+    // targets, so force non-stealth mprotect-RX here; app per-method/ interp hooks stay WxShadow.
+    ScopedStealthOverride scoped_gc_normal(0);
 
     // Source reference: rustFrida art_method/bridge.rs discovery and
     // art_controller.rs GC hook installation. Signatures vary by API, so try
@@ -2781,14 +2814,20 @@ uintptr_t DecodeArtMethod(JNIEnv *env, jobject reflected_method) {
 }
 
 std::unique_ptr<MethodState> Install(JNIEnv *env, jobject reflected_method,
-                                     NativeHookCallback callback, uintptr_t key) {
+                                     NativeHookCallback callback, uintptr_t key,
+                                     int stealth_override) {
 #if !defined(__aarch64__)
-    (void)env; (void)reflected_method; (void)callback; (void)key;
+    (void)env; (void)reflected_method; (void)callback; (void)key; (void)stealth_override;
     return nullptr;
 #else
     const uint64_t perf_start = ArtPerfEnabled() ? ArtPerfNowNs() : 0;
     if (!env || !reflected_method || !callback || !InitializeBootstrap(env)) return nullptr;
     std::lock_guard lock(g_install_mutex);
+
+    // Scoped per-install stealth override. A non-negative override (e.g. Normal for framework
+    // hooks whose code pages embed literal pools and livelock under WxShadow) is visible to
+    // InstallArtRouterWithFallback via ArtStealthFlag() and restored on scope exit.
+    ScopedStealthOverride scoped_override(stealth_override);
 
     auto state = std::make_unique<MethodState>();
     state->original_art_method = DecodeReflectedArtMethod(env, reflected_method);

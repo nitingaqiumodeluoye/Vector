@@ -644,7 +644,7 @@ VECTOR_DEF_NATIVE_METHOD(jboolean, HookBridge, isWxShadowStealthMode) {
  */
 VECTOR_DEF_NATIVE_METHOD(jboolean, HookBridge, hookMethod, jboolean useModernApi,
                          jobject hookMethod, jclass hooker, jint priority, jobject callback,
-                         jboolean allowArtBackend) {
+                         jboolean allowArtBackend, jint stealthMode) {
     if (!hookMethod || !hooker || !callback) return JNI_FALSE;
     bool newHook = false;
     const uint64_t perf_start = HookPerfEnabled() ? HookPerfNowNs() : 0;
@@ -712,7 +712,8 @@ VECTOR_DEF_NATIVE_METHOD(jboolean, HookBridge, hookMethod, jboolean useModernApi
             const uint64_t art_start = perf_start != 0 ? HookPerfNowNs() : 0;
             auto state = art::Install(env, hookMethod,
                                       VectorArtHookCallback,
-                                      reinterpret_cast<uintptr_t>(target));
+                                      reinterpret_cast<uintptr_t>(target),
+                                      static_cast<int>(stealthMode));
             if (art_start != 0) {
                 LOGI("[perf] java_hook stage=art_install target={} success={} elapsedUs={}",
                      static_cast<void *>(target), state != nullptr,
@@ -1608,7 +1609,7 @@ static JNINativeMethod gMethods[] = {
     VECTOR_NATIVE_METHOD(HookBridge, isWxShadowStealthMode, "()Z"),
     VECTOR_NATIVE_METHOD(HookBridge, hookMethod,
                          "(ZLjava/lang/reflect/Executable;Ljava/lang/Class;ILjava/"
-                         "lang/Object;Z)Z"),
+                         "lang/Object;ZI)Z"),
     VECTOR_NATIVE_METHOD(HookBridge, unhookMethod,
                          "(ZLjava/lang/reflect/Executable;Ljava/lang/Object;)Z"),
     VECTOR_NATIVE_METHOD(HookBridge, replaceCallback,

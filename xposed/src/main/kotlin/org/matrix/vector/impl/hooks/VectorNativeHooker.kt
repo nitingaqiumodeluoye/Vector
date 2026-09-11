@@ -25,6 +25,7 @@ class VectorHookBuilder(
     private val moduleId: String? = null,
     private val frozen: (() -> Boolean)? = null,
     private val defaultExceptionMode: ExceptionMode = ExceptionMode.PROTECTIVE,
+    private val stealthMode: Int = STEALTH_DEFAULT,
 ) : HookBuilder {
 
     private var priority = WbInterface.PRIORITY_DEFAULT
@@ -133,6 +134,7 @@ class VectorHookBuilder(
                 // rawVector determines when framework/module hooks are installed. The native
                 // bridge selects the lightweight or complete rustFrida-compatible WxShadow stage.
                 true,
+                stealthMode,
             )
         ) {
             throw HookFailedError("Cannot hook $origin")
@@ -147,6 +149,16 @@ class VectorHookBuilder(
     }
 
     companion object {
+        /** Use the process-wide ART stealth mode (set by SelectArtStealthMode). */
+        const val STEALTH_DEFAULT = -1
+
+        /** Force non-stealth mprotect-RX patch for a single hook (e.g. framework hooks
+         *  whose code pages embed literal pools and livelock under WxShadow). */
+        const val STEALTH_NORMAL = 0
+
+        /** Force WxShadow exec-only patch for a single hook. */
+        const val STEALTH_WXSHADOW = 1
+
         /**
          * The hooks [moduleId] currently has installed, which is what a reload hands to the new
          * generation. Taken after old code has been frozen, so nothing can be added to it behind
