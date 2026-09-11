@@ -16,6 +16,9 @@ bin/
 # Local crash/tombstone/logcat captures.
 /logs/
 
+# Local one-dragon build logs (build_<code>.log output of gradle.zipRelease).
+/build_*.log
+
 # Local hooking/debug diagnostic artifacts (hunter logcat/dmesg dumps).
 /artifacts/
 
