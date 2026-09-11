@@ -6,6 +6,7 @@
 #include <sys/prctl.h>
 
 #include <cerrno>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -102,6 +103,18 @@ std::unordered_set<std::string> g_module_native_libs;
 std::unordered_set<void *> g_initialized_linker_module_handles;
 std::unordered_set<std::string> g_loading_module_libraries;
 std::list<NativeOnModuleLoaded> g_module_loaded_callbacks;
+
+// native_init entrypoints deferred by LoadNativeLibraryFd (soLoader path). They must run from a
+// module-class native-method context so that JNIEnv::FindClass inside them resolves the module
+// ClassLoader: ART's GetClassLoader picks the declaring class of the CURRENT native method (or
+// the nativeLoad override), and under soLoader the framework would otherwise be the resolving
+// context. Kotlin fires them via NativeAPI.firePendingNativeInits after the module ClassLoader
+// exists. rawVector got this for free because the module itself called System.loadLibrary.
+struct PendingNativeInit {
+    std::string library_name;
+    NativeInit init;
+};
+std::vector<PendingNativeInit> g_pending_native_inits;
 
 // Temporary diagnostic build switch requested for comparing Vector soLoader against Android linker.
 // Keep the Java/daemon transport unchanged (module ELF still arrives as sealed SharedMemory), but
@@ -347,12 +360,24 @@ void NotifyNativeModuleCallbacks(const char *name, void *handle) {
 }
 
 void *DoDlopenHook(const char *name, int flags, const void *extinfo, const void *caller_addr) {
+    // 2026-09-12 诊断打点（AGENTS.md 用户批准）：hook 进→wait 返回与 backup 执行耗时 ——
+    // 用于定位 soLoader LoadDependencies 间歇性 7–10s 依赖链窗口是否落入本 hook。
+    const auto hook_start = std::chrono::steady_clock::now();
     std::unique_lock<std::mutex> lock(g_do_dlopen_backup_mutex);
     g_do_dlopen_backup_ready.wait(lock, [] { return g_do_dlopen_backup != nullptr; });
+    const auto wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - hook_start)
+                             .count();
     const auto backup = g_do_dlopen_backup;
     lock.unlock();
 
     void *handle = backup(name, flags, extinfo, caller_addr);
+    const auto backup_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::steady_clock::now() - hook_start)
+                               .count();
+    LOGI("[perf] do_dlopen_hook lib='{}' waitUs={} backupUs={} handle={}",
+         name != nullptr ? name : "null", static_cast<long long>(wait_us),
+         static_cast<long long>(backup_us), reinterpret_cast<void *>(handle));
     const std::string lib_name = name != nullptr ? name : "null";
     LOGV("do_dlopen hook triggered for library: '{}'", lib_name.c_str());
     if (handle != nullptr) {
@@ -470,6 +495,7 @@ bool LoadNativeLibraryFd(int fd, size_t size, const std::string &library_name) {
     if (!EnsureNativeApi()) return false;
     if (!InstallNativeLibraryLoadMonitor()) return false;
     LOGI("Vector soLoader loading module ELF '{}' fd={} size={}", library_name.c_str(), fd, size);
+    const auto load_start = std::chrono::steady_clock::now();
 
     {
         std::lock_guard<std::mutex> lock(g_core_elf_registry_mutex);
@@ -562,31 +588,123 @@ bool LoadNativeLibraryFd(int fd, size_t size, const std::string &library_name) {
         return false;
     }
 
-    try {
-        auto native_init = reinterpret_cast<NativeInit>(init_sym);
-        LOGI("native_init entry diagnostics for '{}': addr={} map='{}' bytes=[{}]",
-             library_name.c_str(), init_sym, FindMapLine(init_sym).c_str(),
-             FormatBytes(init_sym, 16).c_str());
-        LOGI("Calling native_init for module ELF '{}' at {}", library_name.c_str(), init_sym);
-        if (auto callback = native_init(g_native_api_entries); callback != nullptr) {
-            std::lock_guard<std::mutex> lock(g_core_elf_registry_mutex);
-            g_module_loaded_callbacks.push_back(callback);
-            LOGI("native_init for '{}' registered library-load callback {}.",
-                 library_name.c_str(), reinterpret_cast<void *>(callback));
-        } else {
-            LOGI("native_init for '{}' completed without library-load callback.",
-                 library_name.c_str());
-        }
-    } catch (...) {
-        LOGE("native_init threw for module '{}'.", library_name.c_str());
-        finish_loading();
-        return false;
+    // Defer native_init: firing it here would run inside NativeAPI.loadNativeLibraries, whose
+    // declaring class belongs to the framework, so FindClass inside native_init would resolve the
+    // framework ClassLoader and every module resolving its own Java classes would break. The
+    // entrypoint runs later from a module-class context via FirePendingNativeInits.
+    auto native_init = reinterpret_cast<NativeInit>(init_sym);
+    LOGI("native_init for '{}' deferred to module-class context: addr={} map='{}'",
+         library_name.c_str(), init_sym, FindMapLine(init_sym).c_str());
+    {
+        std::lock_guard<std::mutex> lock(g_core_elf_registry_mutex);
+        g_pending_native_inits.push_back({library_name, native_init});
     }
+    LOGI("[perf] load_lib stage=native_init_deferred elapsedUs={}",
+         static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+             std::chrono::steady_clock::now() - load_start)
+             .count()));
 
     {
         std::lock_guard<std::mutex> lock(g_core_elf_registry_mutex);
         g_loading_module_libraries.erase(library_name);
         g_loaded_module_loaders.emplace(library_name, std::move(loader));
+    }
+    LOGI("[perf] load_lib stage=finish_total elapsedUs={}",
+         static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+             std::chrono::steady_clock::now() - load_start)
+             .count()));
+    return true;
+}
+
+namespace {
+
+// Runs deferred native_init entrypoints and collects their library-load callbacks. Called either
+// from NativeInitTrampoline (module-class context) or directly (framework-context fallback).
+void RunPendingNativeInits(const std::vector<PendingNativeInit> &pending) {
+    for (const auto &item : pending) {
+        try {
+            if (auto callback = item.init(g_native_api_entries); callback != nullptr) {
+                std::lock_guard<std::mutex> lock(g_core_elf_registry_mutex);
+                g_module_loaded_callbacks.push_back(callback);
+                LOGI("native_init for '{}' registered library-load callback {}.",
+                     item.library_name.c_str(), reinterpret_cast<void *>(callback));
+            } else {
+                LOGI("native_init for '{}' completed without library-load callback.",
+                     item.library_name.c_str());
+            }
+        } catch (...) {
+            LOGE("native_init threw for module '{}'.", item.library_name.c_str());
+        }
+    }
+}
+
+// Trampoline bound onto the module-defined carrier class (NativeInitFire.fireNativeInit) by
+// FirePendingNativeInits. While ART executes this native method, the "current method" belongs to
+// the module ClassLoader, so JNIEnv::FindClass calls made by the deferred native_init
+// entrypoints resolve the module's own Java classes (rawVector semantics; see GetClassLoader in
+// ART's jni_internal.cc).
+void NativeInitTrampoline(JNIEnv * /*env*/, jclass /*clazz*/) {
+    std::vector<PendingNativeInit> pending;
+    {
+        std::lock_guard<std::mutex> lock(g_core_elf_registry_mutex);
+        pending.swap(g_pending_native_inits);
+    }
+    RunPendingNativeInits(pending);
+}
+
+}  // namespace
+
+bool FirePendingNativeInits(JNIEnv *env, jclass carrier_class) {
+    if (!EnsureNativeApi()) return false;
+
+    // NOTE: pending is NOT drained here. The carrier-class trampoline (NativeInitTrampoline)
+    // performs the swap itself, exactly once, while ART executes the module-defined native
+    // method. Draining here would race/regress into the trampoline swapping an empty list.
+    size_t pending_count = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_core_elf_registry_mutex);
+        pending_count = g_pending_native_inits.size();
+    }
+    LOGI("FirePendingNativeInits: pending_count={} carrier_class={}", pending_count,
+         static_cast<const void *>(carrier_class));
+    if (pending_count == 0) return true;
+
+    if (env == nullptr || carrier_class == nullptr) {
+        // Fallback for modules whose ClassLoader could not carry the NativeInitFire dex: fire
+        // from the current (framework) context. FindClass inside native_init will not see module
+        // classes — same as the pre-deferral behavior.
+        std::vector<PendingNativeInit> pending;
+        {
+            std::lock_guard<std::mutex> lock(g_core_elf_registry_mutex);
+            pending.swap(g_pending_native_inits);
+        }
+        LOGW("Firing {} deferred native_init(s) without a module-class context; FindClass "
+             "inside them resolves the framework ClassLoader.",
+             pending.size());
+        RunPendingNativeInits(pending);
+        return true;
+    }
+
+    const JNINativeMethod methods[] = {
+        {"fireNativeInit", "()V", reinterpret_cast<void *>(&NativeInitTrampoline)},
+    };
+    if (env->RegisterNatives(carrier_class, methods, 1) != JNI_OK) {
+        LOGE("Failed to register the native_init trampoline on the module carrier class.");
+        if (env->ExceptionCheck() == JNI_TRUE) env->ExceptionClear();
+        return false;
+    }
+
+    jmethodID mid = env->GetStaticMethodID(carrier_class, "fireNativeInit", "()V");
+    if (mid == nullptr) {
+        LOGE("Module carrier class does not expose fireNativeInit()V.");
+        if (env->ExceptionCheck() == JNI_TRUE) env->ExceptionClear();
+        return false;
+    }
+
+    env->CallStaticVoidMethod(carrier_class, mid);
+    if (env->ExceptionCheck() == JNI_TRUE) {
+        LOGE("native_init carrier invocation threw; clearing the exception.");
+        if (env->ExceptionCheck() == JNI_TRUE) env->ExceptionClear();
     }
     return true;
 }

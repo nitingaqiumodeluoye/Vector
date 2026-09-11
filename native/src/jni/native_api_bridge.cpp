@@ -4,6 +4,7 @@
 
 #include <android/sharedmem_jni.h>
 
+#include <chrono>
 #include <vector>
 
 #include <sys/mman.h>
@@ -37,6 +38,7 @@ VECTOR_DEF_NATIVE_METHOD(jbooleanArray, NativeAPI, loadNativeLibraries, jobjectA
         const int fd = ASharedMemory_dupFromJava(env, memory);
         const size_t size = fd >= 0 ? ASharedMemory_getSize(fd) : 0;
         if (name_chars && fd >= 0) {
+            const auto elem_start = std::chrono::steady_clock::now();
             unsigned char pread_magic[4] = {};
             const ssize_t pread_size = size >= sizeof(pread_magic)
                                            ? pread(fd, pread_magic, sizeof(pread_magic), 0)
@@ -55,6 +57,10 @@ VECTOR_DEF_NATIVE_METHOD(jbooleanArray, NativeAPI, loadNativeLibraries, jobjectA
             }
             values[static_cast<size_t>(i)] =
                 vector::native::LoadNativeLibraryFd(fd, size, name_chars) ? JNI_TRUE : JNI_FALSE;
+            LOGI("[perf] load_native_lib element={} name='{}' elapsedUs={}", i, name_chars,
+                 static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+                     std::chrono::steady_clock::now() - elem_start)
+                     .count()));
         }
         if (name_chars) env->ReleaseStringUTFChars(name, name_chars);
         if (fd >= 0) close(fd);
@@ -65,10 +71,18 @@ VECTOR_DEF_NATIVE_METHOD(jbooleanArray, NativeAPI, loadNativeLibraries, jobjectA
     return result;
 }
 
+VECTOR_DEF_NATIVE_METHOD(jboolean, NativeAPI, firePendingNativeInits, jclass carrier_class) {
+    // Fires the native_init entrypoints deferred by LoadNativeLibraryFd from the context of the
+    // given module-defined carrier class, so FindClass inside them resolves the module
+    // ClassLoader (rawVector semantics). See native_api.h for the full rationale.
+    return vector::native::FirePendingNativeInits(env, carrier_class) ? JNI_TRUE : JNI_FALSE;
+}
+
 static JNINativeMethod gMethods[] = {
     VECTOR_NATIVE_METHOD(NativeAPI, recordNativeEntrypoint, "(Ljava/lang/String;)V"),
     VECTOR_NATIVE_METHOD(NativeAPI, loadNativeLibraries,
                         "([Ljava/lang/String;[Landroid/os/SharedMemory;)[Z"),
+    VECTOR_NATIVE_METHOD(NativeAPI, firePendingNativeInits, "(Ljava/lang/Class;)Z"),
 };
 
 void RegisterNativeApiBridge(JNIEnv *env) { REGISTER_VECTOR_NATIVE_METHODS(NativeAPI); }

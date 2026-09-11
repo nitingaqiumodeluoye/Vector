@@ -1,6 +1,7 @@
 #pragma once
 
 #include <dlfcn.h>
+#include <jni.h>
 
 #include <string>
 #include <cstddef>
@@ -54,10 +55,23 @@ using NativeInit = NativeOnModuleLoaded (*)(const NativeAPIEntries *entries);
 void RegisterNativeLib(const std::string &library_name);
 
 /**
- * Loads one module ELF image from sealed SharedMemory through Vector's anonymous ELF loader and
- * invokes its native_init entrypoint. APK paths and Android linker APIs are not accepted.
+ * Loads one module ELF image from sealed SharedMemory through Vector's anonymous ELF loader.
+ * The ELF's native_init entrypoint is *deferred*, not invoked here: APK paths and Android linker
+ * APIs are not accepted.
  */
 bool LoadNativeLibraryFd(int fd, size_t size, const std::string &library_name);
+
+/**
+ * Invokes the native_init entrypoints deferred by LoadNativeLibraryFd from the context of the
+ * given module entry class. rawVector semantics: native_init ran on the module's own Java stack
+ * (System.loadLibrary from a module class), so ART's GetClassLoader resolved JNIEnv::FindClass
+ * against the module ClassLoader. Under soLoader the calling frame is framework code, which would
+ * leave FindClass resolving against the framework and break every module that resolves its own
+ * Java classes. Firing through a native method registered on a module class restores the module
+ * context using public JNI APIs only. When entry_class is null the pending inits fire directly
+ * (framework context; fallback for modules without entry classes).
+ */
+bool FirePendingNativeInits(JNIEnv *env, jclass entry_class);
 
 /**
  * @brief WxShadow inline hook implementation used by Vector's internal and module-facing native hooks.

@@ -113,45 +113,46 @@ Vector 的整体运行流程与 hook 实现分别使用两套已验证源码作�
 
 ## 模块 native so 加载约束
 
-当前阶段按原版 `D:\crack\rsfrida\rawVector` 的 linker 加载逻辑对齐，直到用户明确通知恢复
-soLoader。在此阶段，模块 native so 由 Android linker 负责加载：模块 `ClassLoader` 可以暴露
-APK 内 `lib/<abi>` 搜索路径，模块 Java 代码可以调用 `System.load()` 或
-`System.loadLibrary()`，`native_init` 由 linker 已加载的 ELF 导出并返回库加载回调。
+**2026-09-11 用户通知恢复 soLoader，本节基线切换回 soLoader 路径并立即生效。**
+当前生效链路：模块 native ELF 由 daemon 读取到只读 SharedMemory，Java 侧
+`NativeAPI.loadNativeLibraries(names, images)` 把 SharedMemory fd 交给 Vector core，由
+`ElfLoader::LoadLibraryFd()` 自装链接；模块 Java 层不得再走 `System.load()` /
+`System.loadLibrary()` / APK zip entry 直载 linker。
 
-1. **当前 linker 基线。**
-   - `VectorModuleClassLoader.findLibrary()` 可以返回模块 APK 内对应 ABI 的 zip entry 路径，
-     形如 `module.apk!/lib/arm64-v8a/libfoo.so`，行为以 rawVector 的实现为准。
-   - `ModuleCode.nativeLibraryDir` 可以作为模块 `ClassLoader` 的 native library search path
-     传入，但不得凭经验改成其它目录或独立 loader 路径。
-   - `META-INF/xposed/native_init.list` 与 `assets/native_init` 作为 native 库名元数据；模块
-     入口 ELF 由 Android linker 加载后，通过导出的 `native_init` 完成初始化。
-   - `native_init` 返回的库加载回调可以对 linker 提供的目标库 `handle` 调用
-     `dlsym(handle, ...)`，用于定位目标库导出符号；这不等同于加载目标库。
-   - 当前阶段不得因为看到 APK、`base.apk` 或 `apk!/lib/<abi>` 的 linker 映射就判定失败；应先
-     对照 rawVector 的实际加载时机、`dlopen`/`native_init`/回调日志和目标库 handle。
-
-2. **soLoader 暂停规则。**
-   - 暂停调用 Vector 内置 `soLoader`、`ElfLoader::LoadLibraryFd()`、SharedMemory ELF 映射、
-     `NativeAPI.loadNativeLibraries()` 作为模块 native so 的实际加载后端。
-   - 暂停期间不得把 linker 路径和 soLoader 路径混用，也不得以 soLoader 的匿名/FD-backed
-     maps 标准否定当前 linker 测试结果。
-   - `NativeAPI.recordNativeEntrypoint()` 仅保留兼容记录语义，不得在 linker 已加载的库上重复
-     执行 native_init 或再次加载同名库。
-   - 只有用户明确通知恢复 soLoader 后，才恢复原先的 SharedMemory、FD、匿名映射和生命周期
-     约束，并重新禁止模块直接走 linker。
-
+1. **生效基线（soLoader）。**
+   - `VectorModuleManager` 的 `USE_RAW_VECTOR_LINKER_NATIVE_LOADER = false`：
+     `librarySearchPath` 保持空串，模块库由 daemon sealed SharedMemory +
+     `NativeAPI.loadNativeLibraries()` 走 soLoader 装载。
+   - `META-INF/xposed/native_init.list` 与 `assets/native_init` 仍是元数据来源；
+     `native_init` 由 soLoader 装载后由 core 调用并取回库加载回调。
+   - `native_init` 返回的库加载回调仍可对后续目标库 `handle` 调用 `dlsym(handle,...)`
+     定位导出符号；这不等同于加载目标库。
+2. **linker 直载路径仅作诊断保留。**
+   - `native/src/core/native_api.cpp` 的 `kDiagUseAndroidLinkerForModuleNative` 诊断开关
+     保持 `false`； linker 直载分支与 `VectorModuleManager` 的
+     `USE_RAW_VECTOR_LINKER_NATIVE_LOADER=true` 分支代码保留用于诊断，默认不得启用。
+   - 暂停期遗留的经验已验证：linker 直载会在目标进程 maps 留下 `base.apk`
+     外来代码容器映射（xff T2 `MAPS_FOREIGN` 口径），恢复 soLoader 后应不复存在。
 3. **native inline hook 能力。**
    - 模块 native so 仍只能使用 Vector 提供的 `NativeAPIEntries` 和 Vector core/agent 的
      inline hook 能力，不得自行引入第二套 inline hook、mprotect fallback 或 Dobby runtime。
-   - rawVector linker 加载只改变模块 ELF 的装载后端，不改变 ART hook、inline hook、router、
-     trampoline 和原函数调用的 Vector/rustFrida 对齐要求。
-
-4. **恢复 soLoader 后的历史基线。**
-   - 恢复通知生效后，模块 native ELF 必须由 daemon 读取到只读 SharedMemory，再由 Vector core
-     调用 `ElfLoader::LoadLibraryFd()`；不得向目标进程传递 APK 路径或 zip entry 路径。
-   - 恢复后不得使用 `System.load()`、`System.loadLibrary()`、APK zip entry 或文件系统解压路径
-     作为模块 native 加载后端；目标进程 maps 中出现模块 APK 或模块 native so 的文件路径可执行
-     映射即视为未对齐。
+   - 装载后端切换不改变 ART hook、inline hook、router、trampoline 和原函数调用的
+     soLoader/rustFrida 对齐要求。
+4. **CSOLoader 对比决策与 TLS 吸收（2026-09-11）。**
+   - 对比 `E:\52\CSOLoader`（PerformanC，AGPL-3.0，ReZygisk 采用）与
+     `external/soLoader`（MIT，Vector 已集成）后，用户选定：**继续用 soLoader 作为模块 so
+     装载后端；CSOLoader 仅作为功能参照，不作为运行时后端引入**（AGPL 传染顾虑、
+     接口/管理局线成本、风险隔离；其 file-backed mmap 反而比 soLoader 的匿名拷贝映射
+     多留一个文件路径痕迹面）。
+   - **吸收项：TLS 重定位支持。** soLoader 原先不处理 `TLS_DTPMOD/TLS_DTPREL/TLS_TPREL/
+     TLSDESC` 与 `__tls_get_addr`，带 `thread_local` 的模块 so 会拒载。参照 CSOLoader
+     `linker.c` 的 TLS 模型（全局 module 表 + pthread key per-thread DTV +
+     `__tls_get_addr` 自有实现 + TLSDESC dynamic resolver + TPREL 的 addr-tpidr emulation）
+     新增 `TlsManager`，符号级 `__tls_get_addr` 替换仅作用于 soLoader 装载的 image。
+   - 已知局限（与 CSOLoader 同款语义，需在代码注释保留）：TPREL emulation 以发起线程的
+     块地址计算 tpoff，后续线程共用同一块；跨 image TLS 引用 v1 不支持（明确报错提示，
+     避免静默错误符号值）。模块 so 常驻场景下 unload 语义仅在 register/unregister
+     generation 翻转时生效。
 
 ## 本机 Android SDK 环境
 

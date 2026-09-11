@@ -7,8 +7,8 @@ android {
 
     defaultConfig {
         applicationId = "com.example.nathookdemo"
-        versionCode = 21
-        versionName = "1.10.0"
+        versionCode = 23
+        versionName = "1.12.0"
     }
 
     // Enable AIDL support

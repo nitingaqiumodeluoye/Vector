@@ -1,25 +1,18 @@
 package com.example.nathookdemo;
 
 /**
- * Thin JNI bridge into {@code libvector_nathook_demo.so}.
+ *记录桥接 stub，见 {@code NativeHookDemoModule}。
  *
- * <p>The static block is the module's native-load trigger: {@code System.loadLibrary} funnels
- * through {@code VectorModuleClassLoader.findLibrary()} (which answers with the STORED
- * {@code apk!/lib/<abi>/…} zip entry) into the linker {@code do_dlopen} hook, where Vector
- * resolves and runs {@code native_init} with the {@code NativeAPIEntries} pointer.</p>
- *
- * <p>The native entry reproduces rustFrida's {@code Jni.addr("RegisterNatives")} resolution
- * (JNI_GetCreatedJavaVMs → GetEnv → *env table[215]) and hooks it through Vector's hookFunc.
- * The module's own UI can install/remove the hook in its process; scoped target processes install
- * it from native_init during injection.</p>
+ * <p>2026-09-11 SoLoader 恢复：模块 native ELF 由 Vector daemon sealed SharedMemory +
+ * NativeAPI.loadNativeLibraries() 走 ElfLoader::LoadLibraryFd() 装载，native_init 在装载后
+ * 就完成 RegisterNatives hook 安装，本类不再作为 System.loadLibrary 触发器。
+ * start/stopRecording 两个 native 方法仅在未来 demo UI 手动开关时使用；由于 soLoader 的
+ * 匿名映射不注册进系统 dl 链，这两个 native 方法依赖进程侧 RegisterNatives 手动绑定，
+ * 直接调用将拋 UnsatisfiedLinkError（现有调用点均有兑顶）。</p>
  */
 public final class NativeBridge {
 
     private NativeBridge() {}
-
-    static {
-        System.loadLibrary("vector_nathook_demo");
-    }
 
     /** Installs the RegisterNatives hook and performs the one-time resolution (idempotent). */
     public static native boolean startRecording();

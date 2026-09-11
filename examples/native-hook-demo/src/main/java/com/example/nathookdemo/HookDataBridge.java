@@ -35,7 +35,16 @@ public final class HookDataBridge {
 
     private static final Handler sAsyncHandler;
     static {
-        System.loadLibrary("vector_nathook_demo");
+        // 2026-09-11 soLoader baseline: the module ELF is loaded by Vector's soLoader and the
+        // RegisterNatives hook is installed by native_init long before this class loads. The
+        // linker never sees the module library, so System.loadLibrary here cannot resolve it and
+        // would throw UnsatisfiedLinkError, failing <clinit> and every later callback. Guarded:
+        // this block no longer needs to load anything.
+        try {
+            System.loadLibrary("vector_nathook_demo");
+        } catch (Throwable t) {
+            Log.w(TAG, "System.loadLibrary unavailable under soLoader (hook handled by native_init): " + t);
+        }
         HandlerThread thread = new HandlerThread("HookReportThread");
         thread.start();
         sAsyncHandler = new Handler(thread.getLooper());

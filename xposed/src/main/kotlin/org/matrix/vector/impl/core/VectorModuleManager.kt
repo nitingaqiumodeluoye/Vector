@@ -32,9 +32,10 @@ import org.matrix.vector.nativebridge.NativeAPI
 object VectorModuleManager {
 
     private const val TAG = "VectorModuleManager"
-    // rawVector baseline: register native_init names, expose the module's native-library search
-    // path, and let the module invoke Android's linker through System.loadLibrary().
-    private const val USE_RAW_VECTOR_LINKER_NATIVE_LOADER = true
+    // 2026-09-11 用户通知恢复 soLoader：模块 native ELF 由 daemon sealed SharedMemory +
+    // NativeAPI.loadNativeLibraries() 走 ElfLoader::LoadLibraryFd() 自装链接。linker 直载分支
+    // （true）仅作诊断保留；xff T2 已验证 linker 路径会留 base.apk MAPS_FOREIGN 痕迹。
+    private const val USE_RAW_VECTOR_LINKER_NATIVE_LOADER = false
 
     private fun elapsedUs(startNs: Long): Long = (System.nanoTime() - startNs) / 1_000L
 
@@ -153,43 +154,9 @@ object VectorModuleManager {
             module.code.preLoadedNativeLibraries.forEach { memory ->
                 runCatching { memory.close() }
             }
-        } else {
-            val nativeNames =
-                module.code.moduleLibraryNames
-                    .map { "${module.packageName}!/${it}" }
-                    .toTypedArray()
-            val nativeImages = module.code.preLoadedNativeLibraries.toTypedArray()
-            if (nativeNames.isNotEmpty() || nativeImages.isNotEmpty()) {
-                nativeImages.forEachIndexed { index, memory ->
-                    traceNativeSharedMemory(
-                        module.packageName,
-                        module.code.moduleLibraryNames.getOrNull(index) ?: "<missing-name:$index>",
-                        memory,
-                    )
-                }
-                val loaded =
-                    runCatching {
-                            try {
-                                NativeAPI.loadNativeLibraries(nativeNames, nativeImages)
-                            } finally {
-                                nativeImages.forEach { it.close() }
-                            }
-                        }
-                        .getOrElse {
-                            Log.e(TAG, "Failed to load native libraries for ${module.packageName}", it)
-                            return false
-                        }
-                if (loaded.size != nativeNames.size || loaded.any { !it }) {
-                    Log.e(TAG, "One or more native libraries failed for ${module.packageName}")
-                    return false
-                }
-                Log.i(
-                    TAG,
-                    "Loaded native libraries for ${module.packageName}: " +
-                        nativeNames.indices.joinToString { index -> "${nativeNames[index]}=${loaded[index]}" },
-                )
-            }
         }
+        // NOTE: the soLoader native load moved into buildGeneration(), after loadApk() has created
+        // the module ClassLoader. See loadModuleNativeLibraries() for the rawVector timing reason.
 
         traceAnonymousExecMaps("renderModule:before-build", module.packageName)
         val (generation, entries) =
@@ -216,6 +183,54 @@ object VectorModuleManager {
 
         Log.d(TAG, "Rendered module ${module.packageName} successfully.")
         true
+    }
+
+    /**
+     * Loads a module's native ELF images through Vector's soLoader. The images' `native_init`
+     * entrypoints are NOT invoked here: they are deferred and fired later via
+     * [NativeAPI.firePendingNativeInits] from a module-class context, because under rawVector
+     * native_init resolved the module's own Java classes through the module ClassLoader (it ran
+     * on the module's own System.loadLibrary stack), while a direct call from this framework
+     * frame would make ART's FindClass resolve the framework.
+     *
+     * Returns false when a library fails to load, which fails the whole generation.
+     */
+    private fun loadModuleNativeLibraries(module: LoadedModule): Boolean {
+        val nativeNames =
+            module.code.moduleLibraryNames
+                .map { "${module.packageName}!/${it}" }
+                .toTypedArray()
+        val nativeImages = module.code.preLoadedNativeLibraries.toTypedArray()
+        if (nativeNames.isEmpty() && nativeImages.isEmpty()) return true
+        nativeImages.forEachIndexed { index, memory ->
+            traceNativeSharedMemory(
+                module.packageName,
+                module.code.moduleLibraryNames.getOrNull(index) ?: "<missing-name:$index>",
+                memory,
+            )
+        }
+        val loaded =
+            runCatching {
+                    try {
+                        NativeAPI.loadNativeLibraries(nativeNames, nativeImages)
+                    } finally {
+                        nativeImages.forEach { it.close() }
+                    }
+                }
+                .getOrElse {
+                    Log.e(TAG, "Failed to load native libraries for ${module.packageName}", it)
+                    return false
+                }
+        if (loaded.size != nativeNames.size || loaded.any { !it }) {
+            Log.e(TAG, "One or more native libraries failed for ${module.packageName}")
+            return false
+        }
+        Log.i(
+            TAG,
+            "Loaded native libraries for ${module.packageName}: " +
+                nativeNames.indices.joinToString { index -> "${nativeNames[index]}=${loaded[index]}" },
+        )
+        return true
     }
 
     // Publishes nothing, so a reload can fail before the old generation is touched.
@@ -275,10 +290,24 @@ object VectorModuleManager {
             // Create the isolated ClassLoader for the module
             val initLoader = WbModule::class.java.classLoader
             traceAnonymousExecMaps("renderApk:before", module.packageName)
+            // Append Vector's NativeInitFire carrier dex so the carrier class is defined by the
+            // MODULE ClassLoader itself: firePendingNativeInits binds and invokes its declared
+            // native method to give deferred native_init entrypoints the module FindClass context
+            // (rawVector semantics). If allocation fails, degrade to the framework-context
+            // fallback (carrierClass = null).
+            val carrierMemory = if (module.code.moduleLibraryNames.isNotEmpty()) {
+                NativeInitFireDex.newSharedMemory()
+            } else {
+                null
+            }
+            val moduleDexes = buildList {
+                addAll(module.code.preLoadedDexes)
+                carrierMemory?.let { add(it) }
+            }
             val moduleClassLoader =
                 VectorModuleClassLoader.loadApk(
                     module.apkPath,
-                    module.code.preLoadedDexes,
+                    moduleDexes,
                     librarySearchPath,
                     initLoader,
                     blockLegacyApi = module.code.targetApiVersion >= 102,
@@ -292,6 +321,45 @@ object VectorModuleManager {
             ) {
                 Log.e(TAG, "The Xposed API classes are compiled into ${module.packageName}")
                 return null
+            }
+
+            // Load the module's native ELF images (soLoader) and run its native_init after the
+            // module ClassLoader exists, so native_init's FindClass resolves the module's own Java
+            // classes. rawVector timing: the module itself dlopens its library from its Java code,
+            // so the call stack ClassLoader is the module's; here the module ClassLoader is set as
+            // the thread context ClassLoader around the call instead.
+            traceAnonymousExecMaps("loadModuleNativeLibraries:before", module.packageName)
+            if (!loadModuleNativeLibraries(module)) return null
+            traceAnonymousExecMaps("loadModuleNativeLibraries:after", module.packageName)
+
+            // Fire the deferred native_init entrypoints from a module-class context so that
+            // FindClass inside them resolves the module's own Java classes (rawVector timing:
+            // module classes are available by now; the entry classes below may not exist yet).
+            if (carrierMemory != null) {
+                Log.i(
+                    TAG,
+                    "Firing deferred native_init entrypoints for ${module.packageName}",
+                )
+                val carrierClass =
+                    runCatching { moduleClassLoader.loadClass(NativeInitFireDex.CLASS_NAME) }
+                        .onFailure { e ->
+                            Log.e(TAG, "Cannot load the NativeInitFire carrier class", e)
+                        }
+                        .getOrNull()
+                val fired = NativeAPI.firePendingNativeInits(carrierClass)
+                if (!fired) {
+                    Log.e(
+                        TAG,
+                        "Failed to fire deferred native_init entrypoints for ${module.packageName}",
+                    )
+                    return null
+                }
+            } else if (module.code.moduleLibraryNames.isNotEmpty()) {
+                Log.w(
+                    TAG,
+                    "Carrier dex unavailable for ${module.packageName}; native_init will stay " +
+                        "deferred until a module-class context is available",
+                )
             }
 
             // Create the Context that will be injected into the module

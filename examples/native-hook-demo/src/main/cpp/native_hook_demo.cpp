@@ -384,8 +384,14 @@ bool InitializeJavaReferences(JNIEnv *env) {
 
 // Get JNIEnv for current thread, attaching if necessary
 JNIEnv *GetJNIEnvForCallback() {
+    // rawVector get_or_init_vm semantics: bootstrap the JavaVM via libart's dynamic symbol
+    // table on the first use (g_vm is only set later by InitializeJavaReferences otherwise,
+    // which would make the very first native_init call fail with nullptr).
     if (g_vm == nullptr) {
-        return nullptr;
+        g_vm = GetJavaVm();
+        if (g_vm == nullptr) {
+            return nullptr;
+        }
     }
     
     JNIEnv *env = nullptr;
