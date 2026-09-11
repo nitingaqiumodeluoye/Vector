@@ -33,8 +33,14 @@ native method whose declaring class belongs to the module ClassLoader:
   `.../service/`). Those prefixes are rewritten to random same-length names in the framework dex,
   which would desynchronize the `NativeInitFireDex.CLASS_NAME` constant from the carrier dex. The
   carrier dex bytes themselves are embedded as base64 and are never rewritten.
-- `RegisterNatives` requires the method to be declared native ahead of time, and Android 11's JNI
-  `DefineClass` is unsupported — that is why the class is shipped as a prebuilt dex.
+- `RegisterNatives` requires the method to be declared native ahead of time, and ART's JNI
+  `DefineClass` is an unsupported stub — verified against the target platform (Android 12 /
+  SDK 31, `android12-release` `jni_internal.cc`: `LOG(WARNING) << "JNI DefineClass is not
+  supported"`) as well as the android11/13/14/15 branches. Even if it existed, `DefineClass`
+  would define the class into the *caller's* ClassLoader (the framework's), not the module's —
+  appending the prebuilt dex to the module ClassLoader's dex list is the only way to get the
+  declaring class owned by the module ClassLoader. That is why the class is shipped as a
+  prebuilt dex.
 
 ## Regenerating the dex
 
