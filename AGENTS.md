@@ -167,6 +167,24 @@ $env:ANDROID_SDK_ROOT = 'D:\sdk'
 
 不要仅因为 `ANDROID_HOME` / `ANDROID_SDK_ROOT` 为空就判定 Android SDK 不可用；应先检查 `D:\sdk`。
 
+## 源码修改与编译的准入约束
+
+1. **修改源码前必须先向用户提问并获准。**
+   - 任何涉及源码的修改（native/、xposed/、zygisk/、daemon/、manager/、legacy/、examples/、
+     构建脚本等）在动手前，必须先向用户提出修改方案（改什么、为什么、受哪些基准约束），
+     用户明确同意后才能执行。
+   - 禁止未经用户允许修改源码；包括“顺手修”“先斩后奏”“等最终验证再确认”等形式。
+   - 可以先做只读性操作（读代码、logcat、/proc、dmesg 等取证与分析），分析结论可直接
+     汇报给用户，但不构成修改授权。
+2. **未经允许不得启动编译/打包/安装/重启。**
+   - 不得自行触发 gradle 构建、产物打包、模块安装或设备重启。
+   - 只有用户明确要求构建、安装或“一条龙”验证时才允许执行；用户明确指定“仅编译”或
+     “不要安装/重启”时按其范围停住。
+3. **与“编译验证节奏/Vector 构建自动衔接”的关系。**
+   - 自动衔接规则仅在用户已明确获准的构建请求内生效：获准的流程从编译到验收连续跑完。
+   - 自动衔接不授权任何新的源码修改；如跑链路中发现需要新的源码改动，必须停下并重新
+     征求用户同意。
+
 ## 编译验证节奏
 
 ### Vector 构建自动衔接
@@ -223,6 +241,88 @@ NeoZygisk 日志中的 `is on the denylist` 只表示该进程会执行 denylist
 Vector 注入被跳过，也不得单独作为注入失败原因。排查注入失败时应继续查看后续模块加载日志，
 例如 `dlopen_ext`、Zygisk module ELF 读取、`preAppSpecialize`、`postAppSpecialize`、
 `VectorNative` 初始化和 framework dex 加载结果。
+
+## simpleperf 在目标设备上禁用
+
+在当前目标设备（alioth / M2012K11AC，运行 wxshadow KPM 的内核）上**禁止使用 simpleperf 采样**
+（无论系统级 `record -a` 还是进程级）：实测 2026-09-05 两次系统级采样
+（`simpleperf record -a -g -e cpu-clock -f 4000`）均在采样窗口内引发**设备自发重启**，且重启
+与 Vector 注入与否无关。该内核 + wxshadow KPM 组合对 perf_event/NMI 路径脆弱（与 rustFrida
+历史提交 0d9b7e3 临时禁用同页 LDR literal relocate 时代排查的重启问题同源）。
+
+1. 排查 CPU/卡顿问题时不得再尝试 simpleperf；也不要向 AGENTS 之外的文档推荐该工具。
+2. 替代手段：`/proc/<pid>/task/<tid>/stat` 的 utime/stime（用户态/内核态 CPU 占比）、
+   `/proc/<pid>/task/<tid>/syscall`、`wchan`、`/proc/<pid>/task/<tid>/stack`（root）、
+   ANR trace（`/data/anr/`）的 schedstat、MIUIScout HANG 日志。
+3. 若未来确需 perf，必须先在 wxshadow KPM 卸载/禁用状态下单独验证 perf_event 路径不再
+   引发重启，再考虑恢复使用。
+
+## xff/com.demo.addapp 启动卡顿根因（wxshadow shadow 页 read/exec 翻转风暴）
+
+### 结论（2026-09-05 锁定，铁证级）
+
+Vector 与 rustFrida **都会**让 com.xff.launch / com.demo.addapp 启动卡 ~10 秒，根因不是
+Vector 特有逻辑，而是「wxshadow patch libart 热桥 + GC 同步 hook」这一组合的固有缺陷，
+两者实现机制相同，因此症状一致。
+
+**卡点（xff 日志铁证，多次复现）：**
+```text
+16:50:38.594  Waiting for a blocking GC ObjectsAllocated
+16:50:48.691  WaitForGcToComplete blocked ObjectsAllocated on Background for 10.097s
+主线程 backtrace: handleStartActivity → callActivityOnStart →
+                   LayoutInflater.inflate / FinalizerReference.add / Reference.<init>
+```
+阻塞式 GC 10.1s 期间，连 libbacktrace 的 `UnwindThread` 都
+`BacktraceCurrent::UnwindThread: Timed out waiting for signal handler` 超时，说明进程在 GC
+窗口内几乎完全停滞。
+
+### 完整因果链（每步都有源码/dmesg 证据）
+
+1. rustFrida 或 Vector 用 `Java.setStealth(1)` / wxshadow 模式，把 libart 热桥
+   `quick_to_interpreter_bridge`（偏移 `...022320`）、`quick_resolution_trampoline`
+   （`...022070`）、DoCall/GC 层（`...be4c48/52bc/5ec8` 等）patch 成 **shadow 页（`--x`
+   可执行不可读）**。rustFrida 日志铁证：`ep=0x7888222320`、`artController 初始化完成:
+   Layer1=2, Layer2=4, GC=2, OatHeader=active, Fixup=active`。
+
+2. 两者都安装 **GC 同步 hook**（`art_controller.rs:771` 起：`GC CopyingPhase`、
+   `GC CollectGarbageInternal`、`GC RunFlipFunction`），回调 `on_gc_sync_leave/enter`
+   （`art_controller.rs:1585/1593`）在每次 GC 关键阶段调用 `synchronize_replacement_methods()`
+   （`art_controller.rs:1678`），遍历 replacement 方法的 `declaring_class_` / `access_flags_`
+   做同步。
+
+3. 这些 `read_volatile`/`write_volatile` 访问的原始 ArtMethod 位于被 shadow 化的 libart 页上
+   （`--x` 不可读），每次读触发 read fault → KPM 翻回 original（`r--`）；紧随其后的执行又触发
+   exec fault → 翻回 shadow（`--x`）。dmesg 铁证（同一热桥页 `7bcfa22000` 的紧密翻转循环）：
+   ```text
+   [1670.403744] read fault at 7bcfa22000 → original (r--)
+   [1670.403747] exec fault at 7bcfa22320 → shadow (--x)
+   [1670.403749] read fault at 7bcfa22000 → original (r--)
+   [1670.403751] exec fault at 7bcfa22320 → shadow (--x)   ← 间隔仅 3-4 微秒
+   ```
+
+4. 每次翻转都走 KPM `do_page_fault_before_impl`（`get_task_mm` + `spin_lock(global_lock)` +
+   链表扫描 `find_page` + `mmput`）。xff 启动进入 onStart 布局 inflate → 大量对象分配 →
+   触发 `ObjectsAllocated` 阻塞式 GC，GC 全局暂停窗口内的翻转风暴把一次本应 ~100ms 的 GC
+   拖慢到 10 秒。
+
+### 证据要点（勿再被如下错误理论误导）
+
+- **「rustFrida 用 stealth=0 / normal 所以不卡」是错的**：rustFrida 走 wxshadow 时同样
+  patch 了 `quick_to_interpreter_bridge` 且 `stealth=1`，地址/语义与 Vector 完全一致。
+  早期旧日志（rf_hook_trace.txt）显示的 stealth=0 是另一套（非 wxshadow）路径，不代表当前
+  rustFrida 的 wxshadow 行为。
+- **Vector 的 4942 万 minor fault（pid 10349，主线程 minflt=49429502、stime=14.88s）与
+  rustFrida 的 GC 阻塞 10s（pid 14158）是同一根因的两个表现**：前者卡在 splitPaths→stat()
+  的巨量 page touch，后者卡在 GC 的 shadow 页翻转；本质都是 shadow 页 r/x 翻转 + KPM 全局锁
+  放大。
+- **dmesg 翻转总数（仅 151 条）与「fault 风暴」不矛盾**：KPM 的 `handle_read_fault` /
+  `handle_exec_fault` 只在 `ret==0` 成功路径才打印日志，翻转风暴中被 KPM 快速处理/失败的
+  fault 不会全部落日志；真正的开销在 `do_page_fault_before_impl` 对**每一次** fault 的
+  get_task_mm + global_lock + list scan，而非日志条数。
+
+### 修复方向（治标 vs 治本，见下方专节）
+
+详见「wxshadow 启动卡顿：治标 vs 治本」一章。
 
 ## `bad ELF magic: 00000000` 处置
 
@@ -301,3 +401,74 @@ fork 时都要重新加载它一遍。Android 规定 `debuggable=true` 的 APK �
    ```
 4. 排查"宿主启动慢/注入后变卡"时，先检查所有已启用模块 APK 是否 debuggable
    （dumpsys 看 run-from-apk），再考虑 Vector 框架侧原因。
+
+## wxshadow 启动卡顿：治标 vs 治本
+
+> 背景见「xff/com.demo.addapp 启动卡顿根因」一章。这里是修复路径的决策说明，
+> 任何改动前必须先明确是走治标还是治本，两者目标、范围、风险完全不同。
+
+### 治标（降低翻转频率 / 减少 GC 同步触发）
+
+**思路**：不改变 wxshadow 的 shadow 页语义，而是减少「在 GC 密集窗口内触碰 shadow 页」的次数。
+
+具体手段（可叠加）：
+1. **减少 GC 同步时机**：不要在每次 GC CopyingPhase / CollectGarbageInternal 都调用
+   `synchronize_replacement_methods()`，只在 replacement 方法的 `declaring_class_`（GcRoot）
+   真正被移动时才同步。可用跟踪 GcRoot 哨兵替代全量遍历。
+2. **缩小 GC hook 覆盖**：只 hook 真正会移动对象的阶段（Copying / Compacting GC），
+   对非移动的 Sticky / Young GC 不装 on_leave 同步。
+3. **KPM 快速路径**：`do_page_fault_before_impl` 对非 shadow 页的 fault 立即返回
+   （当前每次 fault 都 get_task_mm + global_lock + list scan 后才判定），把单个 fault 的
+   固定开销降下来。这属于 KPM 侧，需 SSH 拉最新源再改。
+
+**特征**：
+- 保留 shadow 反检测（CRC/自校验读到原始字节）能力，不牺牲 stealth 语义。
+- 改动局部、风险低，但只能「减轻」卡顿（翻转次数下降，单次翻转开销仍在）。
+- 对 GC 密集的 app（xff 这种启动时大量 inflate + finalizer）只能缓解不能根治。
+
+### 治本（libart 热桥不走 shadow，消除 r/x 翻转本源）
+
+**思路**：让 ART 内部 **既要读又要执行** 的热桥（`quick_to_interpreter_bridge`、
+`quick_resolution_trampoline` 等）**不用 shadow patch，改用 normal patch（mprotect，页保持
+r-x 可读可执行）**，从而从源头消除 read/exec 翻转。
+
+具体手段：
+1. 对齐 rustFrida 源码里 `hot_shared_art_entries_enabled_by_default()` 的语义——它仅对
+   `stealth_mode()==Recomp` 启用热桥共享路由；非该模式下热桥不应被 eager shadow patch。
+2. Vector 侧 `CompleteInitializationImpl` 里 `EnsureInterpreterRouter` /
+   `InitializeSharedLibartRouter` 目前**无条件** patch `quick_to_interpreter_bridge` /
+   `quick_resolution_trampoline`，应加 `use_shared_jni_nterp_layer1 &&` 保护，让普通
+   replacement 不触碰全局热桥。
+3. 只对**被实际 hook 的业务方法**保留 shadow（反检测价值仍在），全局共享热桥走 normal。
+
+**特征**：
+- 从源头消除 GC/解释器读热桥时的 fault 翻转，GC 不再被拖慢 → **根治**卡顿。
+- 代价：热桥不再有 shadow 隐藏能力（`quick_to_interpreter_bridge` 的原始字节可被进程内
+  CRC/自校验读到真实值），对「检测 libart 热桥是否被篡改」的高级反检测**略降防护**。
+  但对多数场景（检测的是业务方法/自身 so，不检测 ART 热桥）无影响。
+- 改动涉及 ART router 语义，必须严格对照 rustFrida 的 stealth 判定逻辑，不得凭经验改。
+
+### 决策建议
+
+- **默认选治本**：卡顿是「热桥走 shadow」这一设计在 GC 密集场景的必然结果，治标只能缓解，
+  且每次只缓解一部分最终还是要回到治本。治本直接消除矛盾根源。
+- 改治本时，必须先读 rustFrida `art_controller.rs` 里 `stealth_mode()` /
+  `hot_shared_art_entries_enabled_by_default()` 的完整判定，确认哪些路径该走 normal、
+  哪些该走 shadow，再动手，避免把反检测语义一起破坏。
+- 若产品硬性要求热桥也必须 shadow（高级反检测），则只能走治标 + 接受 GC 密集 app 的残留卡顿。
+
+### 2026-09-11 决策（覆盖“默认选治本”）
+
+用户已选定**方案 B：严格对齐 rustFrida 现状**，且明确未授权修改源码：
+
+1. 热桥层（`quick_to_interpreter_bridge` / `quick_resolution_trampoline` / DoCall /
+   配置化共享 JNI·Nterp 路由 / GC·OAT 层）**维持 rustFrida 现行行为**：wxshadow 模式下
+   sflag=1（KPM shadow 页）。已逐行核实 rustFrida `prepare_hook_target`：`WxShadow => 1`。
+2. 应用（含管理器）启动的卡顿/ANR（主线程 99% kernel + 千万级 minor fault）是“热桥走
+   shadow”的已知固有缺陷，**按已知状态保留**，不再作为新缺陷排查为修复驱动。
+3. 此决策**冻结**“默认选治本”路径：后续会话不得因 AGENTS 早前“默认选治本”建议自行改热桥
+   stealth；任何 sul 法案及热桥 patch 策略的变动都必须先向用户提问获批（准入约束见
+   “源码修改与编译的准入约束”一章）。
+4. Vector 已对齐、不回退的 lean 收口仍维持：`UseSharedJniNterpLayer1()`（auto 全跳过）与
+   `InitializeBootstrapImpl` 的 deferred（等价 lean preinit）。
+
