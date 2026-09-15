@@ -154,6 +154,44 @@ Vector 的整体运行流程与 hook 实现分别使用两套已验证源码作�
      避免静默错误符号值）。模块 so 常驻场景下 unload 语义仅在 register/unregister
      generation 翻转时生效。
 
+## 编写 native 模块的硬约束
+
+**每次新建或修改模块（`examples/`、用户模块、任何带 `native_init.list` 的 APK）都必须遵守。**
+完整原理、可照抄骨架与排障依据见 `docs/native-module-guide.md`，本节只列无条件生效的铁律。
+
+1. **禁止 `System.loadLibrary()` / `System.load()` / APK zip entry 直载 linker。** 模块 so 只能
+   由 daemon sealed SharedMemory + `NativeAPI.loadNativeLibraries()` →
+   `ElfLoader::LoadLibraryFd()` 装载；`VectorModuleClassLoader.findLibrary` 在 soLoader 模式下
+   故意跳过 `apk!/lib/<abi>/*.so`。模块 Java 声明的 `native` 方法没有自动绑定来源，要么在
+   `native_init` 里 `RegisterNatives`，要么当可选入口并兜底 `UnsatisfiedLinkError`。
+2. **模块 so 必须导出 `native_init(NativeAPIEntries*)`，且返回非 null 的库加载回调。**
+   符号名固定为 `native_init`；`JNI_OnLoad` **不会被调用**（soLoader 只跑 `DT_INIT`/
+   `init_array`），不得依赖它，也不得用它获取 `JavaVM*`。
+3. **`JavaVM*` 只能从 libart `.dynsym` 解析 `JNI_GetCreatedJavaVMs` 自举**（对齐 rustFrida
+   `get_or_init_vm`），并在首次使用时 lazy 初始化；首次 `native_init` 里
+   `env->GetJavaVM()` 不可靠。
+4. **`FindClass` 只在 `native_init` 内经载体 trampoline 可靠解析模块自身类**；不得依赖
+   `Thread.contextClassLoader`（ART 的 JNI `FindClass` 不读它）。载体
+   （`org.matrix.vector.nativeload.NativeInitFire`）由框架内建，模块无需实现，但要容忍
+   `Carrier dex unavailable` 的框架上下文降级。
+5. **inline hook 只能使用 `entries->hookFunc` / `entries->unhookFunc`**（Vector wxshadow
+   engine）。禁止 Dobby、mprotect fallback 或任何第二套 inline hook。
+6. **replacement 的签名/ABI 必须与被 hook 函数一致**，属裸替换语义；原调用走 `backup`
+   trampoline（`hookFunc` 返回 0 且 `backup != nullptr` 才算成功）。
+7. **`scope.list` 仅在 `module.prop` 含 `staticScope=true` 时生效**；要让模块自身 App 进程
+   被注入，必须在 scope 中显式包含自身包名（`staticScope=true` + `scope.list`，或管理器/
+   `cli scope` 手动添加）。scope 不含自身包名时 `RequestAppBinder` 返回 none、
+   `Not injecting ...: the daemon has no binder for it.` 是设计行为，不是 bug。
+8. **`native_init.list` / `assets/native_init` 只接受 `lib/arm64-v8a/<纯文件名>.so`**：文件名
+   必须 `.so` 结尾、不得含 `/` 或 `\`，且 soLoader 目前只支持 arm64-v8a。
+9. **模块 APK 必须 release（非 debuggable）+ debug 签名**，且 release 前先 bump
+   `versionCode`/`versionName`（见《版本号更新规则》与《模块 APK 必须使用非 debuggable 构建》）。
+10. **改完必须按验收日志串自检**：`Loaded native libraries for ...`、
+    `Firing deferred native_init entrypoints for ...`、`FirePendingNativeInits: pending_count=`、
+    `registered library-load callback`。缺 `registered library-load callback` 优先查
+    `native_init` 是否返回 nullptr 或 `native_init.list` 名称不匹配。禁止用脚本主动启动目标
+    App 采集这些日志（见《安装重启后的启动约束》）。
+
 ## 本机 Android SDK 环境
 
 本机存在可用 Android SDK：`D:\sdk`。
@@ -235,6 +273,114 @@ $env:ANDROID_SDK_ROOT = 'D:\sdk'
 3. 管理器可正常被 Vector 拉起并完成连接/显示已激活状态；如果管理器未自动出现，必须通过 Vector 支持的启动入口触发后再确认。
 4. 若状态为 `unknown`，继续执行上一节规定的“确认状态 -> 卸载 -> 安装 -> 重启”循环；在状态恢复为非 `unknown` 前不得进入原因分析，也不得宣称修复完成。
 5. 最终汇报必须分别记录：构建版本、安装结果、重启后状态、ART hook 证据和管理器激活证据。
+
+## 每次重装必须先验证 Vector 激活状态（硬性前置）
+
+**任何验收、压测、崩溃统计、日志取证之前，必须先确认 Vector 已真正注入目标进程。**
+激活未确认时得到的“零崩溃 / 零 ANR”一律视为**假阴性**，数据作废、必须重跑
+（实测教训：曾出现 4 轮“零崩溃”，实为 `vectord` 注入失败进入重启循环、模块压根没注入，
+被测代码一行没跑）。
+
+### 激活判据（按顺序，缺一不可）
+
+1. **注入链进程在**：`ps -A -o PID,NAME | grep -iE 'zygisk|vectord|apd'` 应含
+   `zygisk-ptrace64`、`zygiskd64`、`vectord`。
+2. **无注入失败循环**：logcat 中 `VectorDaemon: Failed to inject VectorService into
+   system_server` / `System Server died` / `Restarting system_server` 必须为 0；
+   出现任一即说明已进入重启循环，全机不再注入。
+3. **目标进程内有本模块日志**：`VectorNative`、`startup-trace`（信号层另有 `WxShadow`）。
+4. **有 hook 装上的证据**：如 duckusb 的
+   `Settings spoof: hooks installed=4 detail: Global.getInt/3=1 …`。
+5. **禁止**用 `/proc/<pid>/maps` 是否含 `zygisk_vector` 作判据：本模块用 CustomLinker
+   匿名映射，linker 无 soinfo，正常激活时也查不到。
+
+### 已知会破坏激活的两类原因与处置
+
+- **代码侧（改动了 dispatch 依赖的 `HookContext::x[0]` 语义）**：
+  router prologue 把帧槽 SP+0 从“被 hook 的原方法”换成 replacement 后，`ctx->x[0]` 随之改变，
+  托管路由失效 → `vectord` 报 `Failed to inject VectorService into system_server` 并重启
+  system_server 循环。**帧槽要改，只能改帧内存（走栈可见的那 8 字节），`ctx->x[0]` 必须
+  保持“被 hook 的原方法”语义**（对照 `vector_art_hook.cpp::OnDoCallEnter`：inline 引擎里
+  ctx 本身就是帧，故两者天然统一）。
+- **设备侧（加载器登记表陈旧/残缺）**：连续多次 `installApatchAndRebootRelease` 可能让 Zygisk
+  加载器登记表变旧：实测 `/data/adb/zygisksu/modules_info` 记录的 `.so` size 与实际文件不符
+  （1511424 vs 1557872）、条目缺失，后果是全系统 0 条 Vector 日志。
+  **❌ 绝对不要删除 `/data/adb/zygisksu/modules_info*`**：那是 NeoZygisk（id=zygisksu）
+  自己的模块登记表，实测删除后它**不会被重建**，且进入“无模块可加载”的死胡同——
+  症状是全模块（含未修改的 `zygisk_propmask`/`tricky_store`）的 helper 进程
+  （`zygiskd64-<module>`）全部消失，**与代码无关**。
+  **✅ 正确处置**：在 APatch 管理器里对模块做一次重新安装/重新启用，
+  让 NeoZygisk 自己重建登记表；或重新跑模块安装流程（`installApatchAndRebootRelease`）。
+  判定“加载器整体挂了还是只有我方模块挂了”：看 helper 进程
+  `ps -A -o PID,NAME | grep zygiskd64-`，若有其它模块的 helper 而只有 vector 缺失，
+  才可能是代码问题；全部缺失则是加载器/登记表层级问题。
+  另外：`APatchD : apd::cli: command: Module { command: List }` 每 3 秒一次只是管理器
+  轮询列表，**不是失败重试循环**，不得当作故障证据。
+  结论：**同一 boot 周期内不要多次重装。**
+
+### 汇报要求
+
+汇报“已激活”时，必须同时给出：注入链进程、上述 4 条日志判据的**实测条数**，
+以及本轮所用构建产物路径/时间戳；未给判据数字的“已激活”不算确认。
+
+## 帧槽铁律：`HookContext::x[0]` 禁止在 pass-through 路径改写（zygote 崩因，2026-09-15 实测）
+
+**背景（一次真实事故）**：为消除走栈崩溃，曾在 `vector_art_hook.cpp::OnDoCallEnter`
+的三条提前返回路径上改写 `ctx->x[0]`（`!replacement` 写 0；`orig_bypass_consume_current_thread`
+与 `!ShouldReplaceForManagedStack` 写 replacement）。结果：**zygote 崩溃** → NeoZygisk 反复重启
+zygote → **所有应用都拿不到模块**（表现为“未激活”：0 条 `VectorNative`、无 `zygiskd64-<模块>`
+helper、`modules_info` 不重建）。已全部撤销。
+
+**机制（必须记住）**：`emit_save_hook_context`（`hook_engine_inline.c:51`）建的 `HookContext`
+就是一块 ART `SaveRefsAndArgs` 形状的帧：
+
+```
+sub sp, sp, #352
+stp x0,x1 -> [sp,#0]      ← SP+0 同时是：ART StackVisitor 读的“帧方法槽” + 保存的 x0
+… x0..x30 @ SP+0..240, sp@248, pc@256, nzcv@264, trampoline@272, d0-d7@280, intercept_leave@344
+```
+
+一个内存字承担两个角色：**ART 的方法槽** 与 **原函数执行时必须为 ArtMethod 的 x0**。
+pass-through / `$orig` 直通 / miss 的语义是“继续执行原函数”，此时 `x0` 必须还是原 ArtMethod；
+改它就是给原函数送 NULL 或 malloc 假方法 → 立即崩（zygote 第一个中招）。
+
+**对齐依据（rustFrida `art_controller.rs::on_do_call_enter`，已逐行核实）**：rustFrida 在
+`hook_managed_reentry_guard_active` / `orig_bypass_consume_current_thread` / `callOriginal bypass` /
+`!should_replace_for_stack` / `!replacement` **五条路径全部不改 `ctx.x[0]`**，
+只有“真正替换”那条走到底才写 `ctx.x[0] = replacement; ctx.intercept_leave = 1`。
+因此：**任何在此处“为了走栈安全”而改写 x[0] 的做法都是自创、且必然崩**；要走栈安全只能改
+帧布局（把方法槽与保存的 x0 分开）或走被动修复层。
+
+**诊断口诀**：模块整体不加载（无 helper、无 `VectorNative`）时，**先查 zygote 是否在崩**：
+logcat/`logcat.last` 里的 `zygiskd64: zygiskd::zygiskd: Zygote restarted, cleaning up companion sockets`
+或用户侧 “zygote crashed”。**不要**先怀疑加载器/登记表/NeoZygisk。
+
+## 对齐差距表：rustFrida 走栈防护 8 层 vs Vector 现状（2026-09-15 核对）
+
+rustFrida 自述（`art_controller.rs:1042` 初始化日志）分层：
+`Layer1, Layer2, GC, OatHeader, Fixup, PrettyMethod, DecodeGcMasks, InlinePatch`。
+
+| 层 | Vector 现状 | 说明 |
+| --- | --- | --- |
+| Layer1 / Layer2 | ✅ 已对齐 | 共享 JNI/Nterp 路由 |
+| GC | ✅ | `OnGcSyncEnter/OnGcSyncLeave` |
+| OatHeader | ✅ | `OnGetOatQuickMethodHeader`（`vector_art_hook.cpp:1219+`） |
+| **Fixup** | ✅ **与 rf lean 模式一致 → 不加** | rustFrida 的 Fixup/GC/OAT 同属 `skip_global_sync_hooks`，**精简预装（lean preinit）模式会整体跳过**（`art_controller.rs:784`：“精简预装模式也跳过「全局同步 hook」(GC/OAT/FixupStaticTrampolines)”）；Vector 已对齐 lean 收口。
+另 Vector `hook_engine` 已有注释说明排除理由：ClassLinker fixup 在持锁期，“doing replacement writes and icache maintenance there can block dex registration and the next GC checkpoint”。**结论：不加** |
+| PrettyMethod | ✅ **与 rf 一致（禁止移植）** | rustFrida 该 hook 代码存在但**用 `if false &&` 永久禁用**（`art_controller.rs:988-990`，注释：*"PrettyMethod can run from ART/JD crash and signal paths. Routing it through our hook pool can leave a thread unsuspendable if a signal handler blocks there"*）→ 它改靠 OatHeader + InlinePatch 从源头避免走到 FATAL。**不得拿 tombstone_09 去 hook PrettyMethod** |
+| DecodeGcMasks | ✅ 已移植 | 本轮 `OnDecodeGcMasksOnlyEnter` + `g_dummy_oat_header` |
+| **InlinePatch** | ✅ **已修（2026-09-15）** | rustFrida：`hook_patch_inlined_oat_header_checks(bridge.get_oat_quick_method_header)`（`art_controller.rs:1022-1029`），**无条件调用**（在 lean 门控之外）。
+Vector 原本已调用但条件是 `oat_header_ready`（= `g_is_system_process && InitializeOatHeaderLayer()`）→ **app 进程内联点未打补丁**（= tombstone_09 崩在 hunter app 进程的根因）。
+现改为与 rf 一致：不论进程，只要能解析 `GetOatQuickMethodHeader` 本体地址就打补丁；验收日志 `WxShadow ART inlined OAT header patch ready: count=N exclude=0x…` |
+
+**tombstone_09 族根因（与 rustFrida 同源）**：inline thunk 的 **wrap 路径**（`on_leave != NULL`，
+Java hook 默认）不 tail-jump，`BLR` 原函数返回后执行 `str x0,[sp,#0]`（把**返回值**写回
+`HookContext` 偏移 0）——而它就是 ART 的方法槽 → 走栈时拿到“返回值当方法” → `GetOatQuickMethodHeader`
+失败 → FATAL 分支 → 拼 `PrettyMethod()` 时对 NULL DexFile 取址 SEGV。rustFrida 有**同一句代码**，
+它的对策不是改这句，而是上面那两层防护（InlinePatch 源头拦截 + OatHeader/DecodeGcMasks 被动修复）。
+
+**后续动作（按对齐优先）**：① **接入 InlinePatch**：在 Vector 初始化里调用 oat patch 的安装函数（对照 rustFrida `hook_patch_inlined_oat_header_checks(bridge.get_oat_quick_method_header)`，传 `GetOatQuickMethodHeader` 本体地址）——这是消除 tombstone_09 族的**对齐手段**；
+② 核对 Fixup 层（GC hook 是否覆盖 `FixupStaticTrampolines`）；③ **不要** hook PrettyMethod（rustFrida 已验证会因信号/崩溃路径不可挂起而用 `if false &&` 禁用）。
 
 ## NeoZygisk denylist 日志判读
 
@@ -371,6 +517,43 @@ dlopen_ext ... /memfd:wwb_so (deleted) ... has bad ELF magic: 00000000
 禁止 Codex 主动启动任何目标或普通 App（包括 `am start`、`monkey`、点击启动入口或其它等效操作）。
 需要采集普通 App 的启动日志时，必须等待用户手动启动目标 App 后再读取最新日志。安装重启验证完成后，
 应向用户报告构建版本、安装结果和设备状态，不得顺带启动其它 App。
+
+## 验证纪律：Vector 侧验收禁止同时挂 rustFrida 脚本
+
+当验证目标是 **Vector 框架或 Vector 模块（如 `examples/duckusb`）的等效逻辑**时，
+**不得在同一轮同时注入 rustFrida 脚本**（`rfclient -l xxx.js`）。
+
+实证教训（2026-09-14）：duckusb 的 FLAG_DEBUGGABLE 清位实现有缺陷
+（日志 `DuckUSB: debuggable spoof: ContextImpl not found`，hook 根本没装上），但同轮
+rustFrida 脚本的 `[DBG-FLAG]` 把位清了，xff `jdwp-verdict` 照样 SAFE ——
+**脚本掩盖了模块 bug**，“验证通过”是假的。
+
+规则：
+
+1. 验证模块等效性 = 纯 Vector + 模块 + KPM 链路：不 spawn、不 attach、不挂脚本。
+2. 目标 App 由用户手动启动（见《安装重启后的启动约束》），日志只看模块自身 TAG
+   （如 `DuckUSB`）与检测器 TAG（如 `AdbDbgProp` 的 `jdwp-verdict`/`adbd-runtime`）。
+3. 每条判据必须能指回**模块自己的日志行**（如
+   `debuggableSpoof[...] flags 0x…46 → 0x…44`），而不是脚本的 SPOOF/DBG 行。
+4. rustFrida 脚本只用于：建立对照基准、或模块尚未实现该能力时的临时兜底；
+   一旦宣称“等效已实现”，验收轮必须剥离脚本重新跑。
+
+## 模块 APK 更新无需重启手机（仅 Vector 框架需要）
+
+Vector 框架本体（zygisk / daemon / xposed 框架 jar / native core）更新后才需要重启手机；
+**模块 APK（`examples/*`、被注入的宿主模块）更新不需要重启手机**，也不需要软重启：
+
+1. Vector 的模块注入是**按进程 fork 时加载**：模块 APK 的新 dex/so 只会在下一次该 app
+   进程被 fork 时生效。装完模块 APK 后，只需 **force-stop 目标 app（或重新打开它）**，
+   新版本就生效。
+2. 框架侧（daemon / 管理器）会在模块 APK 更新后自动重扫模块目录，不需要重启
+   Vector 或系统。
+3. 例外：改了框架侧机制（如 daemon 的模块发现、soLoader、native_init 装载、管理器
+   binder 时序、scope 解析逻辑）时，才需要重启手机——那是框架更新，不是模块更新。
+
+实操判据：本轮构建产物是**模块 APK**（如 `examples/duckusb`），装完只需 force-stop
+目标 app；本轮构建产物是 **Vector 框架包**（`zygisk_vector` 模块 zip），必须走
+「安装 + 重启手机 + 状态验收」全套流程。
 
 ## 模块 APK 必须使用非 debuggable 构建（release + debug 签名）
 
