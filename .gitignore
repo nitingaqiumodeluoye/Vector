@@ -19,6 +19,12 @@ bin/
 # Local one-dragon build logs (build_<code>.log output of gradle.zipRelease).
 /build_*.log
 
+# Local gradle build/deploy logs written by ad-hoc runs (buildV.log, deployP.log, install.log…).
+/*.log
+# One-shot investigation scratch (logcat/tombstone/rf-gate captures, probe dumps, pid files).
+/.tmp*
+/.build*.pid
+
 # Local hooking/debug diagnostic artifacts (hunter logcat/dmesg dumps).
 /artifacts/
 
