@@ -12,8 +12,23 @@
 #define NATIVE_FAKE_OAT_PREFIX_SIZE (NATIVE_FAKE_CODEINFO_BYTES + 4)
 #define NATIVE_HOOK_CONTEXT_FRAME_SIZE 352
 #define NATIVE_STACK_METHOD_SLOT_SIZE 16
+#define NATIVE_HOOK_CONTEXT_FRAME_SIZE 352
 #define NATIVE_TOTAL_FRAME_SIZE (NATIVE_STACK_METHOD_SLOT_SIZE + NATIVE_HOOK_CONTEXT_FRAME_SIZE)
-#define NATIVE_FAKE_PACKED_FRAME_SIZE (NATIVE_HOOK_CONTEXT_FRAME_SIZE / 16)
+/*
+ * ART 的约定：方法槽算在帧内。实测 libart 自己的 JNI 帧构建代码
+ *   art_quick_generic_jni_trampoline: sub sp,sp,#0xe0 ; str x0,[sp]
+ * 即 224 字节帧里 [sp+0] 就是 ArtMethod，packed_frame_size = 224/16 = 14。
+ *
+ * 本 thunk 的帧同样是「[SP+0] = 替换 ArtMethod，随后是 HookContext」，总共 368 字节，
+ * 所以必须声明 368/16 = 23。之前写成 352/16 = 22（把方法槽排除在外），ART 走栈时
+ * 从本帧只前进 352，比真实帧顶少 16 字节，于是把错位处的数据当成 ArtMethod* 解引用：
+ *   #00 art::ArtMethod::PrettyMethod+80
+ *   #01 art::ArtMethod::GetOatQuickMethodHeader+792
+ *   #02 art::StackVisitor::WalkStack<1>
+ *   #03 art::Thread::VisitRoots   ← ConcurrentCopying ThreadFlipVisitor
+ * 即 hunter 里反复出现的 SI_USER SIGSEGV。
+ */
+#define NATIVE_FAKE_PACKED_FRAME_SIZE (NATIVE_TOTAL_FRAME_SIZE / 16)
 
 static void encode_native_fake_codeinfo(uint8_t buf[NATIVE_FAKE_CODEINFO_BYTES],
                                         uint32_t code_size, uint32_t frame_packed) {

@@ -43,6 +43,11 @@ struct MethodState {
     bool owns_router_hook = false;
     bool native_entry_hook = false;
     bool native_entry_installed = false;
+    // rustFrida callback/registry.rs:112 native_entry_critical —— 原生入口使用
+    // @CriticalNative ABI：x0+ 直接是 Java 基本类型参数，没有 JNIEnv*/jclass。
+    // 安装期由 access_flags & kAccCriticalNative 结合签名可支持性判定（对齐
+    // rustFrida install.rs:311-314 的 is_critical_native）。
+    bool native_entry_critical = false;
     // rustFrida's normal Java hook path may temporarily downgrade an
     // unclassified libart shared entry to quick_to_interpreter_bridge.
     // Cleanup restores the original ArtMethod entry_point_.
@@ -89,6 +94,16 @@ bool Activate(MethodState &state);
 /** Invoke the cloned original ArtMethod through JNI Call*MethodA. */
 jobject InvokeOriginal(JNIEnv *env, const MethodState &state, jobject receiver,
                        jobjectArray args);
+
+/**
+ * rustFrida callback/hook.rs 把 HookContext* 绑定到回调对象（atoms.hook_ctx_ptr），
+ * 使 $orig() 能用「进入时的原始寄存器」直调 trampoline，而不是经 JNI 重入
+ * ArtMethod（original_call.rs:1137）。Vector 的 hooker 是 Java 侧对象，故改为
+ * 把当前 dispatch 帧压入线程本地栈，供 InvokeOriginal 查询同一 target 的 ctx。
+ */
+void PushDispatchFrame(jmethodID target, HookContext *ctx, jobjectArray values);
+void PopDispatchFrame(jmethodID target);
+bool LookupDispatchFrame(jmethodID target, HookContext **ctx, jobjectArray *values);
 
 /** Deoptimize one method through ART instrumentation when its symbols are available. */
 bool Deoptimize(JNIEnv *env, const MethodState &state);

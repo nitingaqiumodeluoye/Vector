@@ -121,4 +121,16 @@ inline bool RegisterNativeMethodsInternal(JNIEnv *env, std::string_view class_na
     RegisterNativeMethodsInternal(env, GetNativeBridgeSignature() + #class_name, gMethods,         \
                                   ArraySize(gMethods))
 
+/**
+ * @brief Populate the ART dispatch class cache from a clean bootstrap stack.
+ *
+ * `HookBridge.initializeArtBootstrap` / `completeArtBootstrap` do this on the
+ * JNI path, but the native pre-attach bootstrap path (zygisk `postAppSpecialize`)
+ * never calls either, leaving the hot-path class cache empty. Call this from
+ * `postAppSpecialize` before handing control to the Java framework.
+ *
+ * @param env The JNIEnv of the specializing thread.
+ */
+void PrimeDispatchClassCache(JNIEnv *env);
+
 }  // namespace vector::native::jni

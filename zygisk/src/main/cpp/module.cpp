@@ -606,6 +606,11 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     // controller is installed after attach returns.
     const bool use_art_bootstrap = true;
     LOGI("App process selected: using WxShadow pre-attach bootstrap");
+    // 该路径不经过任何 JNI 方法，HookBridge.initializeArtBootstrap/completeArtBootstrap
+    // 都不会被执行，dispatch 热路径的类缓存会永远为空（管理器进程因此每个 dispatch 都
+    // 跳过，LoadedApk.getClassLoader() 返回 null 导致宿主 makeApplication 抛 NPE）。
+    // 这里在栈仍然干净的 pre-attach 阶段先把缓存与 JavaVM 补齐。
+    jni::PrimeDispatchClassCache(env_);
     // Initialize JNI hooks via the native library.
     stage_start = std::chrono::steady_clock::now();
     this->InitHooks(env_);

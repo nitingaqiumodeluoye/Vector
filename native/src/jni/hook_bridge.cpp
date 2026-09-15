@@ -376,24 +376,146 @@ namespace {
 using vector::native::art::MethodState;
 using vector::native::art::ValueKind;
 
+// 层 3（对齐 rustFrida）：dispatch 热路径禁止调用 FindClass。
+// FindClass 需要「当前方法所属 ClassLoader」，ART 会走
+// Thread::GetCurrentMethod() → StackVisitor::WalkStack 沿栈向下遍历；而 dispatch
+// 期间栈上存在 art_router 合成帧（hook_engine_art.c 的伪 OAT thunk），WalkStack
+// 一旦读到 entrypoint 为空的 quick frame 就命中 stack.cc:834 /
+// art_method.cc:549 的 CHECK(existing_entry_point != nullptr) → Runtime abort
+// （无 tombstone，只有 logcat 的 F 行，栈为 FindClass→GetCurrentMethod→WalkStack）。
+// rustFrida 的中间表示把参数直接 marshal 成 JS 值、热路径完全不碰 FindClass；
+// 这里取等价做法：bootstrap 期把用到的类缓存成 global ref，热路径只读缓存。
+// 缓存缺失时 dispatch 直接 skip —— 绝不在热路径 FindClass 兜底。
+static constexpr size_t kDispatchClassCacheSlots = 10;
+
+static std::atomic<jclass> g_box_class_cache[kDispatchClassCacheSlots];
+static std::atomic<jclass> g_object_class_cache{nullptr};
+static std::atomic<jclass> g_number_class_cache{nullptr};
+// 装箱/拆箱用的 jmethodID 也在 bootstrap 期解析并缓存：热路径上每次 dispatch 都要
+// 对每个参数做一次 valueOf/xxxValue，逐次 GetStaticMethodID/GetMethodID 是纯开销。
+// （这两个查找都不需要调用方的 class loader，因此不会触发 ART 栈遍历，可在热路径
+// 安全用作缓存未命中时的兜底。）
+static std::atomic<jmethodID> g_box_value_of_cache[kDispatchClassCacheSlots];
+static std::atomic<jmethodID> g_box_unbox_cache[kDispatchClassCacheSlots];
+
+static jclass ResolveAndPinClass(JNIEnv *env, const char *name) {
+    jclass local = env->FindClass(name);
+    if (!local) {
+        env->ExceptionClear();
+        return nullptr;
+    }
+    auto global = static_cast<jclass>(env->NewGlobalRef(local));
+    env->DeleteLocalRef(local);
+    return global;
+}
+
+// 仅在 bootstrap（栈干净、无合成帧）阶段调用。
+static void CacheDispatchClasses(JNIEnv *env) {
+    if (!env) return;
+    static const char *const kBoxNames[kDispatchClassCacheSlots] = {
+        nullptr,           "java/lang/Boolean", "java/lang/Byte",  "java/lang/Character",
+        "java/lang/Short", "java/lang/Integer", "java/lang/Long",  "java/lang/Float",
+        "java/lang/Double", nullptr,
+    };
+    static const char *const kValueOfSigs[kDispatchClassCacheSlots] = {
+        nullptr,
+        "(Z)Ljava/lang/Boolean;",
+        "(B)Ljava/lang/Byte;",
+        "(C)Ljava/lang/Character;",
+        "(S)Ljava/lang/Short;",
+        "(I)Ljava/lang/Integer;",
+        "(J)Ljava/lang/Long;",
+        "(F)Ljava/lang/Float;",
+        "(D)Ljava/lang/Double;",
+        nullptr,
+    };
+    static const char *const kUnboxNames[kDispatchClassCacheSlots] = {
+        nullptr, "booleanValue", "byteValue", "charValue", "shortValue",
+        "intValue", "longValue", "floatValue", "doubleValue", nullptr,
+    };
+    static const char *const kUnboxSigs[kDispatchClassCacheSlots] = {
+        nullptr, "()Z", "()B", "()C", "()S", "()I", "()J", "()F", "()D", nullptr,
+    };
+    if (g_object_class_cache.load(std::memory_order_acquire) == nullptr) {
+        g_object_class_cache.store(ResolveAndPinClass(env, "java/lang/Object"),
+                                   std::memory_order_release);
+    }
+    if (g_number_class_cache.load(std::memory_order_acquire) == nullptr) {
+        g_number_class_cache.store(ResolveAndPinClass(env, "java/lang/Number"),
+                                   std::memory_order_release);
+    }
+    for (size_t i = 0; i < kDispatchClassCacheSlots; ++i) {
+        if (!kBoxNames[i] || g_box_class_cache[i].load(std::memory_order_acquire)) continue;
+        g_box_class_cache[i].store(ResolveAndPinClass(env, kBoxNames[i]),
+                                   std::memory_order_release);
+    }
+    // valueOf 在 box 类上解析，拆箱方法在 box 类（Boolean/Character）或 Number 上解析。
+    const jclass number_class = g_number_class_cache.load(std::memory_order_acquire);
+    for (size_t i = 0; i < kDispatchClassCacheSlots; ++i) {
+        if (!kValueOfSigs[i]) continue;
+        const jclass box_class = g_box_class_cache[i].load(std::memory_order_acquire);
+        if (!box_class) continue;
+        if (g_box_value_of_cache[i].load(std::memory_order_acquire) == nullptr) {
+            jmethodID mid = env->GetStaticMethodID(box_class, "valueOf", kValueOfSigs[i]);
+            if (mid == nullptr) {
+                env->ExceptionClear();
+            } else {
+                g_box_value_of_cache[i].store(mid, std::memory_order_release);
+            }
+        }
+        if (g_box_unbox_cache[i].load(std::memory_order_acquire) == nullptr) {
+            const jclass owner =
+                (i == static_cast<size_t>(ValueKind::Boolean) ||
+                 i == static_cast<size_t>(ValueKind::Char))
+                    ? box_class
+                    : number_class;
+            if (owner) {
+                jmethodID mid = env->GetMethodID(owner, kUnboxNames[i], kUnboxSigs[i]);
+                if (mid == nullptr) {
+                    env->ExceptionClear();
+                } else {
+                    g_box_unbox_cache[i].store(mid, std::memory_order_release);
+                }
+            }
+        }
+    }
+}
+
+// 热路径只读缓存；返回的 global ref 不得 DeleteLocalRef。
+static jclass CachedBoxClass(ValueKind kind) {
+    const auto index = static_cast<size_t>(kind);
+    if (index >= kDispatchClassCacheSlots) return nullptr;
+    return g_box_class_cache[index].load(std::memory_order_acquire);
+}
+
 static jobject BoxCallbackValue(JNIEnv *env, ValueKind kind, uint64_t raw, uint64_t fp_raw) {
-    const char *clazz_name = nullptr;
     const char *sig = nullptr;
     switch (kind) {
-    case ValueKind::Boolean: clazz_name = "java/lang/Boolean"; sig = "(Z)Ljava/lang/Boolean;"; break;
-    case ValueKind::Byte: clazz_name = "java/lang/Byte"; sig = "(B)Ljava/lang/Byte;"; break;
-    case ValueKind::Char: clazz_name = "java/lang/Character"; sig = "(C)Ljava/lang/Character;"; break;
-    case ValueKind::Short: clazz_name = "java/lang/Short"; sig = "(S)Ljava/lang/Short;"; break;
-    case ValueKind::Int: clazz_name = "java/lang/Integer"; sig = "(I)Ljava/lang/Integer;"; break;
-    case ValueKind::Long: clazz_name = "java/lang/Long"; sig = "(J)Ljava/lang/Long;"; break;
-    case ValueKind::Float: clazz_name = "java/lang/Float"; sig = "(F)Ljava/lang/Float;"; break;
-    case ValueKind::Double: clazz_name = "java/lang/Double"; sig = "(D)Ljava/lang/Double;"; break;
+    case ValueKind::Boolean: sig = "(Z)Ljava/lang/Boolean;"; break;
+    case ValueKind::Byte: sig = "(B)Ljava/lang/Byte;"; break;
+    case ValueKind::Char: sig = "(C)Ljava/lang/Character;"; break;
+    case ValueKind::Short: sig = "(S)Ljava/lang/Short;"; break;
+    case ValueKind::Int: sig = "(I)Ljava/lang/Integer;"; break;
+    case ValueKind::Long: sig = "(J)Ljava/lang/Long;"; break;
+    case ValueKind::Float: sig = "(F)Ljava/lang/Float;"; break;
+    case ValueKind::Double: sig = "(D)Ljava/lang/Double;"; break;
     case ValueKind::Object: return reinterpret_cast<jobject>(raw);
     case ValueKind::Void: return nullptr;
     }
-    auto clazz = env->FindClass(clazz_name);
+    auto clazz = CachedBoxClass(kind);
     if (!clazz) return nullptr;
-    auto mid = env->GetStaticMethodID(clazz, "valueOf", sig);
+    const size_t slot = static_cast<size_t>(kind);
+    auto mid = g_box_value_of_cache[slot].load(std::memory_order_acquire);
+    if (mid == nullptr && slot < kDispatchClassCacheSlots) {
+        // 缓存未命中（未 bootstrap 的进程）：GetStaticMethodID 不需要 caller 的
+        // class loader，不会触发 ART 栈遍历，可安全兜底。
+        mid = env->GetStaticMethodID(clazz, "valueOf", sig);
+        if (mid == nullptr) {
+            env->ExceptionClear();
+        } else {
+            g_box_value_of_cache[slot].store(mid, std::memory_order_release);
+        }
+    }
     jobject result = nullptr;
     if (mid) {
         jvalue argument{};
@@ -417,8 +539,24 @@ static jobject BoxCallbackValue(JNIEnv *env, ValueKind kind, uint64_t raw, uint6
         }
         result = env->CallStaticObjectMethodA(clazz, mid, &argument);
     }
-    env->DeleteLocalRef(clazz);
     return result;
+}
+
+// 热路径优先使用 bootstrap 期缓存的拆箱方法；未命中时按类查找（GetMethodID 同样
+// 不需要 caller 的 class loader，不会触发 ART 栈遍历，可安全兜底）。
+static jmethodID CachedUnboxMethod(JNIEnv *env, ValueKind kind, jclass owner,
+                                   const char *name, const char *sig) {
+    const size_t slot = static_cast<size_t>(kind);
+    if (slot >= kDispatchClassCacheSlots) return nullptr;
+    auto mid = g_box_unbox_cache[slot].load(std::memory_order_acquire);
+    if (mid != nullptr) return mid;
+    mid = env->GetMethodID(owner, name, sig);
+    if (mid == nullptr) {
+        env->ExceptionClear();
+        return nullptr;
+    }
+    g_box_unbox_cache[slot].store(mid, std::memory_order_release);
+    return mid;
 }
 
 static bool UnboxCallbackValue(JNIEnv *env, jobject value, ValueKind kind,
@@ -434,11 +572,10 @@ static bool UnboxCallbackValue(JNIEnv *env, jobject value, ValueKind kind,
     jmethodID method = nullptr;
     switch (kind) {
     case ValueKind::Boolean:
-        clazz = env->FindClass("java/lang/Boolean");
+        clazz = CachedBoxClass(ValueKind::Boolean);
         if (!clazz) return false;
-        method = env->GetMethodID(clazz, "booleanValue", "()Z");
+        method = CachedUnboxMethod(env, ValueKind::Boolean, clazz, "booleanValue", "()Z");
         if (!method || !env->IsInstanceOf(value, clazz)) {
-            env->DeleteLocalRef(clazz);
             return false;
         }
         *raw = env->CallBooleanMethod(value, method);
@@ -449,41 +586,45 @@ static bool UnboxCallbackValue(JNIEnv *env, jobject value, ValueKind kind,
     case ValueKind::Long:
     case ValueKind::Float:
     case ValueKind::Double:
-        clazz = env->FindClass("java/lang/Number");
+        clazz = g_number_class_cache.load(std::memory_order_acquire);
         if (!clazz || !env->IsInstanceOf(value, clazz)) {
-            if (clazz) env->DeleteLocalRef(clazz);
             return false;
         }
         if (kind == ValueKind::Byte) {
-            method = env->GetMethodID(clazz, "byteValue", "()B");
+            method = CachedUnboxMethod(env, ValueKind::Byte, clazz, "byteValue", "()B");
+            if (!method) return false;
             *raw = static_cast<uint64_t>(static_cast<int64_t>(env->CallByteMethod(value, method)));
         } else if (kind == ValueKind::Short) {
-            method = env->GetMethodID(clazz, "shortValue", "()S");
+            method = CachedUnboxMethod(env, ValueKind::Short, clazz, "shortValue", "()S");
+            if (!method) return false;
             *raw = static_cast<uint64_t>(static_cast<int64_t>(env->CallShortMethod(value, method)));
         } else if (kind == ValueKind::Int) {
-            method = env->GetMethodID(clazz, "intValue", "()I");
+            method = CachedUnboxMethod(env, ValueKind::Int, clazz, "intValue", "()I");
+            if (!method) return false;
             *raw = static_cast<uint64_t>(static_cast<int64_t>(env->CallIntMethod(value, method)));
         } else if (kind == ValueKind::Long) {
-            method = env->GetMethodID(clazz, "longValue", "()J");
+            method = CachedUnboxMethod(env, ValueKind::Long, clazz, "longValue", "()J");
+            if (!method) return false;
             *raw = static_cast<uint64_t>(env->CallLongMethod(value, method));
         } else if (kind == ValueKind::Float) {
-            method = env->GetMethodID(clazz, "floatValue", "()F");
+            method = CachedUnboxMethod(env, ValueKind::Float, clazz, "floatValue", "()F");
+            if (!method) return false;
             float f = env->CallFloatMethod(value, method);
             std::memcpy(fp_raw, &f, sizeof(f));
             *raw = *fp_raw;
         } else {
-            method = env->GetMethodID(clazz, "doubleValue", "()D");
+            method = CachedUnboxMethod(env, ValueKind::Double, clazz, "doubleValue", "()D");
+            if (!method) return false;
             double d = env->CallDoubleMethod(value, method);
             std::memcpy(fp_raw, &d, sizeof(d));
             *raw = *fp_raw;
         }
         break;
     case ValueKind::Char:
-        clazz = env->FindClass("java/lang/Character");
+        clazz = CachedBoxClass(ValueKind::Char);
         if (!clazz) return false;
-        method = env->GetMethodID(clazz, "charValue", "()C");
+        method = CachedUnboxMethod(env, ValueKind::Char, clazz, "charValue", "()C");
         if (!method || !env->IsInstanceOf(value, clazz)) {
-            env->DeleteLocalRef(clazz);
             return false;
         }
         *raw = env->CallCharMethod(value, method);
@@ -494,11 +635,43 @@ static bool UnboxCallbackValue(JNIEnv *env, jobject value, ValueKind kind,
     case ValueKind::Void:
         return true;
     }
-    if (clazz) env->DeleteLocalRef(clazz);
+    // clazz 均为缓存的 global ref，不得 DeleteLocalRef（否则会误删缓存）。
     return !env->ExceptionCheck();
 }
 
-static uint64_t ReadNativeArgument(HookContext *ctx, const ValueKind kind,
+// 对齐 rustFrida：dispatch 的 JNIEnv 不能信任上游 caller 的 x0（props/相机快速链路
+// 可能把数据指针残留在 dispatch 入口 x0 —— FindClass 若把它当 env 解引用即 SIGSEGV，
+// 表现为 tombstone #0 pc 在 ndr x8,[x8,#0x30]）、。JavaVM 在 bootstrap 阶段缓存，
+// dispatch 用 JavaVM::GetEnv 拿当前线程 attach 的 env；未 attach 直接 skip。
+static std::atomic<void *> g_dispatch_java_vm{nullptr};
+
+static JavaVM *DispatchJavaVM() {
+    return reinterpret_cast<JavaVM *>(g_dispatch_java_vm.load(std::memory_order_acquire));
+}
+
+static void CacheDispatchJavaVM(JNIEnv *env) {
+    if (env && DispatchJavaVM() == nullptr) {
+        JavaVM *vm = nullptr;
+        if (env->GetJavaVM(&vm) == JNI_OK && vm) {
+            g_dispatch_java_vm.store(vm, std::memory_order_release);
+        }
+    }
+}
+
+static JNIEnv *DispatchJNIEnvForCurrentThread(HookContext *ctx) {
+    JavaVM *vm = DispatchJavaVM();
+    if (!vm) {
+        // bootstrap 尚未 cache VM：保守回退 ctx->x[0]（legacy 行为）
+        return ctx ? reinterpret_cast<JNIEnv *>(ctx->x[0]) : nullptr;
+    }
+    JNIEnv *env = nullptr;
+    if (vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK || !env) {
+        return nullptr;
+    }
+    return env;
+}
+
+static uint64_t ReadNativeArgument(HookContext *ctx, const ValueKind kind, size_t gp_base,
                                    size_t *gp, size_t *fp, size_t *stack) {
     const bool floating = kind == ValueKind::Float || kind == ValueKind::Double;
     if (floating) {
@@ -507,7 +680,10 @@ static uint64_t ReadNativeArgument(HookContext *ctx, const ValueKind kind,
         ++*fp;
         return value;
     }
-    if (*gp < 6) return ctx->x[2 + (*gp)++];
+    // gp_base=2：普通 JNI 约定（x0=JNIEnv*、x1=this/jclass，参数从 x2 起）；
+    // gp_base=0：@CriticalNative 约定（x0 起直接是 Java 基本类型参数），
+    // 对齐 rustFrida callback/hook.rs::extract_critical_native_arg 的 gp_index=0。
+    if (gp_base + *gp < 8) return ctx->x[gp_base + (*gp)++];
     const auto value = *reinterpret_cast<uint64_t *>(ctx->sp + (*stack)++ * 8);
     ++*gp;
     return value;
@@ -528,7 +704,19 @@ static void VectorArtHookCallback(HookContext *ctx, void *raw_user_data) {
         ctx->x[0] = 0;
         return;
     }
-    auto *env = reinterpret_cast<JNIEnv *>(ctx->x[0]);
+    auto *thunk_env = reinterpret_cast<JNIEnv *>(ctx->x[0]);
+    auto *env = DispatchJNIEnvForCurrentThread(ctx);
+    if (env && env != thunk_env) {
+        // 上游 thunk 入口 x0 与线程 env 不一致：caller 把非 env 指针（props 数据等）
+        // 传到了 dispatch —— 限频记录，改按线程 env 分发，不崩。
+        static std::atomic<uint32_t> g_env_mismatch_count{0};
+        const uint32_t n = g_env_mismatch_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n == 1 || (n % 64) == 0) {
+            LOGI("[java_hook] dispatch env mismatch x0={} thread_env={} count={} target={}",
+                 static_cast<void *>(thunk_env), static_cast<void *>(env), n,
+                 static_cast<void *>(target));
+        }
+    }
     if (!env) {
         LOGI("[java_hook] dispatch skip: no JNIEnv target={}", static_cast<void *>(target));
         ctx->x[0] = 0;
@@ -541,17 +729,35 @@ static void VectorArtHookCallback(HookContext *ctx, void *raw_user_data) {
         ctx->x[0] = 0;
         return;
     }
-    auto object_class = env->FindClass("java/lang/Object");
+    // 热路径禁止 FindClass（见 CacheDispatchClasses 注释）：只读 bootstrap 缓存。
+    //
+    // 缓存缺失时不能返回 0（那会让 hook 的返回值变成 null，例如
+    // LoadedApk.getClassLoader() 返回 null 直接导致宿主进程 makeApplication 抛
+    // NullPointerException），改为按「原样透传」处理：先尝试一次原始调用，取不到就
+    // 用进入时的原始寄存器直调 saved trampoline —— 与 args 原样透传时的 $orig 语义
+    // 一致，保证调用方拿到真实返回值。绝不走 FindClass 兜底（会触发 StackVisitor
+    // abort）。
+    auto object_class = g_object_class_cache.load(std::memory_order_acquire);
     if (!object_class) {
-        LOGI("[java_hook] dispatch skip: FindClass(Object) failed target=%p",
-             static_cast<void *>(target));
-        env->ExceptionClear();
-        ctx->x[0] = 0;
-        return;
+        static std::atomic<uint32_t> g_missing_class_count{0};
+        const uint32_t n = g_missing_class_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n == 1 || (n % 64) == 0) {
+            LOGI("[java_hook] dispatch class cache empty, pass-through count={} target={}", n,
+                 static_cast<void *>(target));
+            // 就地补一次缓存：此处已由 bootstrap 前的调用方保证栈干净（缓存缺失只可能
+            // 出现在 bootstrap 尚未填充的进程里），且只在第一次缺失时执行。
+            CacheDispatchClasses(env);
+            object_class = g_object_class_cache.load(std::memory_order_acquire);
+        }
+        if (!object_class) {
+            if (state->native_entry_hook && state->quick_trampoline != 0) {
+                ctx->x[0] = hook_invoke_trampoline(ctx, reinterpret_cast<void *>(state->quick_trampoline));
+            }
+            return;
+        }
     }
     auto values = env->NewObjectArray(static_cast<jsize>(count), object_class, nullptr);
     if (!values) {
-        env->DeleteLocalRef(object_class);
         ctx->x[0] = 0;
         return;
     }
@@ -560,19 +766,36 @@ static void VectorArtHookCallback(HookContext *ctx, void *raw_user_data) {
         env->SetObjectArrayElement(values, static_cast<jsize>(index++),
                                    reinterpret_cast<jobject>(ctx->x[1]));
     }
+    // CriticalNative 不允许对象参数（rustFrida install.rs:137 已按签名拒绝）；
+    // 这里再兵一层，避免把对象引用当成裸寄存器解引用。
+    if (state->native_entry_critical) {
+        for (const auto kind : state->parameter_kinds) {
+            if (kind == ValueKind::Object) {
+                LOGI("[java_hook] dispatch skip: CriticalNative object param target={}",
+                     static_cast<void *>(target));
+                ctx->x[0] = 0;
+                return;
+            }
+        }
+    }
     size_t gp = 0;
     size_t fp = 0;
     size_t stack = 0;
+    const size_t gp_base = state->native_entry_critical ? 0 : 2;
     for (const auto kind : state->parameter_kinds) {
-        const auto raw = ReadNativeArgument(ctx, kind, &gp, &fp, &stack);
+        const auto raw = ReadNativeArgument(ctx, kind, gp_base, &gp, &fp, &stack);
         const bool floating = kind == ValueKind::Float || kind == ValueKind::Double;
         auto boxed = BoxCallbackValue(env, kind, raw, floating ? raw : 0);
         env->SetObjectArrayElement(values, static_cast<jsize>(index++), boxed);
         if (boxed) env->DeleteLocalRef(boxed);
     }
+    // 绑定当前 dispatch 帧：hooker 在回调内调 invokeOriginalMethod 时，
+    // InvokeOriginal 可用「进入时的原始寄存器」直调 trampoline（rustFrida 语义），
+    // 而非经 JNI 重入 ArtMethod。
+    art::PushDispatchFrame(target, ctx, values);
     auto result = env->CallObjectMethod(item->hooker_object, item->hooker_callback, values);
+    art::PopDispatchFrame(target);
     env->DeleteLocalRef(values);
-    env->DeleteLocalRef(object_class);
     if (env->ExceptionCheck()) {
         LOGI("[java_hook] dispatch exception target={}", static_cast<void *>(target));
         env->ExceptionDescribe();
@@ -615,7 +838,19 @@ static void VectorArtHookCallback(HookContext *, void *) {}
 
 namespace vector::native::jni {
 VECTOR_DEF_NATIVE_METHOD(jboolean, HookBridge, initializeArtBootstrap) {
+    CacheDispatchJavaVM(env);
+    CacheDispatchClasses(env);
     return art::InitializeBootstrap(env) ? JNI_TRUE : JNI_FALSE;
+}
+
+// 供 zygisk 模块在 native pre-attach bootstrap 路径上直接调用：该路径不经过任何
+// JNI 方法，initializeArtBootstrap/completeArtBootstrap 都不会被执行，于是 dispatch
+// 热路径的类缓存永远为空。管理器进程（走 native 路径）因此每个 dispatch 都 skip，
+// 使 LoadedApk.getClassLoader() 之类的 hook 返回 null（LoadedApk.makeApplication
+// 抛 NullPointerException）。在栈干净的 pre-attach 阶段把缓存补齐。
+void PrimeDispatchClassCache(JNIEnv *env) {
+    CacheDispatchJavaVM(env);
+    CacheDispatchClasses(env);
 }
 
 VECTOR_DEF_NATIVE_METHOD(void, HookBridge, setSystemProcess, jboolean is_system) {
@@ -624,7 +859,9 @@ VECTOR_DEF_NATIVE_METHOD(void, HookBridge, setSystemProcess, jboolean is_system)
 }
 
 VECTOR_DEF_NATIVE_METHOD(jboolean, HookBridge, completeArtBootstrap) {
-    LOGI("[art-init-branch] JNI completeArtBootstrap pid={} tid={}", getpid(), gettid());
+    LOGI("[art-init-branch] JNI completeArtBootstrap pid={} tid={} ", getpid(), gettid());
+    CacheDispatchJavaVM(env);
+    CacheDispatchClasses(env);
     return art::CompleteInitialization(env) ? JNI_TRUE : JNI_FALSE;
 }
 
@@ -947,13 +1184,25 @@ VECTOR_DEF_NATIVE_METHOD(jobject, HookBridge, invokeOriginalMethod, jobject hook
                                [&hook_item](const auto &it) { hook_item = it.second.get(); });
 
     if (hook_item && hook_item->art_state) {
-        LOGI("[orig-call-trace] method={} art_method={} clone={} entry={} quick_trampoline={} native_entry={}",
-             reinterpret_cast<void *>(target),
-             hook_item->art_state->original_art_method,
-             hook_item->art_state->original_clone,
-             hook_item->art_state->original_entry,
-             hook_item->art_state->quick_trampoline,
-             hook_item->art_state->native_entry_hook);
+        // 热路径日志不得无条件打印：duckusb 的 Settings 拦截链一次读取就会走 4 层
+        // dispatch（getFloat→getString→getStringForUser 互相调用），无条件 LOGI 会在
+        // 启动期刷出上千行 logcat 写入并放大主线程延迟（实测触发 Input dispatching
+        // ANR）。改为限频（与 dispatch env mismatch 一致），用 VECTOR_ART_HOOK_ORIG_TRACE=1
+        // 可打开全量诊断。
+        static std::atomic<uint32_t> g_orig_trace_count{0};
+        const char *trace_env = getenv("VECTOR_ART_HOOK_ORIG_TRACE");
+        const bool trace_all = trace_env != nullptr && strcmp(trace_env, "0") != 0;
+        const uint32_t n = g_orig_trace_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (trace_all || n == 1 || (n % 256) == 0) {
+            LOGI("[orig-call-trace] n={} method={} art_method={} clone={} entry={} "
+                 "quick_trampoline={} native_entry={}",
+                 n, reinterpret_cast<void *>(target),
+                 hook_item->art_state->original_art_method,
+                 hook_item->art_state->original_clone,
+                 hook_item->art_state->original_entry,
+                 hook_item->art_state->quick_trampoline,
+                 hook_item->art_state->native_entry_hook);
+        }
         return art::InvokeOriginal(env, *hook_item->art_state, thiz, args);
     }
 

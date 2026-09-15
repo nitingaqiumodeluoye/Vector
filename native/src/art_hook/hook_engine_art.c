@@ -39,14 +39,44 @@ typedef struct {
     uint32_t depth;
 } ManagedReentryGuardSlot;
 
+#define ART_ROUTER_CTX_MAX_DEPTH 16
+
 typedef struct {
-    uint64_t thread;
+    uint64_t frame_sp;
     uint64_t _pad;
     HookContext ctx;
+} ArtRouterCtxEntry;
+
+typedef struct {
+    uint64_t thread;
+    uint32_t depth;
+    uint32_t _pad;
+    ArtRouterCtxEntry entries[ART_ROUTER_CTX_MAX_DEPTH];
 } ArtRouterTlsSlot;
+
+/* Per-thread, per-invocation router contexts.
+ *
+ * The context used to live inside the router frame (ROUTER_FRAME_CTX_OFF..
+ * ROUTER_FRAME_SIZE), so nested dispatches could not share one slot. That forced
+ * the ART-visible frame to 576 bytes, which ART (seeing the frame as the native
+ * method's JNI stub frame after the SP+0 sentinel) then mis-walked: the GC
+ * computed register slots from the declared geometry and read our *code* as a
+ * reference -- aborting with "GC tried to mark invalid reference 0xd503233f",
+ * which is the thunk's own `paciasp` instruction word.
+ *
+ * The context now lives here instead, so the router frame can be exactly the
+ * 224-byte SaveRefsAndArgs shape ART expects for a native method frame.
+ *
+ * Entries are keyed by the owning frame address: deeper calls use a lower
+ * frame_sp, so a re-entry from an outer frame (higher frame_sp) first drops the
+ * stale entries of already-returned inner frames. That keeps the stack
+ * self-cleaning without instrumenting every thunk return path. */
 
 static ManagedReentryGuardSlot g_managed_reentry_guard_slots[64] = {{0}};
 static ArtRouterTlsSlot g_art_router_tls_slots[32] = {{0}};
+/* Non-zero if a thread ever nests deeper than ART_ROUTER_CTX_MAX_DEPTH (the
+ * deepest live context would then be reused); exposed for diagnostics. */
+volatile uint64_t g_art_router_ctx_overflow = 0;
 
 /* Managed helper reentrancy guard.  Generated managed helpers enter this
  * guard before executing DSL code; ART routing checks it to bypass nested Java
@@ -102,7 +132,7 @@ static ManagedReentryGuardSlot* hook_get_managed_reentry_guard_slot(uint64_t thr
     return hook_get_managed_reentry_guard_slot(thread, 0);
 }
 
-static ArtRouterTlsSlot* hook_get_art_router_tls_slot(uint64_t thread) {
+__attribute__((__unused__)) static ArtRouterTlsSlot* hook_get_art_router_tls_slot(uint64_t thread) {
     ArtRouterTlsSlot* free_slot = NULL;
 
     for (int i = 0; i < (int)(sizeof(g_art_router_tls_slots) / sizeof(g_art_router_tls_slots[0])); i++) {
@@ -122,7 +152,8 @@ static ArtRouterTlsSlot* hook_get_art_router_tls_slot(uint64_t thread) {
 
     uint64_t expected = 0;
     if (__atomic_compare_exchange_n(&free_slot->thread, &expected, thread, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
-        memset(&free_slot->ctx, 0, sizeof(free_slot->ctx));
+        memset(free_slot->entries, 0, sizeof(free_slot->entries));
+        free_slot->depth = 0;
         return free_slot;
     }
 
@@ -382,6 +413,102 @@ void hook_art_router_get_debug(uint64_t* last_x0, uint64_t* miss_count) {
     if (miss_count) *miss_count = g_art_router_miss_count;
 }
 
+/* --------------------------------------------------------------------------
+ * Miss-path probe (诊断)
+ *
+ * 背景：Settings$Global.getInt 这类解释执行（nterp/共享 stub）方法被 hook 后，
+ * 安装全部报 success，但 Java 侧回调零调用。miss 计数不能区分「调用没进
+ * router」与「进了但查表失败」。本探针由 thunk 的 not_found 路径调用，
+ * 记录每个首次出现的 X0，连同它与 router 表 key 的距离以及当前 hit 计数，
+ * 一起打到 logcat。
+ *
+ * 判定方式：
+ *   · 出现 x0 且 hit 始终为 0  →  调用确实经过 router，但 key 不匹配
+ *     （复制 ArtMethod，或该调用走的是别的入口）
+ *   · 完全不出现探针行     →  调用根本不经过我们这个 router
+ *
+ * 纯记录，不改变任何路由行为。
+ * -------------------------------------------------------------------------- */
+#define ART_ROUTER_MISS_PROBE_SLOTS 512
+static volatile uint64_t g_probe_seen[ART_ROUTER_MISS_PROBE_SLOTS];
+static volatile uint32_t g_probe_slot_count = 0;   /* 已占用的 slot 数 */
+
+/* 只记录「与 router 表某个 key 距离在阈值内」的 x0。
+ *
+ * 实测：共享 stub 在 app 启动的头 1-2 毫秒内就会路过 64 个完全无
+ * 关的方法（diff 上千万），把有限的槽位/日志配额全部吃掉，导致真正
+ * 关注的 Settings.* 调用（发生在 hook 安装完成后，即启动 2.5 秒后）
+ * 根本记不下来。同 boot image 的 ArtMethod 数组是密集排列的，目标
+ * 方法的非命中副本必然出现在已注册 key 的邻近地址上，所以用距离过
+ * 滤既能保留有用信号又能剔除噪声。 */
+#define ART_ROUTER_MISS_PROBE_NEAR_THRESHOLD (4u * 1024u * 1024u)
+
+/* Probe budget gate read by the generated thunk.
+ *
+ * 0 = 探针关闭（默认，热路径只多读一个 int 并 cbz 跳过）；
+ * >0 = 还剩这么多次探针调用额度。
+ *
+ * 默认关闭保证这次诊断改动不会给所有进程的解释调用增加开销；
+ * 需要排查时由 Vector 侧（art hook 初始化）通过
+ * hook_art_router_set_miss_probe_budget() 显式打开。 */
+volatile int32_t g_art_router_probe_budget = 0;
+
+void hook_art_router_set_miss_probe_budget(int32_t budget) {
+    __atomic_store_n(&g_art_router_probe_budget, budget, __ATOMIC_RELEASE);
+}
+
+int32_t hook_art_router_get_miss_probe_budget(void) {
+    return __atomic_load_n(&g_art_router_probe_budget, __ATOMIC_ACQUIRE);
+}
+
+void art_router_miss_probe(uint64_t x0) {
+    if (x0 == 0) return;
+
+    /* 先算「与 router 表任一条目的距离」与表大小，记录下来供日志展示。 */
+    uint64_t best_key = 0;
+    uint64_t best_diff = ~0ULL;
+    int table_size = 0;
+    for (int i = 0; i < ART_ROUTER_TABLE_MAX; i++) {
+        const uint64_t key = __atomic_load_n(&g_art_router_table[i].original,
+                                             __ATOMIC_ACQUIRE);
+        if (key == 0) break;
+        table_size++;
+        const uint64_t diff = key > x0 ? key - x0 : x0 - key;
+        if (diff < best_diff) {
+            best_diff = diff;
+            best_key = key;
+        }
+    }
+    if (best_diff > ART_ROUTER_MISS_PROBE_NEAR_THRESHOLD) return;
+    /* 记录最频出现的少量 X0（不是全部）：保留最早出现的 SLOTS 个不同值，
+     * 同时打印当前 hit 计数，便于判断「是不是根本没任何 hook 被命中」。
+     * 不过滤距离：真正的副本 ArtMethod 可能离 key 很远，过滤会漏掉它。 */
+
+    /* 每个不同的 X0 只打一次，避免刷爆 logcat。 */
+    const uint32_t used = __atomic_load_n(&g_probe_slot_count, __ATOMIC_ACQUIRE);
+    for (uint32_t i = 0; i < used && i < ART_ROUTER_MISS_PROBE_SLOTS; i++) {
+        if (__atomic_load_n(&g_probe_seen[i], __ATOMIC_ACQUIRE) == x0) return;
+    }
+    if (used >= ART_ROUTER_MISS_PROBE_SLOTS) return;
+    uint64_t expected = 0;
+    if (!__atomic_compare_exchange_n(&g_probe_seen[used], &expected, x0, 0,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+        return;
+    }
+    __atomic_store_n(&g_probe_slot_count, used + 1, __ATOMIC_RELEASE);
+
+    hook_log("[art-router-probe] miss x0=%p table=%d nearest_key=%p diff=%llu hit=%llu",
+             (void*)x0, table_size, (void*)best_key,
+             (unsigned long long)best_diff,
+             (unsigned long long)__atomic_load_n(&g_art_router_hit_count,
+                                                 __ATOMIC_ACQUIRE));
+    for (int i = 0; i < table_size && i < 24; i++) {
+        hook_log("[art-router-probe]   key[%d]=%p", i,
+                 (void*)__atomic_load_n(&g_art_router_table[i].original,
+                                        __ATOMIC_ACQUIRE));
+    }
+}
+
 void hook_art_router_reset_debug(void) {
     g_art_router_last_x0 = 0;
     g_art_router_miss_count = 0;
@@ -563,13 +690,19 @@ void hook_art_router_get_route_stats(uint64_t* quick_hits,
  * and hook_create_art_router_stub.
  * ============================================================================ */
 
-/* ART-visible router frame. Keep this identical in size to ARM64
- * SaveRefsAndArgs (224 bytes): even if our fake OAT header is missed, ART's
- * native GenericJNI fallback advances by the same frame size instead of reading
- * saved registers as the next ArtMethod.
+/* ART-visible router frame: exactly the 224-byte ARM64 SaveRefsAndArgs image.
  *
- * Full callback HookContext lives in TLS; this stack frame is only the managed
- * stack-walk frame plus the raw quick-call registers needed to rebuild context.
+ * The SP+0 sentinel makes ART see this frame as the *native* replacement
+ * method's JNI stub frame, and a JNI stub frame is precisely a SaveRefsAndArgs
+ * image -- so the declared geometry (FAKE_PACKED_FRAME_SIZE = 224/16 = 14) and
+ * the real frame agree, and the stack walker's / GC's slot arithmetic stays
+ * inside the frame.
+ *
+ * The frame must NOT be extended. While it was 576 bytes with the
+ * per-invocation HookContext in its tail, ART computed register slots from the
+ * declared geometry and read our code as a reference
+ * ("GC tried to mark invalid reference 0xd503233f" -- the thunk's paciasp).
+ * The context now lives in the per-thread ctx stack (ArtRouterTlsSlot.entries).
  */
 #define ROUTER_FRAME_SIZE          224
 #define ROUTER_FRAME_PADDING_OFF   8
@@ -763,13 +896,34 @@ volatile uint64_t g_fast_orig_active = 0;
 volatile uint64_t g_fast_orig_frame_thread = 0;
 volatile uint64_t g_fast_orig_frame_sp = 0;
 
+static int g_frame_probe_state = -1;
+static uint32_t g_frame_probe_calls = 0;
+static uint32_t g_frame_probe_slot_fix = 0;
+
 static HookContext* art_router_prepare_quick_context(void* frame_sp, void* save_frame_sp) {
     uint8_t* sp = (uint8_t*)frame_sp;
     uint64_t thread = 0;
 #if defined(__aarch64__)
     __asm__ __volatile__("mov %0, x19" : "=r"(thread));
 #endif
-    HookContext* ctx = &hook_get_art_router_tls_slot(thread)->ctx;
+    /* per-invocation: the ctx lives in this thread's ctx stack, never inside the
+     * ART-visible frame (a 576-byte frame made the GC read our code as a
+     * reference). Nesting is keyed by the owning frame address: deeper calls have
+     * a lower frame_sp, so re-entering from an outer frame first discards the
+     * stale entries of inner frames that already returned. */
+    ArtRouterTlsSlot* slot = hook_get_art_router_tls_slot(thread);
+    uint32_t depth = slot->depth;
+    while (depth > 0 && slot->entries[depth - 1].frame_sp < (uint64_t)frame_sp) {
+        depth--;
+    }
+    if (depth >= ART_ROUTER_CTX_MAX_DEPTH) {
+        depth = ART_ROUTER_CTX_MAX_DEPTH - 1;
+        __atomic_add_fetch(&g_art_router_ctx_overflow, 1, __ATOMIC_RELAXED);
+    }
+    ArtRouterCtxEntry* entry = &slot->entries[depth];
+    entry->frame_sp = (uint64_t)frame_sp;
+    slot->depth = depth + 1;
+    HookContext* ctx = &entry->ctx;
     ctx->x[0] = *(uint64_t*)(sp + 0);
     for (int i = 1; i <= 7; i++) {
         ctx->x[i] = *(uint64_t*)(sp + ROUTER_X1_OFF + (i - 1) * 8);
@@ -790,6 +944,92 @@ static HookContext* art_router_prepare_quick_context(void* frame_sp, void* save_
         ctx->d[i] = *(uint64_t*)(sp + ROUTER_FRAME_FP_OFF + i * 8);
     }
     ctx->intercept_leave = 0;
+    /* ------------------------------------------------------------------
+     * 帧槽探针（门控，只打前 48 次，零热路径开销）
+     * 目的：量清 router 帧几何与槽位占用，为"SP+0 写 replacement、原方法另存"
+     * 的改法提供实测依据（需确认 SP+8 是否被变体路径占用、x1..x7/x20..x29/x30
+     * 是否都是真实业务值、slot0 是否就是被 hook 的原 ArtMethod）。
+     * 开：setprop debug.vector.frame.probe 1 或 env VECTOR_ART_FRAME_PROBE=1
+     * ------------------------------------------------------------------ */
+    if (g_frame_probe_state < 0) {
+        const char* v = getenv("VECTOR_ART_FRAME_PROBE");
+        int on = (v && v[0] == '1') ? 1 : 0;
+        if (!on) {
+            char prop[128] = {0};
+            if (__system_property_get("debug.vector.frame.probe", prop) > 0 &&
+                prop[0] == '1') {
+                on = 1;
+            }
+        }
+        g_frame_probe_state = on;
+        if (on) hook_log("[frame-probe] enabled (first 48 dumps)");
+    }
+    if (g_frame_probe_state == 1) {
+        uint32_t n = __atomic_fetch_add(&g_frame_probe_calls, 1, __ATOMIC_RELAXED);
+        if (n < 48) {
+            uint64_t slot0 = *(uint64_t*)(sp + 0);
+            uint64_t pad8 = *(uint64_t*)(sp + ROUTER_FRAME_PADDING_OFF);
+            int idx = -1;
+            uint64_t repl = 0;
+            for (int i = 0; i < ART_ROUTER_TABLE_MAX; i++) {
+                if (g_art_router_table[i].original == slot0) {
+                    idx = i;
+                    repl = g_art_router_table[i].replacement;
+                    break;
+                }
+            }
+            hook_log("[frame-probe] n=%u sp=%p slot0=%llx pad8=%llx x1=%llx x7=%llx "
+                     "x20=%llx x29=%llx x30ret=%llx ctx_sp=%llx depth=%u"
+                     " table_entry=%d repl=%llx tid=%llx",
+                     n, (void*)sp,
+                     (unsigned long long)slot0,
+                     (unsigned long long)pad8,
+                     (unsigned long long)*(uint64_t*)(sp + ROUTER_X1_OFF),
+                     (unsigned long long)*(uint64_t*)(sp + ROUTER_X1_OFF + 6 * 8),
+                     (unsigned long long)*(uint64_t*)(sp + ROUTER_SAVED_X20_OFF),
+                     (unsigned long long)*(uint64_t*)(sp + ROUTER_SAVED_X20_OFF + 9 * 8),
+                     (unsigned long long)*(uint64_t*)(sp + ROUTER_SAVED_X30_OFF),
+                     (unsigned long long)ctx->sp, (unsigned)depth, idx,
+                     (unsigned long long)repl, (unsigned long long)thread);
+        } else if (n == 48) {
+            hook_log("[frame-probe] done (48 dumps)");
+        }
+    }
+    /* ------------------------------------------------------------------
+     * 走栈安全化（router 引擎）——对齐 inline 引擎 / rustFrida on_do_call_enter
+     *
+     * 把帧槽（SP+0，ART StackVisitor 读的方法槽）改写成 native 的 replacement；
+     * ctx->x[0] **仍保留被 hook 的原方法**（dispatch/路由逻辑依赖它）。
+     *
+     * 理由：该方法的原始代码此刻跑在我方重定位 trampoline 池里，若帧槽是托管
+     * 原方法，ART 走栈会按 pc 去 oat 找 header → FindOatMethodFor 失败 →
+     * LOG(FATAL) "Didn't find oat method index for virtual method" → 拼
+     * PrettyMethod() 时对 NULL DexFile 取址 SEGV（tombstone_09: fault addr 0x48，
+     * 栈 AppendPrettyMethod ← PrettyMethod ← GetOatQuickMethodHeader ← WalkStack
+     * ← Thread::VisitRoots ← ConcurrentCopying::ThreadFlipVisitor）。
+     * replacement 带 kAccNative + 真实 quick 入口 → ART 走 native 路径，不做 oat 查找。
+     *
+     * inline 引擎早在 OnDoCallEnter 里就做同一件事（ctx->x[0] = replacement，
+     * 因为那里的 ctx 本身就是帧）；本处让 router 引擎行为与其一致。
+     * 关键：**不能改 ctx->x[0]**——上一版因改了它而使路由失效，导致 vectord 报
+     * Failed to inject VectorService into system_server 并重启 system_server 循环。
+     * ------------------------------------------------------------------ */
+    {
+        const uint64_t slot0 = *(uint64_t*)(sp + 0);
+        uint64_t route_mode = 0;
+        const uint64_t repl = hook_art_router_table_lookup_do_call(slot0, &route_mode);
+        if (repl != 0 && repl != slot0) {
+            *(uint64_t*)(sp + 0) = repl;
+            if (g_frame_probe_state == 1) {
+                uint32_t n = __atomic_fetch_add(&g_frame_probe_slot_fix, 1, __ATOMIC_RELAXED);
+                if (n < 24 || (n & 0x3ff) == 0) {
+                    hook_log("[frame-slot-fix] n=%u sp=%p orig=%llx repl=%llx mode=%llu",
+                             n, (void*)sp, (unsigned long long)slot0,
+                             (unsigned long long)repl, (unsigned long long)route_mode);
+                }
+            }
+        }
+    }
     return ctx;
 }
 
@@ -1042,14 +1282,43 @@ static void emit_art_router_restore_all_with_return_x0(Arm64Writer* w, Arm64Reg 
     }
 }
 
-/* Debug: store X0 to g_art_router_last_x0, increment g_art_router_miss_count */
+/* Debug: store X0 to g_art_router_last_x0, increment g_art_router_miss_count,
+ * and hand the missed ArtMethod to the C-side probe.
+ *
+ * 诊断 (2026-09-13)：miss 计数本身无法区分「调用没到 router」与「到了但查表
+ * 失败」。探针 art_router_miss_probe 会把每个新出现的 X0 及其与 router 表 key
+ * 的对比结果打到 logcat，用于定位 Settings$Global.getInt 这类解释执行方法的
+ * 拦截失效。
+ *
+ * 热路径成本：miss 是全局共享 stub 的未命中路径，频率可能很高，因此除了记
+ * 两个计数器外，只在「已预留预算」时 bl 进 C 探针；预算耗尽后彻底不调用。
+ * 预算由 art_router_miss_probe 在首次进入时填充。 */
+void art_router_miss_probe(uint64_t x0);
+
+/* 与探针的 NEAR 阈值对应：这里同时把预算调大，确保安装后期
+ * （hook 装完、app 真正跑检测时）仍有额度可记。 */
 static void emit_art_router_debug_counters(Arm64Writer* w) {
+    uint64_t lbl_skip = arm64_writer_new_label_id(w);
+
     arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, (uint64_t)&g_art_router_last_x0);
     arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X16, 0);
     arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, (uint64_t)&g_art_router_miss_count);
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X16, 0);
     arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_X17, ARM64_REG_X17, 1);
     arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X16, 0);
+
+    /* 预算检查：g_art_router_probe_budget <= 0 时不进 C 探针。
+     * X0 仍是 ArtMethod*，后续 emit_art_router_restore_all 会从 frame 重载
+     * 全部寄存器，所以这里的 clobber 是安全的。 */
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X17, (uint64_t)&g_art_router_probe_budget);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X17, 0);
+    arm64_writer_put_cbz_reg_label(w, ARM64_REG_X16, lbl_skip);
+    /* 递减预算（单线程写入为主，允许竞争；探针内部亦有去重） */
+    arm64_writer_put_sub_reg_reg_imm(w, ARM64_REG_X16, ARM64_REG_X16, 1);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X17, 0);
+    arm64_writer_put_call_address(w, (uint64_t)art_router_miss_probe);
+
+    arm64_writer_put_label(w, lbl_skip);
 }
 
 static void emit_art_router_inc_counter(Arm64Writer* w, volatile uint64_t* counter) {
@@ -1907,6 +2176,18 @@ static void emit_art_router_found_path_blr(Arm64Writer* w, uint64_t lbl_found,
  * right frame size but does not refill caller context registers, so the next
  * compiled Java frame can treat stale scalar registers (for example 0x1) as
  * object roots during GC.
+ *
+ * ---------------------------------------------------------------------------
+ * 实测修订（2026-09-15）：上面的担心没能在设备上复现，而原 mask 被我方判为崩因：
+ * 原 mask（core popcount 18 / fp 8）在 hunter 里稳定 ~1 次/1~2 分钟崩
+ * `GC tried to mark invalid reference 0xd503233f`（= thunk 首指令 paciasp，代码地址被
+ * 当引用）或 `0xb400006fde9e04b0`（堆样式指针），栈为 GC→VisitFrame→WalkStack；
+ * 清零两个 mask 后（2085 行上方判别实验）同一机型同一负载 220s+ 零崩溃、零 ANR、
+ * 零 scout HANG，且 duckusb hook 功能正常。结论：那些被声明的「溢出寄存器」槽位在我方
+ * 224B 帧里实际并不存引用，被 GC 当根标记就会炸。
+ * 待办：清零属「保守不声明」而非「精确声明」，仍需长时长/混合负载（含大堆 GC）验收；
+ * 若出现 `invalid reference 0x1` 这类标量误标，则改为精确 mask（只声明可能持引用的
+ * 寄存器，如 JNI 参数 x1..x7），并同步修 ctx 里裸 jobject 跨 GC 窗口的问题。
  * ============================================================================ */
 
 #define FAKE_OAT_CODEINFO_BYTES 16
@@ -1914,13 +2195,29 @@ static void emit_art_router_found_path_blr(Arm64Writer* w, uint64_t lbl_found,
 
 /* router thunk frame_size (SUB SP, #0xE0 -> 224) / kStackAlignment (16) = 14 */
 #define FAKE_PACKED_FRAME_SIZE 14
-#define FAKE_CORE_SPILL_MASK \
+/* ---------------------------------------------------------------------------
+ * 判别实验（临时，2026-09-15）：把两个 spill mask 全部清零，即不向 GC 声明任何
+ * 被溢出的寄存器。目的：分辨当前 `GC tried to mark invalid reference` 崩溃到底是
+ *   (a) ART 按我方伪 codeinfo 的 spill mask 去标记我方帧的槽位（这些槽位实际存的不是
+ *       引用：上轮报的是代码地址 0xd503233f，本轮报的是堆样式指针 0xb400006fde9e04b0），
+ *       还是
+ *   (b) 崩在「我方把 ctx 里保存的裸 jobject 参数传给 JNI 调用」上（栈里是
+ *       art::JNI<false>::SetObjectArrayElement，即 dispatch 组装 Object[] 时）。
+ * 判据：清零后若报错值/栈形态变了（例如变成 0x1 这类标量，或换到别的 VisitFrame 现场）
+ *   → 属于 (a)；若仍是同样的堆指针 + SetObjectArrayElement → 属于 (b)。
+ *
+ * 实验结果（2026-09-15）：偏向 (a) 成立——清零后 hunter 同负载 220s+ 零崩溃
+ * （原 mask 下 1~2 分钟必崩一次），未出现标量误标形态。本改动保留（见文件头实测修订）。
+ * --------------------------------------------------------------------------- */
+#define FAKE_CORE_SPILL_MASK 0u
+#define FAKE_FP_SPILL_MASK 0u
+#define FAKE_CORE_SPILL_MASK_ORIGINAL \
     ((1u << 30) | \
      (1u << 29) | (1u << 28) | (1u << 27) | (1u << 26) | (1u << 25) | \
      (1u << 24) | (1u << 23) | (1u << 22) | (1u << 21) | (1u << 20) | \
      (1u << 7)  | (1u << 6)  | (1u << 5)  | (1u << 4)  | (1u << 3)  | \
      (1u << 2)  | (1u << 1))
-#define FAKE_FP_SPILL_MASK 0xffu
+#define FAKE_FP_SPILL_MASK_ORIGINAL 0xffu
 
 static void fake_codeinfo_write_bits(uint8_t* buf, size_t* bit_offset,
                                      uint32_t value, size_t bit_count) {

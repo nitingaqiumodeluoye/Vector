@@ -491,6 +491,21 @@ void hook_dump_code(void* addr, size_t size);
 void hook_art_router_get_debug(uint64_t* last_x0, uint64_t* miss_count);
 
 /*
+ * Miss-path probe (diagnostic).
+ *
+ * The generated ART router thunk calls art_router_miss_probe(X0) on every
+ * not_found scan while the budget is positive. The probe logs each distinct X0
+ * together with its distance to the nearest router-table key, which is what
+ * distinguishes "calls never reach the router" from "the router is reached but
+ * the X0 ArtMethod differs from the registered key".
+ *
+ * Budget defaults to 0 (off): the thunk then only loads the counter and skips.
+ */
+#define ART_ROUTER_PROBE_DEFAULT_BUDGET 200000
+void hook_art_router_set_miss_probe_budget(int32_t budget);
+int32_t hook_art_router_get_miss_probe_budget(void);
+
+/*
  * Get hit counter for found path + last matched X0.
  */
 void hook_art_router_get_hit_debug(uint64_t* hit_count, uint64_t* last_hit_x0);

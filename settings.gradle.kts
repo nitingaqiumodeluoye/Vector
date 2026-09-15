@@ -27,6 +27,7 @@ rootProject.name = "Vector"
 
 include(
     ":daemon",
+    ":examples:duckusb",
     ":examples:lsp-hello",
     ":examples:native-hook-demo",
     ":external:axml",
@@ -36,6 +37,7 @@ include(
     ":legacy",
     ":manager",
     ":manager-ui",
+    ":services:libxposed-service",
     ":services:manager-service",
     ":services:daemon-service",
     ":xposed",

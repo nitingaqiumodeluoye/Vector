@@ -1224,9 +1224,42 @@ void OnGetOatQuickMethodHeader(HookContext *ctx, void *) {
     // Source reference: rustFrida art_controller.rs::on_get_oat_quick_method_header.
     // Hook-pool PCs do not belong to ART-owned quick code, and malloc-backed
     // replacement ArtMethods have no valid OAT header.
-    if (hook_is_in_exec_pool(pc) != 0 || IsReplacementMethod(method)) {
+    //
+    // 诊断（限频）：GC 崩溃现场是 VisitFrame 里 `ldr x13,[x11,...]`（x11 = 非 NULL 垃圾），
+    // 而伪 codeinfo 下 stack_maps_ 应全零（基址为 NULL，guard 能救）。因此那一帧拿到的
+    // codeinfo 很可能不是我们那 16 字节伪前缀。这里把每次「返回 NULL」的判定细节打出来，
+    // 用来对照崩溃时刻。
+    const bool in_pool = hook_is_in_exec_pool(pc) != 0;
+    const bool replacement = IsReplacementMethod(method);
+    // 诊断默认关闭：GetOatQuickMethodHeader 在 system_server 里是 10 万次/秒级的
+    // 热路径（实测开机 20s 内 214 万次），在这里写 logcat 本身就会拖慢 system_server
+    // 主线程（实测 Slow dispatch 1757ms → 输入分发超时 ANR）。需要时用
+    // VECTOR_ART_OAT_TRACE=1 打开。
+    static const bool oat_trace = [] {
+        const char *env = getenv("VECTOR_ART_OAT_TRACE");
+        return env != nullptr && env[0] != '0';
+    }();
+    if (oat_trace && (in_pool || replacement)) {
+        static std::atomic<uint32_t> g_oat_null_count{0};
+        const uint32_t n = g_oat_null_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n == 1 || (n % 4096) == 0) {
+            LOGI("[oat-header] NULL n={} method={} pc={} in_pool={} replacement={}", n,
+                 reinterpret_cast<void *>(method), reinterpret_cast<void *>(pc), in_pool,
+                 replacement);
+        }
+    }
+    if (in_pool || replacement) {
         ctx->x[0] = 0;
         return;
+    }
+    if (oat_trace) {
+        // 透传（真正调 ART）也限频记录，用于发现「本该判为我们的帧却走了透传」。
+        static std::atomic<uint32_t> g_oat_pass_count{0};
+        const uint32_t n = g_oat_pass_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n == 1 || (n % 16384) == 0) {
+            LOGI("[oat-header] pass n={} method={} pc={}", n,
+                 reinterpret_cast<void *>(method), reinterpret_cast<void *>(pc));
+        }
     }
     if (ctx->trampoline) {
         ctx->x[0] = hook_invoke_trampoline(ctx, ctx->trampoline);
@@ -2193,6 +2226,106 @@ extern "C" void *art_quick_test_suspend_entrypoint() {
 
 alignas(16) std::array<uint8_t, 64> g_dummy_oat_header{};
 
+size_t g_decode_gc_masks_guard_ready = 0;
+
+/**
+ * rustFrida parity —— **主动**版 NULL OatQuickMethodHeader 防护。
+ *
+ * Source reference: rustFrida quickjs-hook/src/jsapi/java/art_controller.rs
+ *   install_decode_gc_masks_only_null_guard()  (:2175)
+ *   on_decode_gc_masks_only_enter()            (:2119)
+ *   find_decode_gc_masks_only_header_load()    (:2125)
+ *
+ * 被动层 TryHandleNullOatHeader()（本文件下方，与 rustFrida crash_handler.rs:207 逐行同构）
+ * 只能在**故障已经发生之后**把 faulting LDR 的 base 换成 dummy header 再重执行。可是这类
+ * 故障正好发生在 CC GC 根翻转期间（ConcurrentCopying::ThreadFlipRoots **持有
+ * thread_list_lock_**），失败代价极高，实测即 hunter 的「滑一下就卡死」：
+ *   art_method.cc:497 Check failed: found_virtual（GC 走栈 GetOatQuickMethodHeader）
+ *   → Runtime::Abort → ThreadList::Dump 在同一把锁上 RunCheckpoint 卡住
+ *   → 全进程新线程 attach 死锁（InsetsAnimationThread 起不来）
+ *   → 主线程 HandlerThread.getLooper 里 Object.wait 等死 → Input dispatching timed out。
+ *
+ * 主动层在解引用**之前**就把 dummy header 填好：挂 CodeInfo::DecodeGcMasksOnly 内部第一条
+ * header 读取指令，进入回调时若 x0（header 指针）为 0 就替换成 g_dummy_oat_header，
+ * 故障根本不产生（也就不会在持锁上下文里触发 abort/信号处理）。
+ *
+ * 目标地址取法：符号 + 函数内第一条 `ldr w?, [x0]`，而不是 rustFrida 的整段 prologue
+ * pattern 扫描 —— 后者是 API 36 专用字节，本机 Android 12 实测为：
+ *   _ZN3art8CodeInfo17DecodeGcMasksOnlyEPKNS_20OatQuickMethodHeaderE @0x669eec
+ *   +0x00  5f 24 03 d5   paciasp
+ *   +0x04  fd 0f 1a f8   str x29, [sp, #-0x60]!
+ *   …                    （prologue 不动 x0/x1）
+ *   +0x34  09 00 40 b9   ldr w9, [x0]   ← 第一条 header 读取，挂这里
+ * 用符号解析 + 前向扫描 `ldr w?,[x0]` 对版本变化更宽容，且不会误挂到
+ * GetOatQuickMethodHeader 里同形状的 load 上（rustFrida 的原注释也指出了这个风险）。
+ *
+ * 可用 VECTOR_ART_DECODE_GUARD=0 关闭（做 A/B 对照用）。
+ */
+static void OnDecodeGcMasksOnlyEnter(HookContext *ctx, void *) {
+    if (ctx && ctx->x[0] == 0) {
+        ctx->x[0] = reinterpret_cast<uint64_t>(g_dummy_oat_header.data());
+    }
+}
+
+size_t InitializeDecodeGcMasksGuard() {
+    static bool attempted = false;
+    if (attempted) return g_decode_gc_masks_guard_ready;
+    attempted = true;
+
+    if (const char *env = getenv("VECTOR_ART_DECODE_GUARD")) {
+        if (env[0] == '0' && env[1] == '\0') {
+            LOGI("WxShadow ART DecodeGcMasksOnly guard: disabled by env");
+            return 0;
+        }
+    }
+
+    const auto entry = reinterpret_cast<uintptr_t>(ResolveArtSymbol(
+        "_ZN3art8CodeInfo17DecodeGcMasksOnlyEPKNS_20OatQuickMethodHeaderE")) &
+        kPacStripMask;
+    if (!entry || !IsInArtModule(entry)) {
+        LOGW("WxShadow ART DecodeGcMasksOnly guard: symbol unresolved");
+        return 0;
+    }
+
+    // 函数内第一条 `ldr w?, [x0]`（encoding 0xB9400000 | Rt，imm12 = 0，Rn = 0）。
+    // 走到这里说明符号地址正确；再核对 prologue 头两字，避免符号表漂移导致乱挂。
+    auto *const code = reinterpret_cast<const uint8_t *>(entry);
+    const uint32_t p0 = *reinterpret_cast<const uint32_t *>(code);
+    const uint32_t p1 = *reinterpret_cast<const uint32_t *>(code + 4);
+    if (p0 != 0xd503245fu /* paciasp */ || p1 != 0xf81a0ffdu /* str x29, [sp, #-0x60]! */) {
+        LOGW("WxShadow ART DecodeGcMasksOnly guard: prologue mismatch p0={:#x} p1={:#x}", p0, p1);
+        return 0;
+    }
+
+    uintptr_t target = 0;
+    for (size_t off = 8; off + 4 <= 0x80; off += 4) {
+        const uint32_t insn = *reinterpret_cast<const uint32_t *>(code + off);
+        if ((insn & 0xffc00000u) == 0xb9400000u && ((insn >> 5) & 0x1fu) == 0u &&
+            ((insn >> 0) & 0x1fu) <= 30u) {
+            target = entry + off;
+            break;
+        }
+    }
+    if (!target || !IsMappedExecutable(target)) {
+        LOGW("WxShadow ART DecodeGcMasksOnly guard: header load not found in {} entry={}",
+             reinterpret_cast<void *>(entry), reinterpret_cast<void *>(target));
+        return 0;
+    }
+
+    if (hook_attach(reinterpret_cast<void *>(target), OnDecodeGcMasksOnlyEnter, nullptr,
+                    nullptr, ArtStealthFlag()) != HOOK_OK) {
+        LOGW("WxShadow ART DecodeGcMasksOnly guard: hook_attach failed target={}",
+             reinterpret_cast<void *>(target));
+        return 0;
+    }
+    g_decode_gc_masks_guard_ready = 1;
+    LOGI("WxShadow ART DecodeGcMasksOnly NULL guard ready entry={} target={} (offset={})",
+         reinterpret_cast<void *>(entry), reinterpret_cast<void *>(target),
+         static_cast<unsigned long>(target - entry));
+    return 1;
+}
+
+
 struct SigchainAction {
     bool (*sc_sigaction)(int, siginfo_t *, void *);
     sigset_t sc_mask;
@@ -2263,9 +2396,47 @@ bool TryHandleNullOatHeader(int signal, siginfo_t *info, void *raw_context) {
     return false;
 }
 
+std::atomic<unsigned long> g_delivered_sigsegv_count{0};
+
+/**
+ * 投递型 SIGSEGV：si_code == SI_USER / SI_TKILL，即 kill()/tgkill() 送来的信号，
+ * 而不是取址失败（后者是 SEGV_MAPERR/SEGV_ACCERR）。
+ *
+ * AOSP ART 的 implicit-suspend 就是这种形态：Thread::ModifySuspendCountInternal 对停在
+ * futex/ConditionVariable 上的线程执行 kill(tid, SIGSEGV)，期待处理器接管、让线程就地
+ * 进入 suspend 检查（线程根本没有 faulting 地址，tombstone 里正是 `fault addr --------`）。
+ * 识别它的价值：这种信号既无处可重定向、也不应被当成崩溃。
+ */
+static bool IsDeliveredSigsegv(const siginfo_t *info) {
+    return info != nullptr && (info->si_code == SI_USER || info->si_code == SI_TKILL);
+}
+
 extern "C" bool ArtSigchainHandler(int signal, siginfo_t *info, void *context) {
-    return TryHandleImplicitSuspend(signal, info, context) ||
-           TryHandleNullOatHeader(signal, info, context);
+    if (TryHandleImplicitSuspend(signal, info, context) ||
+        TryHandleNullOatHeader(signal, info, context)) {
+        return true;
+    }
+    // 投递型 SIGSEGV = ART 的 implicit-suspend 触发信号，必须「接管后放行」。
+    // 之前这一形态完全没被识别，直接落到 ChainPreviousSigsegvHandler 的兜底重发，
+    // 实测 hunter 冷启 3 次里 2 次要死在 Heap::WaitForGcToCompleteLocked 停车处、
+    // 以 code 0 (SI_USER) SIGSEGV 收场，且因为走的是 raise 而不是 debuggerd 正常
+    // 崩溃路径，经常连 tombstone 都不落盘。
+    if (signal == SIGSEGV && IsDeliveredSigsegv(info)) {
+        const unsigned long n =
+            g_delivered_sigsegv_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        // 热路径限频：前 3 次全打，之后 1/64。
+        if (n <= 3 || (n & 63u) == 0) {
+            const auto pc = context
+                                ? static_cast<uintptr_t>(
+                                      reinterpret_cast<ucontext_t *>(context)->uc_mcontext.pc) &
+                                      kPacStripMask
+                                : 0;
+            LOGW("WxShadow SIGSEGV delivered (implicit suspend) handled count={} pc={} tid={}",
+                 n, reinterpret_cast<void *>(pc), static_cast<long>(gettid()));
+        }
+        return true;
+    }
+    return false;
 }
 
 void ChainPreviousSigsegvHandler(int signal, siginfo_t *info, void *context) {
@@ -2287,8 +2458,19 @@ void ChainPreviousSigsegvHandler(int signal, siginfo_t *info, void *context) {
             return;
         }
     }
-    ::signal(signal, SIG_DFL);
-    ::raise(signal);
+    // 没有可链的旧处理器。这里刻意不再用 ::signal(SIG_DFL) + ::raise()：
+    // ::raise() 会造出 code 0 (SI_USER)、并绕过 debuggerd 的正常崩溃路径，
+    // 让现场（tombstone）经常根本不落盘，而且会掩盖真实 siginfo。
+    // 改为「先把默认处理装回去，再用 tgkill 重投给当前线程」——内核会给出
+    // 真实 siginfo，交给系统崩溃路径（debuggerd 能正常落盘）。
+    LOGW("WxShadow SIGSEGV unhandled: no chainable previous handler signal={} code={} addr={}",
+         signal, info ? info->si_code : -1, info ? info->si_addr : nullptr);
+    if (g_bionic_sigsegv_guard_installed.load(std::memory_order_acquire)) {
+        ::sigaction(signal, &g_previous_sigsegv_action, nullptr);
+    } else {
+        ::signal(signal, SIG_DFL);
+    }
+    ::tgkill(getpid(), gettid(), signal);
 }
 
 extern "C" void ArtBionicSigsegvHandler(int signal, siginfo_t *info, void *context) {
@@ -2297,6 +2479,12 @@ extern "C" void ArtBionicSigsegvHandler(int signal, siginfo_t *info, void *conte
 }
 
 bool InitializeSignalGuards() {
+    if (const char *env = getenv("VECTOR_NO_SIGNAL_GUARD")) {
+        if (env[0] != '\0' && !(env[0] == '0' && env[1] == '\0')) {
+            LOGI("WxShadow ART SIGSEGV guard: disabled by env");
+            return false;
+        }
+    }
     // Source reference: rustFrida install_managed_implicit_suspend_guard and
     // install_walkstack_sigsegv_guard. Vector has no Recomp backend, so only
     // original quick-code PCs and NULL OAT-header recovery are handled.
@@ -2607,6 +2795,12 @@ bool CompleteInitializationImpl(JNIEnv *env) {
              do_call_count, ArtPerfElapsedUs(stage_start));
     }
     stage_start = perf_start != 0 ? ArtPerfNowNs() : 0;
+    const size_t decode_guard_ready = InitializeDecodeGcMasksGuard();
+    if (stage_start != 0) {
+        LOGI("[perf] art_controller component=decode_gc_masks_guard ready={} elapsedUs={}",
+             decode_guard_ready, ArtPerfElapsedUs(stage_start));
+    }
+    stage_start = perf_start != 0 ? ArtPerfNowNs() : 0;
     const size_t gc_hook_count = InitializeGcSyncLayer();
     if (stage_start != 0) {
         LOGI("[perf] art_controller component=gc_sync count={} elapsedUs={}",
@@ -2624,21 +2818,58 @@ bool CompleteInitializationImpl(JNIEnv *env) {
              oat_header_ready, ArtPerfElapsedUs(stage_start));
     }
     stage_start = perf_start != 0 ? ArtPerfNowNs() : 0;
+    // rustFrida art_controller.rs:1022-1029：该补丁是**无条件**调用的（在 lean /
+    // skip_global_sync_hooks 门控**之外**）。原因（rf 注释原文）："libart.so 内联了
+    // GetOatQuickMethodHeader 的 data_!=-1 检查，hook_replace 只拦截非内联调用。
+    // 内联点需要单独 patch"。
+    //
+    // 此前本行条件是 oat_header_ready（= g_is_system_process && InitializeOatHeaderLayer()），
+    // 导致 **app 进程（hunter 等）的内联点未打补丁** → ART 走栈/oat 查询落到
+    // FindOatMethodFor 失败 → LOG(FATAL) → 拼 PrettyMethod() 时对 NULL DexFile 取址
+    // SEGV（tombstone_09：fault addr 0x48，栈 AppendPrettyMethod ← PrettyMethod ←
+    // GetOatQuickMethodHeader ← WalkStack ← ConcurrentCopying::ThreadFlipVisitor）。
+    //
+    // 该补丁是一次性二进制 patch（不是 hook，不改变 stealth/不引入 wxshadow 页翻转），
+    // 因此在 app 进程执行是安全的。exclude 传 GetOatQuickMethodHeader **本体**地址，
+    // 避免模式扫描把本体当成内联副本 patch。
+    uint64_t oat_patch_exclude = g_oat_header_hook_target;
+    if (oat_patch_exclude == 0) {
+        for (const char *name : {"_ZN3art9ArtMethod23GetOatQuickMethodHeaderEm",
+                                 "_ZN3art9ArtMethod23GetOatQuickMethodHeaderEj"}) {
+            const auto addr =
+                reinterpret_cast<uintptr_t>(ResolveArtSymbol(name)) & kPacStripMask;
+            if (addr) {
+                oat_patch_exclude = addr;
+                break;
+            }
+        }
+    }
     const int oat_inline_patched =
-        oat_header_ready ? hook_patch_inlined_oat_header_checks(g_oat_header_hook_target) : 0;
+        oat_patch_exclude != 0 ? hook_patch_inlined_oat_header_checks(oat_patch_exclude) : 0;
     if (stage_start != 0) {
         LOGI("[perf] art_controller component=oat_inline_patch count={} elapsedUs={}",
              oat_inline_patched, ArtPerfElapsedUs(stage_start));
     }
-    if (oat_header_ready) {
-        if (oat_inline_patched < 0) {
-            LOGW("WxShadow ART inlined OAT header patch failed: {}", oat_inline_patched);
-        } else {
-            LOGI("WxShadow ART inlined OAT header patch ready: count={}", oat_inline_patched);
-        }
+    if (oat_patch_exclude == 0) {
+        LOGW("WxShadow ART inlined OAT header patch skipped: GetOatQuickMethodHeader unavailable");
+    } else if (oat_inline_patched < 0) {
+        LOGW("WxShadow ART inlined OAT header patch failed: {} exclude={}",
+             oat_inline_patched, reinterpret_cast<void *>(oat_patch_exclude));
+    } else {
+        LOGI("WxShadow ART inlined OAT header patch ready: count={} exclude={}",
+             oat_inline_patched, reinterpret_cast<void *>(oat_patch_exclude));
     }
     stage_start = perf_start != 0 ? ArtPerfNowNs() : 0;
-    const bool signal_guard_ready = g_is_system_process && InitializeSignalGuards();
+    // 不再限定 system_server：rustFrida 对所有进程都装
+    // （install_managed_implicit_suspend_guard / install_walkstack_sigsegv_guard）。
+    // 此前只在 system_server 安装，导致 app 进程（hunter 等）既没有 implicit-suspend
+    // 接管、也没有伪造帧故障的被动修复层：
+    //   - ART 的 implicit-suspend 触发信号（kill(tid, SIGSEGV)，si_code = SI_USER）
+    //     无人接管 → 冷启期 3 次里有 2 次以 code 0 (SI_USER) SIGSEGV 收场；
+    //   - 我方伪造帧触发的 NULL OatQuickMethodHeader 故障不再被 TryHandleNullOatHeader 修回。
+    // 本函数本身只在 ART hook 层真正初始化的进程里跑，所以不会波及无关进程；
+    // VECTOR_NO_SIGNAL_GUARD=1 可关闭。
+    const bool signal_guard_ready = InitializeSignalGuards();
     if (stage_start != 0) {
         LOGI("[perf] art_controller component=signal_guard ready={} elapsedUs={}",
              signal_guard_ready, ArtPerfElapsedUs(stage_start));
@@ -2676,6 +2907,19 @@ bool CompleteInitializationImpl(JNIEnv *env) {
              miss, reinterpret_cast<void *>(last_miss_x0), hit,
              reinterpret_cast<void *>(last_hit_x0), qh, rh, dch,
              reinterpret_cast<void *>(last_dc_x0));
+
+        /* 诊断（2026-09-13）：miss 探针按属性开启。
+         * 用于定位「hook 安装报 success 但回调零调用」——探针会在 router 未命中
+         * 时打印进入的 X0 及其与 router 表 key 的对比，从而判定调用是否根本
+         * 没到 router，或到了但 key 不匹配（副本 ArtMethod）。
+         * 默认关闭；打开时仅消耗有限预算，耗尽后热路径回到原状。 */
+        std::string probe_prop;
+        if (ReadArtStealthProperty("debug.vector.art.router_probe", &probe_prop) &&
+            probe_prop != "0") {
+            hook_art_router_set_miss_probe_budget(ART_ROUTER_PROBE_DEFAULT_BUDGET);
+            LOGI("WxShadow ART router miss probe armed: budget={}",
+                 ART_ROUTER_PROBE_DEFAULT_BUDGET);
+        }
     }
     return true;
 }
@@ -2747,6 +2991,139 @@ MethodState::~MethodState() {
     if (original_clone) free(reinterpret_cast<void *>(original_clone));
     if (replacement) free(reinterpret_cast<void *>(replacement));
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// rustFrida 对齐：原生入口回调的 ABI 判定 + $orig 原寄存器直调
+// ---------------------------------------------------------------------------
+
+// rustFrida install.rs:133 is_critical_native_signature_supported ——
+// @CriticalNative 只能用于 static、基本类型参数/返回；不满足时该 flag 视为
+// ART noise（install.rs:315-319）。Vector 的 ValueKind 把数组归入 Object。
+static bool IsCriticalNativeSignatureSupported(const MethodState &state) {
+    if (!state.is_static) return false;
+    if (state.return_kind == ValueKind::Object) return false;
+    for (const auto kind : state.parameter_kinds) {
+        if (kind == ValueKind::Object) return false;
+    }
+    return true;
+}
+
+// 把 trampoline 直调后的原始返回寄存器转成 jvalue，供 BoxReturn 装箱。
+static jvalue ReturnValueFromRaw(const MethodState &state, const HookContext *ctx,
+                                 uint64_t raw) {
+    jvalue result{};
+    switch (state.return_kind) {
+    case ValueKind::Boolean: result.z = static_cast<jboolean>(raw); break;
+    case ValueKind::Byte: result.b = static_cast<jbyte>(raw); break;
+    case ValueKind::Char: result.c = static_cast<jchar>(raw); break;
+    case ValueKind::Short: result.s = static_cast<jshort>(raw); break;
+    case ValueKind::Int: result.i = static_cast<jint>(raw); break;
+    case ValueKind::Long: result.j = static_cast<jlong>(raw); break;
+    case ValueKind::Float: {
+        const uint32_t bits = static_cast<uint32_t>(ctx->d[0]);
+        std::memcpy(&result.f, &bits, sizeof(result.f));
+        break;
+    }
+    case ValueKind::Double: std::memcpy(&result.d, &ctx->d[0], sizeof(result.d)); break;
+    case ValueKind::Object: result.l = reinterpret_cast<jobject>(raw); break;
+    case ValueKind::Void: break;
+    }
+    return result;
+}
+
+// dispatch 记录的实参 vs hooker 传回的实参：逐元素相等即视为「原样透传」。
+// 此时用保存的寄存器直调原函数（rustFrida original_call.rs:1137 的 $orig()
+// 无参路径），避开 JNI 重入 ArtMethod。
+static bool ArgsMatchObserved(JNIEnv *env, const MethodState &state,
+                              jobjectArray observed, jobjectArray supplied) {
+    if (!observed || !supplied) return observed == supplied;
+    const size_t offset = state.is_static ? 0 : 1;   // dispatch 数组含 receiver
+    const jsize count = static_cast<jsize>(state.parameter_kinds.size());
+    if (env->GetArrayLength(observed) != count + static_cast<jsize>(offset) ||
+        env->GetArrayLength(supplied) != count) {
+        return false;
+    }
+    for (jsize i = 0; i < count; ++i) {
+        jobject a = env->GetObjectArrayElement(observed, i + static_cast<jsize>(offset));
+        jobject b = env->GetObjectArrayElement(supplied, i);
+        const ValueKind kind = state.parameter_kinds[static_cast<size_t>(i)];
+        bool same = false;
+        if (kind == ValueKind::Object) {
+            same = env->IsSameObject(a, b) == JNI_TRUE;
+        } else {
+            bool ok_a = false;
+            bool ok_b = false;
+            const jvalue va = ReadArgument(env, a, kind, &ok_a);
+            const jvalue vb = ReadArgument(env, b, kind, &ok_b);
+            if (ok_a && ok_b) {
+                switch (kind) {
+                case ValueKind::Boolean: same = va.z == vb.z; break;
+                case ValueKind::Byte: same = va.b == vb.b; break;
+                case ValueKind::Char: same = va.c == vb.c; break;
+                case ValueKind::Short: same = va.s == vb.s; break;
+                case ValueKind::Int: same = va.i == vb.i; break;
+                case ValueKind::Long: same = va.j == vb.j; break;
+                case ValueKind::Float: same = va.f == vb.f; break;
+                case ValueKind::Double: same = va.d == vb.d; break;
+                default: same = false; break;
+                }
+            }
+            env->ExceptionClear();
+        }
+        if (a) env->DeleteLocalRef(a);
+        if (b) env->DeleteLocalRef(b);
+        if (!same) return false;
+    }
+    return true;
+}
+
+// hooker 执行期间的 dispatch 帧栈（thread-local）：把当前 HookContext* 暴露给
+// InvokeOriginal，对齐 rustFrida 将 hook_ctx_ptr 绑到回调对象。
+//
+// 注意：这里必须使用 POD 定长数组，不能使用 std::vector 等带析构函数的容器。
+// 本 so 由 Zygisk 的自定义加载器映射，linker 里没有对应的 soinfo；带析构的
+// thread_local 在首次访问时会调用 __cxa_thread_atexit_impl(&__dso_handle)，
+// linker 查不到该 soinfo 就直接 abort：
+//   'increment_dso_handle_reference_counter: Couldn't find soinfo by dso_handle=...'
+// （实测在 system_server 首个 dispatch 上触发，导致开机 boot loop）。
+// POD 数组无需析构，因此不会注册 TLS dtor。
+namespace {
+struct DispatchFrame {
+    jmethodID target = nullptr;
+    HookContext *ctx = nullptr;
+    jobjectArray values = nullptr;
+};
+constexpr size_t kMaxDispatchFrames = 16;
+thread_local DispatchFrame g_dispatch_frames[kMaxDispatchFrames];
+thread_local size_t g_dispatch_frame_count = 0;
+}  // namespace
+
+void PushDispatchFrame(jmethodID target, HookContext *ctx, jobjectArray values) {
+    if (g_dispatch_frame_count >= kMaxDispatchFrames) return;
+    g_dispatch_frames[g_dispatch_frame_count++] = DispatchFrame{target, ctx, values};
+}
+
+void PopDispatchFrame(jmethodID target) {
+    (void)target;
+    if (g_dispatch_frame_count > 0) --g_dispatch_frame_count;
+}
+
+bool LookupDispatchFrame(jmethodID target, HookContext **ctx, jobjectArray *values) {
+    if (g_dispatch_frame_count == 0) return false;
+    // 先按 target 精确匹配；jmethodID 可能有低位标记导致键不完全相等，
+    // 此时取栈顶（当前正在执行的 hooker 所属帧）仍然是语义正确的。
+    size_t index = g_dispatch_frame_count - 1;
+    for (size_t i = g_dispatch_frame_count; i-- > 0;) {
+        if (g_dispatch_frames[i].target == target) {
+            index = i;
+            break;
+        }
+    }
+    const DispatchFrame &found = g_dispatch_frames[index];
+    if (ctx) *ctx = found.ctx;
+    if (values) *values = found.values;
+    return true;
 }
 
 bool Initialize(JNIEnv *env) {
@@ -2862,14 +3239,18 @@ std::unique_ptr<MethodState> Install(JNIEnv *env, jobject reflected_method,
 
     // Reference: rustFrida install.rs::is_registered_native_entry_candidate and
     // the NativeEntry branch. A normal registered JNI method is hooked at data_,
-    // not through the ART quick router. CriticalNative has a different ABI and
-    // remains on LSPlant until its dedicated callback marshaller is imported.
+    // not through the ART quick router. @CriticalNative 走同一入口（data_），
+    // 但 ABI 不同：x0 起就是基本类型参数，且 $orig 只能用保存寄存器直调
+    // trampoline（rustFrida callback/hook.rs:398 + original_call.rs:1096）。
     const bool data_is_executable = IsMappedExecutable(original_data);
     const bool data_is_in_art = IsInArtModule(original_data & kPacStripMask);
     const auto native_route = ClassifyNativeRoute(
         original_flags, original_data, data_is_executable, data_is_in_art);
     const bool is_native_method = native_route != NativeRouteKind::NotNative;
     const bool registered_native = native_route == NativeRouteKind::RegisteredNative;
+    // rustFrida install.rs:311 对齐：此处只能看到 access_flags；签名可支持性
+    // （static + 基本类型参数/返回）要等 parameter_kinds/return_kind 解析完
+    // 才能定稿，见下方 critical flag 的 ART-noise 降级。
     const bool critical_native = is_native_method &&
                                  (original_flags & kAccCriticalNative) != 0;
     if (native_route == NativeRouteKind::UnsupportedNative) {
@@ -2887,8 +3268,12 @@ std::unique_ptr<MethodState> Install(JNIEnv *env, jobject reflected_method,
         if (!IsMappedExecutable(reinterpret_cast<uintptr_t>(resolved_native))) return nullptr;
         state->native_entry_hook = true;
         state->native_entry_target = reinterpret_cast<uintptr_t>(resolved_native);
+        state->native_entry_critical = critical_native;
         state->callback = callback;
         state->callback_user_data = reinterpret_cast<void *>(key);
+        LOGI("ART native entry route: method={} target={} critical={} flags=0x{:x}",
+             reinterpret_cast<void *>(state->original_art_method),
+             reinterpret_cast<void *>(resolved_native), critical_native, original_flags);
     }
 
     // rustFrida's route_has_independent_code covers compiled AOT/JIT entries
@@ -3036,6 +3421,16 @@ std::unique_ptr<MethodState> Install(JNIEnv *env, jobject reflected_method,
         state->return_kind = ValueKind::Void;
     }
     env->DeleteLocalRef(method_class);
+
+    // rustFrida install.rs:314-319 对齐：flag 与签名必须同时成立才算 @CriticalNative，
+    // 否则该位是 ART noise（MIUI 等构建可能误置）。判定必须在 parameter_kinds /
+    // return_kind 解析完成后进行。
+    if (state->native_entry_critical && !IsCriticalNativeSignatureSupported(*state)) {
+        LOGI("ART native entry critical flag ignored as ART noise: method={} flags=0x{:x}",
+             reinterpret_cast<void *>(state->original_art_method), original_flags);
+        state->native_entry_critical = false;
+    }
+
     auto declaring_class = env->CallObjectMethod(reflected_method, get_declaring_class);
     if (!declaring_class || env->ExceptionCheck()) {
         env->ExceptionClear();
@@ -3228,6 +3623,75 @@ jobject InvokeOriginal(JNIEnv *env, const MethodState &state, jobject receiver,
         ThrowIllegalArgument(env, "args.length does not match parameter count");
         return nullptr;
     }
+
+    // 注：managed / native-entry 两条路的 $orig 都走 rustFrida 的「寄存器直调重定位
+    // trampoline」（前者见下方 quick 寄存器分支，后者见紧跟的 native-entry 分支）。
+    // 早前在此处写的「quick 直调不适用」结论已修正（见下方分支注释）。
+
+    // rustFrida original_call.rs:1096/1137 对齐：native-entry hook 的 $orig 优先
+    // 用「进入时的原始寄存器」直调保存的 trampoline，而不是经 JNI 重入 ArtMethod。
+    // 崩溃实证（tombstone_24/25）：SystemProperties 原生入口的 data_ 会被多种调用
+    // 约定进入（AOT JNI stub / generic JNI trampoline），按 JNI 布局重入会把垃圾
+    // 参数传给原函数（__strncmp 段错误）。寄存器直调与入口 ABI 无关，天然正确。
+    if (state.native_entry_hook && state.quick_trampoline != 0) {
+        HookContext *dispatch_ctx = nullptr;
+        jobjectArray observed = nullptr;
+        if (LookupDispatchFrame(reinterpret_cast<jmethodID>(state.original_art_method),
+                                &dispatch_ctx, &observed) &&
+            dispatch_ctx) {
+            // critical: ABI 决定寄存器就是参数本身，任何 Java 侧实参都只能忽略；
+            // 普通 native: 仅在实参原样透传时直调（改参仍走 JNI 路径）。
+            const bool pass_through =
+                state.native_entry_critical || ArgsMatchObserved(env, state, observed, args);
+            if (pass_through) {
+                const uint64_t raw = hook_invoke_trampoline(
+                    dispatch_ctx, reinterpret_cast<void *>(state.quick_trampoline));
+                return BoxReturn(env, state.return_kind,
+                                 ReturnValueFromRaw(state, dispatch_ctx, raw));
+            }
+        }
+    }
+
+    // ============================================================
+    // rustFrida original_call.rs:1082 对齐 —— managed（非 native-entry）hook 的
+    // $orig 优先用 dispatch 帧里保存的 quick 寄存器直调重定位 trampoline，
+    // 不再经 JNI 重入。
+    //
+    // 此前（Part A 实验）判定「quick 寄存器直调不适用」的判据是错的：当时在
+    // native-entry 上下文的 dispatch 里测到 x0 = JNIEnv，就以为所有 hook 都是
+    // JNI ABI。实测 Java（managed）hook 经 router thunk（224B 帧）进入时是
+    // quick ABI：x0 = ArtMethod，x1..x7 / d0..d7 = 实参（router prologue 就是
+    // 按这个约定保存寄存器的）。
+    //
+    // 为什么必须直调而不是 JNI 重入：JNI 重入会让被 patch 的入口带着 JNI-ABI
+    // 寄存器（x0 = JNIEnv）被再次进入，thunk 顶部的 $orig bypass 按
+    // slot->method == x0 匹配必然失败，于是落到 prologue 把 JNIEnv 当成
+    // ArtMethod 写进帧槽 → ART 走栈（GC VisitRoots / DumpJavaStack）读它 →
+    //   stack.cc:834] Check failed: existing_entry_point != nullptr
+    //   runtime.cc:669] Runtime aborting --- recursively
+    // 实测 hunter 冷启期以 SIGABRT 收场。直调不新建任何帧、不重新进入被 patch
+    // 的入口，帧槽永远只会是真实 ArtMethod。
+    //
+    // 与 rustFrida 的差异仅一处：rustFrida 无条件用保存的寄存器（JS 侧改参会被
+    // 忽略）；Vector 用 ArgsMatchObserved 校验 Java 侧实参是否原样透传，改过参
+    // 仍回落 JNI 路径，语义更保守。
+    if (!state.native_entry_hook && state.quick_trampoline != 0 &&
+        state.original_art_method != 0) {
+        HookContext *dispatch_ctx = nullptr;
+        jobjectArray observed = nullptr;
+        if (LookupDispatchFrame(reinterpret_cast<jmethodID>(state.original_art_method),
+                                &dispatch_ctx, &observed) &&
+            dispatch_ctx && dispatch_ctx->x[0] == state.original_art_method) {
+            const bool pass_through = ArgsMatchObserved(env, state, observed, args);
+            if (pass_through) {
+                const uint64_t raw = hook_invoke_trampoline(
+                    dispatch_ctx, reinterpret_cast<void *>(state.quick_trampoline));
+                return BoxReturn(env, state.return_kind,
+                                 ReturnValueFromRaw(state, dispatch_ctx, raw));
+            }
+        }
+    }
+
     std::vector<jvalue> values(static_cast<size_t>(count));
     std::vector<jobject> object_args;
     object_args.reserve(static_cast<size_t>(count));
