@@ -1,0 +1,19 @@
+# DuckUSB (Vector port). Java Properties format, so '#' comments are fine HERE -- unlike
+# scope.list, whose parser has no comment syntax at all.
+minApiVersion=101
+targetApiVersion=102
+exceptionMode=protective
+
+# Scope is NOT fixed, so the Vector manager lists every installed app and the three names in
+# scope.list are highlighted as recommendations rather than being an outer limit.
+#
+# This matches upstream. It is also the only workable setting for this module: its whole point
+# is to lie to the detector apps the reader chooses, and a fixed scope would mean editing source
+# and rebuilding to choose one. The guards that keep a careless tick from reaching a core OS
+# process are in DuckUsbModule.onPackageReady (uid, process name, package name) and, for the raw
+# property layer, should_skip_hooks() in native_hooks.c.
+#
+# Flip this to true to make scope.list an outer limit instead. Read the README first: the daemon
+# then prunes any row the module does not claim, so apps ticked later get dropped on the next
+# cache rebuild.
+staticScope=false

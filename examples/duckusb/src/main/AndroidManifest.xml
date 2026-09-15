@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      A modern (libxposed/Vector) module carries NO xposed* meta-data. The framework identifies
+      it from META-INF/xposed/: module.prop (min/target API + staticScope), java_init.list (the
+      entry class), native_init.list (libvector_duckusb.so) and scope.list (the fixed scope).
+
+      No INTERNET permission: upstream's only network use was the manual update check, which is
+      not ported. The hook half never touches the network.
+    -->
+    <application
+        android:name=".DuckUsbApp"
+        android:allowBackup="false"
+        android:hasCode="true"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:extractNativeLibs="false">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

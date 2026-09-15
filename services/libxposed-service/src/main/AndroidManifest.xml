@@ -1,0 +1,24 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!--
+      Mirrors services/libxposed/service/src/main/AndroidManifest.xml. The submodule's manifest
+      is NOT picked up automatically: AGP reads only this module's own src/main/AndroidManifest.xml,
+      and the submodule's java/aidl directories are pulled in as extra source sets (see
+      build.gradle.kts). Keeping the entry here is what makes a consuming module app merge a
+      provider at <applicationId>.WbService — the authority daemon's ModuleAppService.sendBinder
+      looks for before it gives up, retries three times and throttles for a minute.
+
+      ${applicationId} is deliberately left unexpanded: it is substituted with the *consumer's*
+      application id during manifest merge, which is exactly the per-module authority we need.
+      The class name is fully qualified rather than ".WbProvider" because this module's namespace
+      differs from the class's package.
+    -->
+    <application>
+        <provider
+            android:name="de.wwb.android.wbosed.service.WbProvider"
+            android:authorities="${applicationId}.WbService"
+            android:exported="true"
+            tools:ignore="ExportedContentProvider" />
+    </application>
+</manifest>

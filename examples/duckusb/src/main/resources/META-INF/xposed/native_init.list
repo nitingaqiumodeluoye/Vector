@@ -1,0 +1,6 @@
+# Native library names declared by this module (one per line).
+# The daemon reads lib/arm64-v8a/libvector_duckusb.so out of this APK into sealed SharedMemory
+# and Vector's soLoader links it, then calls its exported native_init(NativeAPIEntries*) from a
+# module-class context. System.loadLibrary() is never used and would not work: soLoader maps the
+# image anonymously and never registers it with the Android linker.
+libvector_duckusb.so
