@@ -7,7 +7,6 @@
 #include <jni/jni_bridge.h>
 #include <jni/jni_hooks.h>
 #include <pthread.h>
-#include <sys/prctl.h>
 #include <sys/system_properties.h>
 #include <unistd.h>
 
@@ -24,122 +23,35 @@
 
 namespace vector::native::module {
 
-#ifndef PR_SET_VMA
-#define PR_SET_VMA 0x53564d41
-#endif
-#ifndef PR_SET_VMA_ANON_NAME
-#define PR_SET_VMA_ANON_NAME 0
-#endif
-
-static constexpr const char *kZygiskVmaName = "wwb_zygisk";
-static constexpr useconds_t kLateVmaNameDelaysUs[] = {
-    10 * 1000,
-    50 * 1000,
-    200 * 1000,
-    1000 * 1000,
-    3000 * 1000,
-};
-
-// rustFrida reference:
-// - loader/helpers/bootstrapper.c frida_bootstrap names its temporary executable mapping
-//   "wwb_loader" with PR_SET_VMA_ANON_NAME.
-// - loader/helpers/rustfrida-loader.c rustfrida_set_vma_name applies the same naming to
-//   agent mappings derived from the "wwb_so" memfd.
-// Vector is loaded by the Zygisk runtime before our code runs, so we cannot turn this VMA into
-// a memfd here. We can still name the already-loaded anonymous RX segment that contains this
-// module's code, matching rustFrida's wwb_* VMA naming style.
-static void NameOwnZygiskRxVma() {
-    const auto own_pc = reinterpret_cast<uintptr_t>(&NameOwnZygiskRxVma);
-
-    FILE *maps = fopen("/proc/self/maps", "r");
-    if (!maps) {
-        LOGW("[vma-name] failed to open /proc/self/maps");
-        return;
-    }
-
-    char line[512];
-    while (fgets(line, sizeof(line), maps)) {
-        unsigned long start = 0;
-        unsigned long end = 0;
-        unsigned long offset = 0;
-        unsigned long inode = 0;
-        char perms[5] = {};
-        char dev[32] = {};
-
-        if (sscanf(line, "%lx-%lx %4s %lx %31s %lu", &start, &end, perms, &offset, dev,
-                   &inode) != 6) {
-            continue;
-        }
-
-        if (own_pc < static_cast<uintptr_t>(start) || own_pc >= static_cast<uintptr_t>(end)) {
-            continue;
-        }
-
-        if (perms[2] != 'x') {
-            LOGW("[vma-name] own pc is not in executable VMA: {}", line);
-            break;
-        }
-
-        if (strcmp(dev, "00:00") != 0 || inode != 0) {
-            LOGD("[vma-name] own zygisk RX VMA is not anonymous; skip naming: {}", line);
-            break;
-        }
-
-        const unsigned long size = end - start;
-        errno = 0;
-        const int ret = prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, start, size,
-                              reinterpret_cast<unsigned long>(kZygiskVmaName));
-        if (ret == 0) {
-            LOGI("[vma-name] named own zygisk RX VMA '{}' range={:x}-{:x}", kZygiskVmaName,
-                 start, end);
-        } else {
-            LOGW("[vma-name] failed to name own zygisk RX VMA '{}' range={:x}-{:x} errno={}",
-                 kZygiskVmaName, start, end, errno);
-        }
-        break;
-    }
-
-    fclose(maps);
-}
-
-static void *LateNameOwnZygiskRxVmaWorker(void *) {
-    NameOwnZygiskRxVma();
-
-    for (useconds_t delay_us : kLateVmaNameDelaysUs) {
-        usleep(delay_us);
-        NameOwnZygiskRxVma();
-    }
-
-    return nullptr;
-}
-
-static void ScheduleLateNameOwnZygiskRxVma() {
-    pthread_t thread{};
-    errno = 0;
-    const int ret = pthread_create(&thread, nullptr, LateNameOwnZygiskRxVmaWorker, nullptr);
-    if (ret == 0) {
-        pthread_detach(thread);
-        LOGD("[vma-name] scheduled late own zygisk RX VMA naming");
-    } else {
-        LOGW("[vma-name] failed to schedule late own zygisk RX VMA naming errno={}", ret);
-    }
-}
-
-// Snapshot anonymous executable mappings at injection boundaries. These maps have no
-// pathname/inode, so recording them around each native stage is the only reliable way
-// to distinguish Vector allocation from a later app/library initializer.
-static void TraceAnonymousExecMaps(const char *stage) {
-    // Diagnostic-only: reading /proc/self/maps fires a page-table walk and takes the
-    // process mmap semaphore on every call. This ran up to 8x on the postAppSpecialize
-    // hot path (entry/after-binder/after-fetch/after-load-dex/after-init-hooks/
-    // after-entry-class/before-fork-common/after-fork-common). On a cold VM (fresh
-    // TLB/icache + first-touch wxshadow pages) each scan degrades into a multi-second
-    // fault storm (perf: handle_pte_fault + do_el0_ia_bp_hardening + mmap_lock spin).
-    // Disabled by default; the corresponding Java-side tracers were disabled in the same
-    // way (VectorModuleManager/VectorStartup traceAnonymousExecMaps).
-    (void)stage;
-    return;
-}
+// 2026-09-18 移除：此处曾实现「自身 VMA 命名」——常量 kZygiskVmaName="wwb_zygisk"、
+// NameOwnZygiskRxVma()、后台延时重试线程（LateNameOwnZygiskRxVmaWorker /
+// ScheduleLateNameOwnZygiskRxVma）。原意是把本模块的匿名 RX 段命名成 wwb_*，躲开
+// 「无名 anon r-x = LSPLant trampoline / InMemoryDex」的启发式。整段已删除，原因：
+//
+//   1. ReZygisk 的 CSOLoader 以 `MAP_PRIVATE + real fd` 映射模块，该段是 file-backed
+//      （实测 r-xp 00000000 fc:0a 297600 /data/adb/modules/zygisk_vector/zygisk/arm64-v8a.so），
+//      函数里的匿名守卫 `dev=="00:00" && inode==0` 直接 break，一次机会都没有。
+//   2. 放宽守卫也无收益：PR_SET_VMA_ANON_NAME 对 file-backed VMA **返回 0 但静默无效**，
+//      两道关卡都在内核里（小米 4.19 / alioth 源码已核对）：
+//        kernel/sys.c:2307-2309   success: if (!vma->vm_file) vma->anon_name = name_addr;
+//                                 —— file-backed 段直接跳过赋值，函数仍返回 0；
+//        fs/proc/task_mmu.c:378-382  if (file) { seq_file_path(m, file, "\n"); goto done; }
+//                                 —— 打印文件路径后就跳走，永远走不到 408-411 行的
+//                                 seq_print_vma_name()。
+//      所以只放宽守卫会打出「命名成功」的假阳性日志（本函数 `if (ret == 0) LOGI(...)`）。
+//
+//      另注（若日后重做本功能必须知道）：该内核的 anon name 是 **用户态指针**，
+//      不拷贝字符串（mm_types.h:308 `const char __user *anon_name`），打印时才用
+//      get_user_pages_remote 现读那一页；页读不到就打印 "[anon:<fault>]"
+//      （task_mmu.c:152-157）。故名字字符串必须常驻 —— 放进会被卸载的库里会退化成
+//      [anon:<fault>]，那是比无名段更明显的指纹。
+//   3. 代价不低：8 处同步调用 + 后台线程 6 次重试 = 单进程最多 14 次全量扫
+//      /proc/self/maps（page-table walk + mmap_lock），外加一个常驻 4.26s 的短命线程。
+//
+// 隐藏职责改由 Treat Wheel 的 MH（maps hiding，src/lib/hiding.c::do_maps_hiding）承担：
+// 它用「匿名副本 + mremap(MREMAP_MAYMOVE|MREMAP_FIXED) 覆盖原址」把 file-backed 段换成
+// 匿名段，路径整段从 maps 消失。若日后确需恢复命名，正确顺序是**先做该换页转换再
+// prctl 命名**（换页后的 VMA 才是匿名，prctl 才真正生效）。
 
 static long long StartupElapsedUs(
     const std::chrono::steady_clock::time_point &start) {
@@ -417,8 +329,6 @@ void VectorModule::onLoad(zygisk::Api *api, JNIEnv *env) {
     this->api_ = api;
     this->env_ = env;
 
-    NameOwnZygiskRxVma();
-
     // Create two singlton instances for classes Context and ConfigBridge
     instance_.reset(this);
     ConfigImpl::Init();
@@ -426,8 +336,6 @@ void VectorModule::onLoad(zygisk::Api *api, JNIEnv *env) {
 }
 
 void VectorModule::preAppSpecialize(zygisk::AppSpecializeArgs *args) {
-    NameOwnZygiskRxVma();
-
     // Reset state for this new process fork.
     should_inject_ = false;
     is_manager_app_ = false;
@@ -481,13 +389,6 @@ void VectorModule::preAppSpecialize(zygisk::AppSpecializeArgs *args) {
 
     IPCBridge::GetInstance().Initialize(env_);
 
-    // TEMP DIAGNOSTIC (3250): enable the in-process ART hook perf timers
-    // ([perf] art_method_install stage=... / [perf] java_hook ...) so the
-    // multi-second silent stalls inside LoadedApk* / createAppFactory hook
-    // installation can be attributed to a concrete sub-step (route / reflect /
-    // clone / downgrade / thunk / table_add). Remove after localization.
-    setenv("VECTOR_ART_HOOK_PERF", "1", 1);
-
     // --- Injection Decision Logic ---
     // Determine if the current process is a valid target for injection.
     lsplant::JUTFString nice_name_str(env_, args->nice_name);
@@ -537,8 +438,6 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
         return;
     }
 
-    NameOwnZygiskRxVma();
-
     if (is_manager_app_) {
         args->nice_name = env_->NewStringUTF(kManagerPackageName);
     }
@@ -548,7 +447,6 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     const auto startup_start = std::chrono::steady_clock::now();
     LOGI("[startup-trace] native postAppSpecialize begin package='{}'", nice_name_str.get());
     LOGD("Asking the daemon about '{}'.", nice_name_str.get());
-    TraceAnonymousExecMaps("postAppSpecialize:entry");
 
     auto &ipc_bridge = IPCBridge::GetInstance();
     auto stage_start = std::chrono::steady_clock::now();
@@ -560,15 +458,12 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
              "elapsedUs={} result=none",
              nice_name_str.get(), StartupElapsedUs(stage_start));
         LOGD("Not injecting '{}': the daemon has no binder for it.", nice_name_str.get());
-        NameOwnZygiskRxVma();
         SetAllowUnload(true);
         return;
     }
     LOGI("[startup-trace] native stage end=RequestAppBinder package='{}' "
          "elapsedUs={} result=ok",
          nice_name_str.get(), StartupElapsedUs(stage_start));
-    NameOwnZygiskRxVma();
-    TraceAnonymousExecMaps("postAppSpecialize:after-binder");
 
     // Fetch resources from the manager service.
     stage_start = std::chrono::steady_clock::now();
@@ -578,7 +473,6 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
              "elapsedUs={} result=failed",
              nice_name_str.get(), StartupElapsedUs(stage_start));
         LOGE("Failed to fetch framework DEX for '{}'.", nice_name_str.get());
-        NameOwnZygiskRxVma();
         SetAllowUnload(true);
         return;
     }
@@ -588,7 +482,6 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     LOGI("[startup-trace] native stage end=FetchFrameworkDex package='{}' "
          "elapsedUs={} result=ok size={}",
          nice_name_str.get(), StartupElapsedUs(stage_start), dex_size);
-    TraceAnonymousExecMaps("postAppSpecialize:after-fetch");
 
     stage_start = std::chrono::steady_clock::now();
     {
@@ -598,7 +491,6 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     close(dex_fd);  // The FD is duplicated by mmap, we can close it now.
     LOGI("[startup-trace] native stage end=LoadDex package='{}' elapsedUs={}",
          nice_name_str.get(), StartupElapsedUs(stage_start));
-    TraceAnonymousExecMaps("postAppSpecialize:after-load-dex");
 
     // Flow reference: rawVector installs framework hooks synchronously before ActivityThread.attach.
     // Vector's hook backend is WxShadow rather than rawVector's LSPlant, so Java initializes the
@@ -616,17 +508,14 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     this->InitHooks(env_);
     LOGI("[startup-trace] native stage end=InitHooks package='{}' elapsedUs={}",
          nice_name_str.get(), StartupElapsedUs(stage_start));
-    TraceAnonymousExecMaps("postAppSpecialize:after-init-hooks");
     // Find the Java entrypoint.
     stage_start = std::chrono::steady_clock::now();
     this->SetupEntryClass(env_);
     LOGI("[startup-trace] native stage end=SetupEntryClass package='{}' elapsedUs={}",
          nice_name_str.get(), StartupElapsedUs(stage_start));
-    TraceAnonymousExecMaps("postAppSpecialize:after-entry-class");
 
     // Hand off control to the Java side of the framework.
     stage_start = std::chrono::steady_clock::now();
-    TraceAnonymousExecMaps("postAppSpecialize:before-fork-common");
     bool entered = this->FindAndCall(
         env_, "forkCommon", "(ZZLjava/lang/String;Ljava/lang/String;Landroid/os/IBinder;Z)V",
         JNI_FALSE, JNI_FALSE, args->nice_name, args->app_data_dir, binder.get(),
@@ -634,7 +523,6 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     LOGI("[startup-trace] native stage end=Main.forkCommon package='{}' "
          "elapsedUs={} result={}",
          nice_name_str.get(), StartupElapsedUs(stage_start), entered);
-    TraceAnonymousExecMaps("postAppSpecialize:after-fork-common");
 
     if (entered) {
         LOGV("Injected Vector framework into '{}'.", nice_name_str.get());
@@ -645,15 +533,11 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     // Unconditionally: the ART and JNI hooks were installed before the entry ran, and their
     // trampolines point into this library. Letting it be unloaded now would leave them dangling.
     SetAllowUnload(false);
-    NameOwnZygiskRxVma();
-    ScheduleLateNameOwnZygiskRxVma();
     LOGI("[startup-trace] native postAppSpecialize end package='{}' elapsedUs={}",
          nice_name_str.get(), StartupElapsedUs(startup_start));
 }
 
 void VectorModule::preServerSpecialize(zygisk::ServerSpecializeArgs *args) {
-    NameOwnZygiskRxVma();
-
     // Reset process-local backend state just like app specialization does.
     // system_server currently initializes LSPlant explicitly below, but keeping
     // inherited zygote state out avoids stale fallback decisions.

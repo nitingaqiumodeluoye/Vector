@@ -7,7 +7,6 @@
  */
 
 #include "hook_engine_internal.h"
-#include <sys/prctl.h>
 #include <stdbool.h>
 
 /* --- Simple replacement hook (hook_install) --- */
@@ -405,16 +404,6 @@ static void* generate_diag_const_replace_thunk(HookEntry* entry, uint64_t value,
                      entry->target, errno);
             return NULL;
         }
-        /* Keep standalone executable thunks identifiable in process maps. */
-#ifndef PR_SET_VMA
-#define PR_SET_VMA 0x53564d41
-#endif
-#ifndef PR_SET_VMA_ANON_NAME
-#define PR_SET_VMA_ANON_NAME 0
-#endif
-        (void)prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME,
-                    (unsigned long)thunk_mem, (unsigned long)THUNK_ALLOC_SIZE,
-                    (unsigned long)"wwb_hook_thunk");
         hook_log("[STEALTH1] diagnostic: minimal const thunk after mmap target=%p thunk=%p",
                  entry->target, thunk_mem);
         entry->thunk = thunk_mem;

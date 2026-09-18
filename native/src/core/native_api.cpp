@@ -1,7 +1,5 @@
 #include "core/native_api.h"
 
-#include <android/dlext.h>
-
 #include <sys/mman.h>
 #include <sys/prctl.h>
 
@@ -98,7 +96,6 @@ namespace vector::native {
 namespace {
 std::mutex g_core_elf_registry_mutex;
 std::unordered_map<std::string, std::unique_ptr<ElfLoader>> g_loaded_module_loaders;
-std::unordered_map<std::string, void *> g_loaded_module_linker_handles;
 std::unordered_set<std::string> g_module_native_libs;
 std::unordered_set<void *> g_initialized_linker_module_handles;
 std::unordered_set<std::string> g_loading_module_libraries;
@@ -115,12 +112,6 @@ struct PendingNativeInit {
     NativeInit init;
 };
 std::vector<PendingNativeInit> g_pending_native_inits;
-
-// Temporary diagnostic build switch requested for comparing Vector soLoader against Android linker.
-// Keep the Java/daemon transport unchanged (module ELF still arrives as sealed SharedMemory), but
-// hand the FD to bionic linker via android_dlopen_ext instead of Vector's ElfLoader. This must not
-// be kept enabled in the production soLoader path.
-constexpr bool kDiagUseAndroidLinkerForModuleNative = false;
 
 using DoDlopen = void *(*)(const char *name, int flags, const void *extinfo,
                            const void *caller_addr);
@@ -503,11 +494,6 @@ bool LoadNativeLibraryFd(int fd, size_t size, const std::string &library_name) {
             LOGI("Module ELF '{}' is already loaded through Vector soLoader.", library_name.c_str());
             return true;
         }
-        if (g_loaded_module_linker_handles.contains(library_name)) {
-            LOGI("Module ELF '{}' is already loaded through diagnostic Android linker path.",
-                 library_name.c_str());
-            return true;
-        }
         if (!g_loading_module_libraries.insert(library_name).second) {
             LOGE("Module ELF '{}' is already being loaded.", library_name.c_str());
             return false;
@@ -518,60 +504,6 @@ bool LoadNativeLibraryFd(int fd, size_t size, const std::string &library_name) {
         std::lock_guard<std::mutex> lock(g_core_elf_registry_mutex);
         g_loading_module_libraries.erase(library_name);
     };
-
-    if constexpr (kDiagUseAndroidLinkerForModuleNative) {
-        LOGW("DIAG linker loader enabled for module ELF '{}' fd={} size={}; bypassing Vector soLoader for this build.",
-             library_name.c_str(), fd, size);
-
-        android_dlextinfo extinfo{};
-        extinfo.flags = ANDROID_DLEXT_USE_LIBRARY_FD | ANDROID_DLEXT_FORCE_LOAD;
-        extinfo.library_fd = fd;
-        void *handle = android_dlopen_ext(library_name.c_str(), RTLD_NOW, &extinfo);
-        if (handle == nullptr) {
-            LOGE("DIAG linker loader failed for module '{}': {}", library_name.c_str(), dlerror());
-            finish_loading();
-            return false;
-        }
-        LOGW("DIAG linker loader linked module ELF '{}' handle={} map='{}'.",
-             library_name.c_str(), handle, FindMapLine(handle).c_str());
-
-        auto init_sym = dlsym(handle, "native_init");
-        if (init_sym == nullptr) {
-            LOGE("DIAG linker loader module '{}' does not export native_init: {}",
-                 library_name.c_str(), dlerror());
-            finish_loading();
-            return false;
-        }
-
-        try {
-            auto native_init = reinterpret_cast<NativeInit>(init_sym);
-            LOGW("DIAG linker native_init diagnostics for '{}': addr={} map='{}' bytes=[{}]",
-                 library_name.c_str(), init_sym, FindMapLine(init_sym).c_str(),
-                 FormatBytes(init_sym, 16).c_str());
-            LOGW("DIAG linker calling native_init for module ELF '{}' at {}",
-                 library_name.c_str(), init_sym);
-            if (auto callback = native_init(g_native_api_entries); callback != nullptr) {
-                std::lock_guard<std::mutex> lock(g_core_elf_registry_mutex);
-                g_module_loaded_callbacks.push_back(callback);
-                LOGW("DIAG linker native_init for '{}' registered library-load callback {}.",
-                     library_name.c_str(), reinterpret_cast<void *>(callback));
-            } else {
-                LOGW("DIAG linker native_init for '{}' completed without library-load callback.",
-                     library_name.c_str());
-            }
-        } catch (...) {
-            LOGE("DIAG linker native_init threw for module '{}'.", library_name.c_str());
-            finish_loading();
-            return false;
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(g_core_elf_registry_mutex);
-            g_loading_module_libraries.erase(library_name);
-            g_loaded_module_linker_handles.emplace(library_name, handle);
-        }
-        return true;
-    }
 
     auto loader = std::make_unique<ElfLoader>();
     if (!loader->LoadLibraryFd(fd, size, library_name.c_str())) {
@@ -600,9 +532,10 @@ bool LoadNativeLibraryFd(int fd, size_t size, const std::string &library_name) {
         g_pending_native_inits.push_back({library_name, native_init});
     }
     LOGI("[perf] load_lib stage=native_init_deferred elapsedUs={}",
-         static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
-             std::chrono::steady_clock::now() - load_start)
-             .count()));
+             static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+                 std::chrono::steady_clock::now() - load_start)
+                 .count()));
+    }
 
     {
         std::lock_guard<std::mutex> lock(g_core_elf_registry_mutex);
@@ -610,9 +543,10 @@ bool LoadNativeLibraryFd(int fd, size_t size, const std::string &library_name) {
         g_loaded_module_loaders.emplace(library_name, std::move(loader));
     }
     LOGI("[perf] load_lib stage=finish_total elapsedUs={}",
-         static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
-             std::chrono::steady_clock::now() - load_start)
-             .count()));
+             static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+                 std::chrono::steady_clock::now() - load_start)
+                 .count()));
+    }
     return true;
 }
 

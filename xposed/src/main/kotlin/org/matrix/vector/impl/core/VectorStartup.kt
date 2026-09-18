@@ -51,13 +51,6 @@ object VectorStartup {
         return names.any { it in items }
     }
 
-    private fun traceAnonymousExecMaps(stage: String) {
-        // Diagnostic-only: see VectorModuleManager.traceAnonymousExecMaps. Reading
-        // /proc/self/maps on the pre-attach bootstrap path amplifies cold-VM fault storms and
-        // contends for the process mmap semaphore with trampoline/thunk allocation. Disabled.
-        return
-    }
-
     private data class DeferredAppState(
         val activityThread: ActivityThread,
         val packageName: String,
@@ -451,7 +444,6 @@ object VectorStartup {
     @JvmStatic
     fun bootstrapNoArtDeferred() {
         if (!noArtDeferredStarted.compareAndSet(false, true)) return
-        traceAnonymousExecMaps("thread-start")
 
         // rustFrida reference:
         // - quickjs-hook/src/jsapi/java/java_boot.js Java._installGateHook defers the gate while
@@ -558,7 +550,6 @@ object VectorStartup {
     ) {
         if (!appAttachLifecycleReplayDispatched.compareAndSet(false, true)) return
 
-        traceAnonymousExecMaps("app-attach-lifecycle-replay-before-dispatch")
         Utils.logW(
             "App attach lifecycle replay ready for ${state.packageName}/" +
                 "${state.processName} after ${attempt * 25}ms reason=$reason; " +
@@ -610,7 +601,6 @@ object VectorStartup {
     }
 
     private fun dispatchNoArtDeferred(state: DeferredAppState, attempt: Int) {
-        traceAnonymousExecMaps("classloader-ready-before-dispatch")
         Utils.logI(
             "No-ART deferred bootstrap ready for ${state.packageName}/" +
                 "${state.processName} after ${attempt * 25}ms"
@@ -658,7 +648,6 @@ object VectorStartup {
     }
 
     private fun dispatchArtDeferredFallback(state: DeferredAppState, attempt: Int) {
-        traceAnonymousExecMaps("art-fallback-classloader-ready-before-dispatch")
         Utils.logW(
             "ART deferred bootstrap fallback ready for ${state.packageName}/" +
                 "${state.processName} after ${attempt * 25}ms; replaying rawVector first-package " +

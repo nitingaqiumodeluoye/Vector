@@ -103,15 +103,6 @@ object VectorModuleManager {
             }
     }
 
-    private fun traceAnonymousExecMaps(stage: String, modulePackageName: String) {
-        // Diagnostic-only: reading /proc/self/maps fires a page-table walk + takes the process
-        // mmap semaphore on every call. This was invoked up to 14x per module load on the fork/
-        // pre-attach hot path, and on a cold VM (fresh TLB/icache + first-touch shadow pages) it
-        // degenerates into a multi-second fault storm (perf: handle_pte_fault +
-        // do_el0_ia_bp_hardening + seq_path + mmap_lock contention). Disabled by default.
-        return
-    }
-
     // Entries are weak on purpose: activeModules owns the only strong reference, and detach()
     // removes it. A reload holds a local strong list for the cycle instead.
     private class Generation(
@@ -158,10 +149,8 @@ object VectorModuleManager {
         // NOTE: the soLoader native load moved into buildGeneration(), after loadApk() has created
         // the module ClassLoader. See loadModuleNativeLibraries() for the rawVector timing reason.
 
-        traceAnonymousExecMaps("renderModule:before-build", module.packageName)
         val (generation, entries) =
             buildGeneration(module, isSystemServer, processName) ?: return false
-        traceAnonymousExecMaps("renderModule:after-build", module.packageName)
 
         entries.forEach { VectorLifecycleManager.activeModules.add(it) }
         generations[module.packageName] = generation
@@ -173,12 +162,10 @@ object VectorModuleManager {
                 override fun getProcessName(): String = processName
             }
         entries.forEach { entry ->
-            traceAnonymousExecMaps("onModuleLoaded:before:${entry.javaClass.name}", module.packageName)
             runCatching { entry.onModuleLoaded(param) }
                 .onFailure { e ->
                     Log.e(TAG, "Error in onModuleLoaded for ${entry.javaClass.name}", e)
                 }
-            traceAnonymousExecMaps("onModuleLoaded:after:${entry.javaClass.name}", module.packageName)
         }
 
         Log.d(TAG, "Rendered module ${module.packageName} successfully.")
@@ -241,7 +228,6 @@ object VectorModuleManager {
     ): Pair<Generation, List<WbModule>>? {
         try {
             Log.d(TAG, "Render module ${module.packageName}")
-            traceAnonymousExecMaps("buildGeneration:start", module.packageName)
 
             val librarySearchPath =
                 if (USE_RAW_VECTOR_LINKER_NATIVE_LOADER) {
@@ -285,11 +271,9 @@ object VectorModuleManager {
             ) {
                 "Unable to enable the in-memory module ClassLoader constructor"
             }
-            traceAnonymousExecMaps("buildGeneration:after-hidden-api", module.packageName)
 
             // Create the isolated ClassLoader for the module
             val initLoader = WbModule::class.java.classLoader
-            traceAnonymousExecMaps("renderApk:before", module.packageName)
             // Append Vector's NativeInitFire carrier dex so the carrier class is defined by the
             // MODULE ClassLoader itself: firePendingNativeInits binds and invokes its declared
             // native method to give deferred native_init entrypoints the module FindClass context
@@ -312,7 +296,6 @@ object VectorModuleManager {
                     initLoader,
                     blockLegacyApi = module.code.targetApiVersion >= 102,
                 )
-            traceAnonymousExecMaps("renderApk:after", module.packageName)
 
             // Security/Integrity Check: Ensure the module isn't bundling its own API classes
             if (
@@ -328,9 +311,7 @@ object VectorModuleManager {
             // classes. rawVector timing: the module itself dlopens its library from its Java code,
             // so the call stack ClassLoader is the module's; here the module ClassLoader is set as
             // the thread context ClassLoader around the call instead.
-            traceAnonymousExecMaps("loadModuleNativeLibraries:before", module.packageName)
             if (!loadModuleNativeLibraries(module)) return null
-            traceAnonymousExecMaps("loadModuleNativeLibraries:after", module.packageName)
 
             // Fire the deferred native_init entrypoints from a module-class context so that
             // FindClass inside them resolves the module's own Java classes (rawVector timing:
@@ -387,9 +368,7 @@ object VectorModuleManager {
             val entries = mutableListOf<WbModule>()
             for (className in module.code.moduleClassNames) {
                 runCatching {
-                        traceAnonymousExecMaps("renderClass:before:$className", module.packageName)
                         val moduleClass = moduleClassLoader.loadClass(className)
-                        traceAnonymousExecMaps("renderClass:after:$className", module.packageName)
                         Log.v(TAG, "Render class $moduleClass")
 
                         if (!WbModule::class.java.isAssignableFrom(moduleClass)) {
@@ -399,15 +378,12 @@ object VectorModuleManager {
 
                         val constructor = moduleClass.getDeclaredConstructor()
                         constructor.isAccessible = true
-                        traceAnonymousExecMaps("constructor:before:$className", module.packageName)
                         val moduleInstance = constructor.newInstance() as WbModule
-                        traceAnonymousExecMaps("constructor:after:$className", module.packageName)
 
                         // detach() is per entry: only the instance that calls it stops.
                         moduleInstance.attachFramework(vectorContext) {
                             VectorLifecycleManager.detach(moduleInstance)
                         }
-                        traceAnonymousExecMaps("attachFramework:after:$className", module.packageName)
 
                         entries.add(moduleInstance)
                     }
