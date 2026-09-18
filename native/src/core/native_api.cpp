@@ -21,6 +21,7 @@
 
 #include "common/logging.h"
 #include "art_hook/hook_engine.h"
+#include "art_hook/vector_art_hook.h"
 #include "elf/elf_image.h"
 #include "elf/symbol_cache.h"
 #include "elf_loader.h"
@@ -353,22 +354,33 @@ void NotifyNativeModuleCallbacks(const char *name, void *handle) {
 void *DoDlopenHook(const char *name, int flags, const void *extinfo, const void *caller_addr) {
     // 2026-09-12 诊断打点（AGENTS.md 用户批准）：hook 进→wait 返回与 backup 执行耗时 ——
     // 用于定位 soLoader LoadDependencies 间歇性 7–10s 依赖链窗口是否落入本 hook。
-    const auto hook_start = std::chrono::steady_clock::now();
+    //
+    // 计时与日志均受 art::ArtPerfEnabled() 控制（默认关）：本 hook 在**每次 dlopen** 都会执行，
+    // 无条件打 INFO + 两次 steady_clock::now() 在生产构建里不可接受。
+    const bool perf_enabled = art::ArtPerfEnabled();
+    const auto hook_start =
+        perf_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::unique_lock<std::mutex> lock(g_do_dlopen_backup_mutex);
     g_do_dlopen_backup_ready.wait(lock, [] { return g_do_dlopen_backup != nullptr; });
-    const auto wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                             std::chrono::steady_clock::now() - hook_start)
-                             .count();
+    const auto wait_us =
+        perf_enabled ? std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now() - hook_start)
+                           .count()
+                     : 0;
     const auto backup = g_do_dlopen_backup;
     lock.unlock();
 
     void *handle = backup(name, flags, extinfo, caller_addr);
-    const auto backup_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                               std::chrono::steady_clock::now() - hook_start)
-                               .count();
-    LOGI("[perf] do_dlopen_hook lib='{}' waitUs={} backupUs={} handle={}",
-         name != nullptr ? name : "null", static_cast<long long>(wait_us),
-         static_cast<long long>(backup_us), reinterpret_cast<void *>(handle));
+    const auto backup_us =
+        perf_enabled ? std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now() - hook_start)
+                           .count()
+                     : 0;
+    if (perf_enabled) {
+        LOGI("[perf] do_dlopen_hook lib='{}' waitUs={} backupUs={} handle={}",
+             name != nullptr ? name : "null", static_cast<long long>(wait_us),
+             static_cast<long long>(backup_us), reinterpret_cast<void *>(handle));
+    }
     const std::string lib_name = name != nullptr ? name : "null";
     LOGV("do_dlopen hook triggered for library: '{}'", lib_name.c_str());
     if (handle != nullptr) {
@@ -531,7 +543,8 @@ bool LoadNativeLibraryFd(int fd, size_t size, const std::string &library_name) {
         std::lock_guard<std::mutex> lock(g_core_elf_registry_mutex);
         g_pending_native_inits.push_back({library_name, native_init});
     }
-    LOGI("[perf] load_lib stage=native_init_deferred elapsedUs={}",
+    if (art::ArtPerfEnabled()) {
+        LOGI("[perf] load_lib stage=native_init_deferred elapsedUs={}",
              static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
                  std::chrono::steady_clock::now() - load_start)
                  .count()));
@@ -542,7 +555,8 @@ bool LoadNativeLibraryFd(int fd, size_t size, const std::string &library_name) {
         g_loading_module_libraries.erase(library_name);
         g_loaded_module_loaders.emplace(library_name, std::move(loader));
     }
-    LOGI("[perf] load_lib stage=finish_total elapsedUs={}",
+    if (art::ArtPerfEnabled()) {
+        LOGI("[perf] load_lib stage=finish_total elapsedUs={}",
              static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
                  std::chrono::steady_clock::now() - load_start)
                  .count()));

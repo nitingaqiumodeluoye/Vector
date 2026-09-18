@@ -32,22 +32,9 @@
 
 namespace vector::native::art {
 
-namespace {
-
-#if defined(__aarch64__)
-
-constexpr uint32_t kAccStatic = 0x0008u;
-constexpr uint32_t kAccNative = 0x0100u;
-constexpr uint64_t kPacStripMask = 0x0000FFFFFFFFFFFFULL;
-constexpr uint32_t kAccCriticalNative = 0x00200000u;
-constexpr uint32_t kAccFastNative = 0x00080000u;
-constexpr uint32_t kAccNterpFastPath = 0x00100000u;
-constexpr uint32_t kAccFastInterpreterToInterpreterInvoke = 0x40000000u;
-constexpr uint32_t kAccPublicApi = 0x10000000u;
-constexpr uint32_t kAccNterpInvokeFastPath = 0x00200000u;
-constexpr size_t kInitialPoolSize = 128 * 1024;
-constexpr char kHookExecPoolVmaName[] = "wwb_hook_exec";
-
+// Defined outside the anonymous namespace below (and outside its __aarch64__ guard) because the
+// perf log sites in core/native_api.cpp and jni/native_api_bridge.cpp gate on it too. See the
+// declaration in native/include/art_hook/vector_art_hook.h for the accepted sources.
 bool ArtPerfEnabled() {
     const char *value = getenv("VECTOR_ART_HOOK_PERF");
     if (value &&
@@ -75,6 +62,22 @@ bool ArtPerfEnabled() {
     }
     return false;
 }
+
+namespace {
+
+#if defined(__aarch64__)
+
+constexpr uint32_t kAccStatic = 0x0008u;
+constexpr uint32_t kAccNative = 0x0100u;
+constexpr uint64_t kPacStripMask = 0x0000FFFFFFFFFFFFULL;
+constexpr uint32_t kAccCriticalNative = 0x00200000u;
+constexpr uint32_t kAccFastNative = 0x00080000u;
+constexpr uint32_t kAccNterpFastPath = 0x00100000u;
+constexpr uint32_t kAccFastInterpreterToInterpreterInvoke = 0x40000000u;
+constexpr uint32_t kAccPublicApi = 0x10000000u;
+constexpr uint32_t kAccNterpInvokeFastPath = 0x00200000u;
+constexpr size_t kInitialPoolSize = 128 * 1024;
+constexpr char kHookExecPoolVmaName[] = "wwb_hook_exec";
 
 uint64_t ArtPerfNowNs() {
     return static_cast<uint64_t>(

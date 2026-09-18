@@ -74,6 +74,23 @@ bool CompleteInitialization(JNIEnv *env);
 void SetSystemProcess(bool is_system);
 void SetManagerProcess(bool is_manager);
 
+/**
+ * Master switch for the in-process `[perf]` timers (`[perf] art_*` / `java_hook` /
+ * `do_dlopen_hook` / `load_lib` / `load_native_lib` …).
+ *
+ * Off unless explicitly requested, so a production build stays silent on logcat. Accepted
+ * sources (any one of them, checked in this order):
+ *   - env  `VECTOR_ART_HOOK_PERF`     = 1/true/yes/on
+ *   - prop `debug.vector.art.perf`    = 1/true/yes/on
+ *   - prop `persist.vector.art.perf`  = 1/true/yes/on
+ *
+ * Defined in vector_art_hook.cpp. It lives outside that file's anonymous namespace on purpose:
+ * the perf log sites outside the ART module (core/native_api.cpp, jni/native_api_bridge.cpp,
+ * plus soLoader's SOLOADER_PERF_LOGI) need the same switch. In particular DoDlopenHook runs on
+ * *every* dlopen, so it must not emit an unconditional INFO line.
+ */
+bool ArtPerfEnabled();
+
 /** Whether the ARM64 backend was initialized successfully. */
 bool IsAvailable();
 

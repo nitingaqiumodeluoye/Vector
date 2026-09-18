@@ -1,6 +1,7 @@
 #include "core/native_api.h"
 #include "jni/jni_bridge.h"
 #include "jni/jni_hooks.h"
+#include "art_hook/vector_art_hook.h"
 
 #include <android/sharedmem_jni.h>
 
@@ -57,10 +58,12 @@ VECTOR_DEF_NATIVE_METHOD(jbooleanArray, NativeAPI, loadNativeLibraries, jobjectA
             }
             values[static_cast<size_t>(i)] =
                 vector::native::LoadNativeLibraryFd(fd, size, name_chars) ? JNI_TRUE : JNI_FALSE;
-            LOGI("[perf] load_native_lib element={} name='{}' elapsedUs={}", i, name_chars,
-                 static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
-                     std::chrono::steady_clock::now() - elem_start)
-                     .count()));
+            if (vector::native::art::ArtPerfEnabled()) {
+                LOGI("[perf] load_native_lib element={} name='{}' elapsedUs={}", i, name_chars,
+                     static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - elem_start)
+                         .count()));
+            }
         }
         if (name_chars) env->ReleaseStringUTFChars(name, name_chars);
         if (fd >= 0) close(fd);
