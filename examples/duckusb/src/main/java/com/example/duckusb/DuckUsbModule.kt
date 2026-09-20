@@ -7,6 +7,9 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.content.pm.ApplicationInfo
 import android.content.res.Resources
+import android.database.Cursor
+import android.database.MatrixCursor
+import android.net.Uri
 import android.os.Binder
 import android.os.Bundle
 import android.os.SystemClock
@@ -177,6 +180,7 @@ class DuckUsbModule : WbModule() {
 
         /** Notification channels the ADB notifications live on (AOSP). */
         private val ADB_CHANNELS = setOf("DEVELOPER", "DEVELOPER_IMPORTANT")
+
     }
 
     // ------------------------------------------------------------------ framework plumbing
@@ -200,6 +204,8 @@ class DuckUsbModule : WbModule() {
 
     /** Verbose per-injection logging; off unless troubleshooting. */
     private fun verboseOn() = prefs.getBoolean(Config.KEY_VERBOSE_LOG, false)
+
+    /** Device-state spoof (keyguard / telephony). Independent of the USB-debugging toggle. */
 
     /** Master pause. Checked by every hook body; the service copy wins when it is live. */
     private fun pausedOn() = prefs.getBoolean(Config.KEY_PAUSED, false)
@@ -342,6 +348,11 @@ class DuckUsbModule : WbModule() {
                 // A3) Covers the one read path the two layers above cannot reach.
                 installGetpropExecSpoof(cl)
             }
+            // A5) Provider transport. Layer A hangs the static Settings getters, but a detector
+            //     can name the provider instead and never touch them: query() on
+            //     content://settings/global, or call(uri, "GET_global", key, Bundle). Both are
+            //     covered here, client-side, so no framework-mode hook is required.
+            installProviderReadSpoof(cl)
         }
     }
 
@@ -793,6 +804,126 @@ class DuckUsbModule : WbModule() {
         // /supportsNormalTermination(), so they are neither overridden nor implemented here. No
         // caller in scope uses them (the detector reads the stream, waits and destroys); a
         // future caller would need reflection-based delegation, not new overrides.
+    }
+
+    // ============ A5) PROVIDER READ SPOOF (query + call, client side) ============
+
+    /**
+     * riskdetector reaches Settings through the provider transport directly, bypassing the
+     * static getters layer A hooks entirely:
+     *
+     *   [Content Provider] `content://settings/global`, 6-arg query:
+     *       resolver.query(uri, null, null, null, null, null)  → scans the `name`/`value`
+     *       rows for "adb_enabled"
+     *   [Content Call] `content://settings/global`, "GET_global":
+     *       resolver.call(uri, "GET_global", "adb_enabled", Bundle()) → reads Bundle "value"
+     *
+     * Layer A never fires for either — the getters are simply not called. The framework-mode
+     * hook (A0, SettingsProvider.call) covers the call form but lives in system_server behind an
+     * opt-in and is off by default; it does not cover the query form at all. These two hooks
+     * close both per-app, with no server-side requirement.
+     *
+     * `query` has many overloads and both the 5-arg and the 6-arg (CancellationSignal) forms are
+     * reachable, so every declared overload is hooked and the body filters by URI. The
+     * CancellationSignal package is `android.os` — `android.database.CancellationSignal` does not
+     * exist, and naming it silently matches nothing.
+     */
+    private fun installProviderReadSpoof(cl: ClassLoader) {
+        val cr = findClass("android.content.ContentResolver", cl)
+        if (cr == null) {
+            logE("ContentResolver not found; provider read spoof disabled")
+            return
+        }
+        val nq = hookAll(cr, "query", providerQueryHooker)
+        val nc = hookAll(cr, "call", providerCallHooker)
+        logI("provider read spoof: ContentResolver.query hooks=$nq call hooks=$nc")
+    }
+
+    private val providerQueryHooker = WbInterface.Hooker { chain ->
+        val result = chain.proceed()
+        if (pausedOn() || !spoofOn()) return@Hooker result
+        try {
+            val uri = chain.args.firstOrNull { it is Uri } as? Uri
+            rewriteSettingsCursor(uri, result as? Cursor) ?: result
+        } catch (t: Throwable) {
+            logE("providerQueryHooker failed", t)
+            result
+        }
+    }
+
+    /**
+     * Rebuild a settings cursor with our values substituted. Only a `content://settings*` URI
+     * carrying the provider's `name`/`value` shape is touched; anything else — including a cursor
+     * without those columns — is returned untouched, so an unrelated query stays byte-identical.
+     *
+     * When nothing matched, the original cursor is rewound to -1 and returned as-is, so its
+     * identity and laziness are preserved; only a real hit pays for the materialised copy.
+     */
+    private fun rewriteSettingsCursor(uri: Uri?, cur: Cursor?): Cursor? {
+        if (cur == null) return null
+        val u = uri?.toString() ?: return cur
+        if (!u.contains("settings")) return cur
+        val cols = cur.columnNames ?: return cur
+        val iName = cur.getColumnIndex("name")
+        val iVal = cur.getColumnIndex("value")
+        if (iName < 0 || iVal < 0) return cur
+
+        val rows = ArrayList<Array<Any?>>()
+        var hits = 0
+        // The cursor arrives fresh (position -1); rewind explicitly because a caller may have
+        // handed us one it already walked, and our scan must not inherit its position.
+        cur.moveToPosition(-1)
+        while (cur.moveToNext()) {
+            val row = arrayOfNulls<Any?>(cols.size)
+            for (i in cols.indices) row[i] = cur.getString(i)
+            val key = row[iName] as? String
+            if (key != null && key in SPOOF_KEYS) {
+                row[iVal] = Config.SETTINGS_OFF
+                hits++
+            }
+            rows.add(row)
+        }
+        if (hits == 0) {
+            cur.moveToPosition(-1)
+            return cur
+        }
+        val out = MatrixCursor(cols)
+        for (r in rows) out.addRow(r)
+        logI("provider query rewritten uri=$u rows=${rows.size} hits=$hits")
+        return out
+    }
+
+    private val providerCallHooker = WbInterface.Hooker { chain ->
+        val result = chain.proceed()
+        if (pausedOn() || !spoofOn()) return@Hooker result
+        try {
+            patchSettingsCallBundle(chain.args, result as? Bundle)
+            result
+        } catch (t: Throwable) {
+            logE("providerCallHooker failed", t)
+            result
+        }
+    }
+
+    /**
+     * The provider's call() protocol returns the setting in `Bundle["value"]`; the key is the
+     * string right after the GET_* method name, whatever the overload's parameter list looks
+     * like on this Android version. Marking the generation index -1 makes the client's
+     * NameValueCache treat the answer as uncacheable, so our hook runs on every read instead of
+     * a real value being served from cache afterwards — the same thing the framework-mode hook
+     * does on the server side.
+     */
+    private fun patchSettingsCallBundle(args: List<Any?>, b: Bundle?): Boolean {
+        if (b == null) return false
+        val idx = args.indexOfFirst { it is String && it in GET_METHODS }
+        if (idx < 0) return false
+        val key = args.getOrNull(idx + 1) as? String ?: return false
+        if (key !in SPOOF_KEYS) return false
+        if (!b.containsKey(CALL_VALUE)) return false
+        b.putString(CALL_VALUE, Config.SETTINGS_OFF)
+        b.putInt(CALL_GENERATION_INDEX, -1)
+        logI("provider call spoofed method=${args[idx]} key=$key")
+        return true
     }
 
     // ========================= B) NOTIFICATION SUPPRESSOR =========================
