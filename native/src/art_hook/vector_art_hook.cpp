@@ -131,11 +131,31 @@ enum class NativeRouteKind : unsigned char {
     UnsupportedNative,
 };
 
+// Source: rustFrida jni_core.rs::probe_art_method_spec_frida NOISE_MASK. These bits are set on
+// live ArtMethods by the interpreter/router but carry no method-kind meaning, so they must be
+// masked out before the flags are read as a method description.
+constexpr uint32_t kArtAccessFlagsNoiseMask =
+    kAccFastInterpreterToInterpreterInvoke | kAccPublicApi | kAccNterpInvokeFastPath;
+
+/**
+ * Route classification for a native method.
+ *
+ * Source: rustFrida install.rs:311-319. The `@CriticalNative` flag alone is NOT authoritative:
+ * vendor ART builds set kAccCriticalNative spuriously as ART noise (seen on MIUI 13, where
+ * SystemProperties.native_get carries the bit while its signature is (String,String)String —
+ * a shape the critical ABI cannot express). Treating the bare flag as authoritative made
+ * WxShadow refuse methods it could have hooked.
+ *
+ * [critical_signature_supported] is therefore the caller's verdict — computed from the live
+ * MethodState (static + primitive-only params/return), the same evidence rustFrida derives from
+ * its parsed JNI signature — and must hold together with the flag before the method is refused.
+ */
 constexpr NativeRouteKind ClassifyNativeRoute(uint32_t access_flags, uintptr_t data,
                                                bool data_is_executable,
-                                               bool data_is_in_art) {
+                                               bool data_is_in_art,
+                                               bool critical_signature_supported) {
     if ((access_flags & kAccNative) == 0) return NativeRouteKind::NotNative;
-    if ((access_flags & kAccCriticalNative) != 0) {
+    if ((access_flags & kAccCriticalNative) != 0 && critical_signature_supported) {
         return NativeRouteKind::UnsupportedNative;
     }
     if (data < 0x10000 || !data_is_executable || data_is_in_art) {
@@ -148,13 +168,20 @@ constexpr NativeRouteKind ClassifyNativeRoute(uint32_t access_flags, uintptr_t d
     return NativeRouteKind::RegisteredNative;
 }
 
-static_assert(ClassifyNativeRoute(0, 0, false, false) == NativeRouteKind::NotNative);
-static_assert(ClassifyNativeRoute(kAccNative, 0x10000, true, false) ==
+static_assert(ClassifyNativeRoute(0, 0, false, false, true) == NativeRouteKind::NotNative);
+static_assert(ClassifyNativeRoute(kAccNative, 0x10000, true, false, false) ==
               NativeRouteKind::RegisteredNative);
-static_assert(ClassifyNativeRoute(kAccNative | kAccCriticalNative, 0x10000, true, false) ==
+// A real @CriticalNative (flag + critical-callable signature) stays unsupported...
+static_assert(ClassifyNativeRoute(kAccNative | kAccCriticalNative, 0x10000, true, false, true) ==
               NativeRouteKind::UnsupportedNative);
-static_assert(ClassifyNativeRoute(kAccNative, 0, false, false) ==
+// ...while the same flag with a non-critical signature is ART noise and must hook normally.
+static_assert(ClassifyNativeRoute(kAccNative | kAccCriticalNative, 0x10000, true, false, false) ==
+              NativeRouteKind::RegisteredNative);
+static_assert(ClassifyNativeRoute(kAccNative, 0, false, false, true) ==
               NativeRouteKind::SharedNative);
+// Interpreter/router noise bits must not change the verdict.
+static_assert(ClassifyNativeRoute(kAccNative | kArtAccessFlagsNoiseMask, 0x10000, true, false,
+                                  false) == NativeRouteKind::RegisteredNative);
 
 struct Layout {
     size_t method_size = 0;
@@ -1925,6 +1952,100 @@ ValueKind KindFromClass(JNIEnv *env, jobject clazz) {
     return ValueKind::Object;
 }
 
+// Source: rustFrida install.rs::is_critical_native_signature_supported.
+//
+// `@CriticalNative` has a hard ABI requirement: static, with primitive-only parameters and a
+// primitive return. Neither reference type (`L...;`) nor array (`[...`) may appear, because the
+// critical ABI passes raw arguments in x0-x7/d0-d7 with no JNIEnv*/jclass receiver and no way to
+// hand a managed reference back.
+//
+// This runs during route classification, i.e. before the full parameter_kinds / return_kind
+// resolution that fills MethodState. It therefore probes the reflective Executable directly and
+// leaves no state behind. A false negative is safe by construction: it only downgrades a
+// suspicious flag to "ordinary native", which hooks the method anyway. A false positive is the
+// dangerous direction, and cannot happen — asserting the critical ABI requires positively
+// observing static + primitive-only, which the critical ABI genuinely needs.
+bool CriticalNativeSignatureSupportedFromReflection(JNIEnv *env, jobject reflected_method) {
+    if (!env || !reflected_method) return false;
+
+    auto executable_class = env->FindClass("java/lang/reflect/Executable");
+    if (!executable_class || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        if (executable_class) env->DeleteLocalRef(executable_class);
+        return false;
+    }
+
+    bool supported = false;
+    jobjectArray params = nullptr;
+    do {
+        auto get_modifiers = env->GetMethodID(executable_class, "getModifiers", "()I");
+        auto get_params = env->GetMethodID(executable_class, "getParameterTypes",
+                                           "()[Ljava/lang/Class;");
+        if (!get_modifiers || !get_params) {
+            env->ExceptionClear();
+            break;
+        }
+        // java.lang.reflect.Constructor has no getReturnType(); it is also never @CriticalNative
+        // (the critical ABI is only defined for static methods), so failing closed is correct.
+        auto method_class = env->GetObjectClass(reflected_method);
+        if (!method_class || env->ExceptionCheck()) {
+            env->ExceptionClear();
+            if (method_class) env->DeleteLocalRef(method_class);
+            break;
+        }
+        auto get_return_type = env->GetMethodID(method_class, "getReturnType",
+                                                "()Ljava/lang/Class;");
+        env->DeleteLocalRef(method_class);
+        if (!get_return_type) {
+            env->ExceptionClear();
+            break;
+        }
+
+        const jint modifiers = env->CallIntMethod(reflected_method, get_modifiers);
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            break;
+        }
+        if ((static_cast<uint32_t>(modifiers) & kAccStatic) == 0) break;
+
+        auto return_class = env->CallObjectMethod(reflected_method, get_return_type);
+        if (!return_class || env->ExceptionCheck()) {
+            env->ExceptionClear();
+            if (return_class) env->DeleteLocalRef(return_class);
+            break;
+        }
+        const ValueKind return_kind = KindFromClass(env, return_class);
+        env->DeleteLocalRef(return_class);
+        if (return_kind == ValueKind::Object) break;
+
+        params = reinterpret_cast<jobjectArray>(
+            env->CallObjectMethod(reflected_method, get_params));
+        if (!params || env->ExceptionCheck()) {
+            env->ExceptionClear();
+            break;
+        }
+
+        supported = true;
+        const jsize count = env->GetArrayLength(params);
+        for (jsize i = 0; i < count; ++i) {
+            jobject type = env->GetObjectArrayElement(params, i);
+            if (!type || env->ExceptionCheck()) {
+                env->ExceptionClear();
+                if (type) env->DeleteLocalRef(type);
+                supported = false;
+                break;
+            }
+            if (KindFromClass(env, type) == ValueKind::Object) supported = false;
+            env->DeleteLocalRef(type);
+            if (!supported) break;
+        }
+    } while (false);
+
+    if (params) env->DeleteLocalRef(params);
+    env->DeleteLocalRef(executable_class);
+    return supported;
+}
+
 void ThrowIllegalArgument(JNIEnv *env, const char *message) {
     auto cls = env->FindClass("java/lang/IllegalArgumentException");
     if (cls) {
@@ -3245,17 +3366,26 @@ std::unique_ptr<MethodState> Install(JNIEnv *env, jobject reflected_method,
     // not through the ART quick router. @CriticalNative 走同一入口（data_），
     // 但 ABI 不同：x0 起就是基本类型参数，且 $orig 只能用保存寄存器直调
     // trampoline（rustFrida callback/hook.rs:398 + original_call.rs:1096）。
+    //
+    // rustFrida install.rs:311-319 对齐：flag 与签名必须同时成立才算 @CriticalNative。
+    // 整个 Install 的 parameter_kinds/return_kind 解析在路由分类之后，但路由分类本身
+    // 要拿这个结论，所以这里先做一次**只读**的签名探测。不是重复劳动：探测失败只会
+    // 让一个可疑 flag 降级成普通 native（即多 hook 一个方法），不会误拒。
+    const bool critical_signature_supported =
+        CriticalNativeSignatureSupportedFromReflection(env, reflected_method);
+    const bool has_critical_flag = (original_flags & kAccCriticalNative) != 0;
+    if (has_critical_flag && !critical_signature_supported) {
+        LOGI("WxShadow ART critical-native flag ignored as ART noise: method={} flags=0x{:x}",
+             reinterpret_cast<void *>(state->original_art_method), original_flags);
+    }
     const bool data_is_executable = IsMappedExecutable(original_data);
     const bool data_is_in_art = IsInArtModule(original_data & kPacStripMask);
     const auto native_route = ClassifyNativeRoute(
-        original_flags, original_data, data_is_executable, data_is_in_art);
+        original_flags, original_data, data_is_executable, data_is_in_art,
+        critical_signature_supported);
     const bool is_native_method = native_route != NativeRouteKind::NotNative;
     const bool registered_native = native_route == NativeRouteKind::RegisteredNative;
-    // rustFrida install.rs:311 对齐：此处只能看到 access_flags；签名可支持性
-    // （static + 基本类型参数/返回）要等 parameter_kinds/return_kind 解析完
-    // 才能定稿，见下方 critical flag 的 ART-noise 降级。
-    const bool critical_native = is_native_method &&
-                                 (original_flags & kAccCriticalNative) != 0;
+    const bool critical_native = is_native_method && has_critical_flag;
     if (native_route == NativeRouteKind::UnsupportedNative) {
         LOGI("WxShadow ART native route deferred to LSPlant: method={} data={} entry={} registered={} critical={}",
              reinterpret_cast<void *>(state->original_art_method),
@@ -3426,8 +3556,13 @@ std::unique_ptr<MethodState> Install(JNIEnv *env, jobject reflected_method,
     env->DeleteLocalRef(method_class);
 
     // rustFrida install.rs:314-319 对齐：flag 与签名必须同时成立才算 @CriticalNative，
-    // 否则该位是 ART noise（MIUI 等构建可能误置）。判定必须在 parameter_kinds /
-    // return_kind 解析完成后进行。
+    // 否则该位是 ART noise（MIUI 等构建可能误置）。
+    //
+    // 路由分类处已经用反射做过一次同样的判定（CriticalNativeSignatureSupportedFromReflection），
+    // 这里是第二道防线，使用的证据不同：此刻 MethodState 的 parameter_kinds / return_kind
+    // 已经由完整解析填好，比反射探测更权威。两者共用同一个语义定义
+    //（IsCriticalNativeSignatureSupported），不会产生分歧；只有在前置探测因异常而
+    // fail-closed 降级、而完整解析又成功时，这里才会真正生效。
     if (state->native_entry_critical && !IsCriticalNativeSignatureSupported(*state)) {
         LOGI("ART native entry critical flag ignored as ART noise: method={} flags=0x{:x}",
              reinterpret_cast<void *>(state->original_art_method), original_flags);
