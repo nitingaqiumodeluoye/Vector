@@ -24,6 +24,10 @@ bin/
 # One-shot investigation scratch (logcat/tombstone/rf-gate captures, probe dumps, pid files).
 /.tmp*
 /.build*.pid
+# Root-level `_`-prefixed scratch: logcat dumps (_r1.txt, _clean4.txt), probe output
+# (_probe_out.txt) and process snapshots. Written by ad-hoc debugging runs and never meant
+# to be committed; without this they show up as untracked noise after every session.
+/_*
 
 # Local hooking/debug diagnostic artifacts (hunter logcat/dmesg dumps).
 /artifacts/
