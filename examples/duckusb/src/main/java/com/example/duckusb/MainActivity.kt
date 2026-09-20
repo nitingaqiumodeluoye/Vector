@@ -190,6 +190,14 @@ class MainActivity : Activity() {
         divider(card)
         card.addView(
             toggle(
+                "伪装设备状态",
+                "锁屏密码（isDeviceSecure / isKeyguardSecure）与插卡状态（getSimState 等）。",
+                Config.KEY_DEVICE_STATE_SPOOF, true
+            )
+        )
+        divider(card)
+        card.addView(
+            toggle(
                 "框架模式",
                 "在 system_server 里做服务端伪装。实验性功能，需要勾选 system 并重启。",
                 Config.KEY_FRAMEWORK_MODE, false
@@ -199,7 +207,7 @@ class MainActivity : Activity() {
         card.addView(
             toggle(
                 "单应用 Settings 伪装",
-                "在客户端 hook getter，逐个注入到作用域内的应用。",
+                "在客户端 hook 静态 getter 与 provider 通道（query / call），逐个注入到作用域内的应用。",
                 Config.KEY_CLIENT_FALLBACK, true
             )
         )

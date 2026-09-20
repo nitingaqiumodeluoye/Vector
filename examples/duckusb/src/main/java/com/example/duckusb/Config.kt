@@ -58,10 +58,33 @@ object Config {
      */
     const val KEY_DEBUGGABLE_SPOOF = "debuggable_spoof_enabled"
 
+    /**
+     * Device-state spoof (default ON): make scoped apps read a *less* suspicious device than the
+     * one they are running on — a lock-screen password exists and a SIM is ready.
+     *
+     * Separate from [KEY_SPOOF] on purpose. That one is about USB debugging; these are checks a
+     * detector runs alongside it, on APIs that have nothing to do with USB. They share the same
+     * "app the user scoped is an app they want lied to" premise but not the same switch, because
+     * they can be wanted independently — e.g. spoofing the SIM state to a scoped app that
+     * legitimately uses telephony would be a bug, not a feature.
+     */
+    const val KEY_DEVICE_STATE_SPOOF = "device_state_spoof_enabled"
+
     /** Every boolean setting worth carrying across the move to remote preferences. */
     val BOOLEAN_KEYS: List<String> =
         listOf(KEY_PAUSED, KEY_SPOOF, KEY_FRAMEWORK_MODE, KEY_CLIENT_FALLBACK, KEY_VERBOSE_LOG,
-            KEY_HIDE_NOTIF, KEY_DEBUGGABLE_SPOOF)
+            KEY_HIDE_NOTIF, KEY_DEBUGGABLE_SPOOF, KEY_DEVICE_STATE_SPOOF)
+
+    /**
+     * The value every spoofed boolean Settings key reads as, on both read paths.
+     *
+     * Both the static getters (layer A) and the provider transport (layer A5) return the value
+     * as a String, because that is what the settings provider stores; an int-returning getter
+     * parses it. Keeping one constant means the two layers can never disagree — a detector that
+     * cross-checks them (as riskdetector does: [Settings] vs [Content Provider] vs
+     * [Content Call]) sees a single consistent answer.
+     */
+    const val SETTINGS_OFF = "0"
 
     /**
      * OS plumbing that must never be lied to, by either the settings spoof or the property
