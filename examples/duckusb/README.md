@@ -10,20 +10,36 @@ reading for the reasoning behind the guards; this file only covers the port.
 
 ## What the module does
 
-Detection apps (banking, MDM, games, integrity checks) don't read any real adb state. They query
-the settings provider:
+Detection apps (banking, MDM, games, integrity checks) don't read any real adb state. They read
+the settings provider — but not always through the static getters:
 
 ```
+// 1) the static getters                       (layer A)
 Settings.Global.getInt(cr, "adb_enabled")                   // USB debugging
 Settings.Global.getInt(cr, "adb_wifi_enabled")              // wireless debugging
 Settings.Global.getInt(cr, "development_settings_enabled")  // Developer Options
+
+// 2) the provider transport, named directly    (layer A5)
+cr.query(Uri.parse("content://settings/global"), null, null, null, null, null)
+cr.call(Uri.parse("content://settings/global"), "GET_global", "adb_enabled", Bundle())
 ```
 
-Two independent layers can lie about that:
+Those two forms are not interchangeable from a hooking standpoint: layer A never runs for form 2.
+A detector that names the provider therefore sees the truth while every getter is already lying —
+and it can cross-check the three readings against each other to prove it.
+
+Within form 1 there is a second, quieter trap: `getInt(cr, name)` (2 args) does **not** delegate to
+`getInt(cr, name, def)` (3 args), so hooking only the 3-arg overload installs a hook that never
+fires. The symptom is a clean install log, zero hook hits, and `adb_enabled` still reading 1 —
+which is exactly what shipped in 1.0.9. `SETTINGS_TARGETS` now lists both overloads.
+
+Layers that can lie:
 
 | Layer | Where it runs | How it works |
 |---|---|---|
-| **Per-app** (default) | Each scoped app | Hooks the static `Settings.Global` / `Settings.Secure` getters, plus `SystemProperties.native_get*` and, natively, libc's `__system_property_get` / `__system_property_read` / `__system_property_read_callback` — and, for the one path those cannot reach (an exec'd `getprop`), wraps `ProcessBuilder.start()` so the child's stdout carries the same overrides |
+| **Per-app: settings** (default) | Each scoped app | Hooks the static `Settings.Global` / `Settings.Secure` getters (both `getInt` overloads) **and** the provider transport — `ContentResolver.query` (every overload; rebuilds a settings cursor with the `value` column substituted) and `ContentResolver.call` (rewrites the returned `Bundle["value"]` and marks it uncacheable). Covers both forms above with no server-side component. |
+| **Per-app: properties** | Each scoped app | `SystemProperties.native_get*`, and natively libc's `__system_property_get` / `__system_property_read` / `__system_property_read_callback` — plus, for the one path no in-process hook can reach (an exec'd `getprop`), wrapping `ProcessBuilder.start()` so the child's stdout carries the same overrides |
+| **Per-app: device state** | Each scoped app | The same detector cross-checks things that are not USB at all: `KeyguardManager.isDeviceSecure` / `isKeyguardSecure` (a device with *no* lock-screen password is the risk), `TelephonyManager.getSimState` (no SIM is the risk) and `SubscriptionManager.getActiveSubscriptionInfoCount`. Spoofing only the ADB paths leaves these reporting the real device. |
 | **Framework mode** (opt-in, experimental) | `system_server` | Hooks `ContentProvider.attachInfo` → waits for the settings provider (matched by **authority**) → hooks only that provider's `call()`, rewriting results per `Binder.getCallingUid()` |
 
 Callers at **uid < 10000** (root / system / shell) always see the truth, so `adb` and the Settings
@@ -86,7 +102,7 @@ bare package names (Java `.properties` rules apply to `module.prop` instead, whi
 | **Master pause** | Stops every hook body. Does *not* uninstall hooks; Vector's own module switch is the real off. |
 | **Spoof USB debugging** | The `adb_enabled` / `adb_wifi_enabled` / Developer Options lie. |
 | **Framework mode** | Server-side spoof. Needs the `system` scope + reboot. Experimental. |
-| **Per-app Settings spoof** | Client-side getters, installed in each scoped app. |
+| **Per-app Settings spoof** | Client-side getters **and** the provider transport (`query`/`call`), installed in each scoped app. |
 | **Hide notification** | Suppressor in `system_server` / System UI. |
 | **Verbose logging** | One log line per injection. Off by default. |
 
@@ -110,6 +126,15 @@ nothing else.
 
 `sys.usb.ffs.ready` is deliberately **not** spoofed (it is machinery the USB stack acts on, not
 telemetry a detector reads).
+
+Device-state reads, spoofed by the per-app device-state layer:
+
+| API | Forced | Why |
+|---|---|---|
+| `KeyguardManager.isDeviceSecure()` | `true` | The check is inverted: **no** lock-screen password is the risk |
+| `KeyguardManager.isKeyguardSecure()` | `true` | Same check, second half — the detector requires both |
+| `TelephonyManager.getSimState()` | `5` | `SIM_STATE_READY` — a device with no SIM is the risk |
+| `SubscriptionManager.getActiveSubscriptionInfoCount()` | `1` | Kept consistent with `SIM_STATE_READY`; one ready subscription |
 
 `persist.sys.usb.config` **is** spoofed — and that is exactly why the getprop layer exists. An
 exec'd `getprop` reads the real property store in its own process, beyond any in-process hook,
