@@ -181,6 +181,8 @@ class DuckUsbModule : WbModule() {
         /** Notification channels the ADB notifications live on (AOSP). */
         private val ADB_CHANNELS = setOf("DEVELOPER", "DEVELOPER_IMPORTANT")
 
+        /** `TelephonyManager.SIM_STATE_READY` — the value that reads as "a SIM is present". */
+        private const val SIM_STATE_READY = 5
     }
 
     // ------------------------------------------------------------------ framework plumbing
@@ -206,6 +208,7 @@ class DuckUsbModule : WbModule() {
     private fun verboseOn() = prefs.getBoolean(Config.KEY_VERBOSE_LOG, false)
 
     /** Device-state spoof (keyguard / telephony). Independent of the USB-debugging toggle. */
+    private fun deviceStateSpoofOn() = prefs.getBoolean(Config.KEY_DEVICE_STATE_SPOOF, true)
 
     /** Master pause. Checked by every hook body; the service copy wins when it is live. */
     private fun pausedOn() = prefs.getBoolean(Config.KEY_PAUSED, false)
@@ -353,6 +356,8 @@ class DuckUsbModule : WbModule() {
             //     content://settings/global, or call(uri, "GET_global", key, Bundle). Both are
             //     covered here, client-side, so no framework-mode hook is required.
             installProviderReadSpoof(cl)
+            // A6) Device-state reads the same detector cross-checks (keyguard / telephony).
+            installDeviceStateSpoof(cl)
         }
     }
 
@@ -924,6 +929,60 @@ class DuckUsbModule : WbModule() {
         b.putInt(CALL_GENERATION_INDEX, -1)
         logI("provider call spoofed method=${args[idx]} key=$key")
         return true
+    }
+
+    // ============ A6) DEVICE-STATE SPOOF (keyguard / telephony) ============
+
+    /**
+     * The same detector cross-checks device state through APIs that have nothing to do with USB
+     * debugging. They are separate checks with their own verdicts, so spoofing only the ADB
+     * paths leaves them reporting the real device:
+     *
+     *   H) 是否有锁屏密码 [KeyguardManager]
+     *        if (km.isDeviceSecure() && km.isKeyguardSecure()) NOT_FOUND else FOUND
+     *      The sense is inverted — NO password is the risk — so both must read true.
+     *      (a missing password is what a freshly-flashed/emulator device has)
+     *   I) 插卡检测 [TelephonyManager]  if (5 != tm.getSimState()) FOUND
+     *      5 = SIM_STATE_READY. A device with no SIM is the risk.
+     *   J) 插卡检测 [SubscriptionManager] ***  if (1 < getActiveSubscriptionInfoCount()) FOUND
+     *      The *** marks it "test only, not part of the verdict", so it does not decide anything
+     *      today. It is spoofed anyway so every SIM-related reading agrees with getSimState —
+     *      otherwise removing the *** later would expose an inconsistency we already know about.
+     *      Returns 1 rather than 0 because one ready subscription is what SIM_STATE_READY means.
+     *
+     * All three are gated by [deviceStateSpoofOn] plus the master pause — deliberately not by
+     * [spoofOn]: they answer different questions, and a user may want one without the other.
+     */
+    private fun installDeviceStateSpoof(cl: ClassLoader) {
+        findClass("android.app.KeyguardManager", cl)?.let { km ->
+            var n = 0
+            for (m in arrayOf("isDeviceSecure", "isKeyguardSecure")) {
+                n += hookAll(km, m, keyguardHooker)
+            }
+            logI("device state spoof: KeyguardManager hooks=$n")
+        }
+        findClass("android.telephony.TelephonyManager", cl)?.let { tm ->
+            // Two overloads exist (getSimState() and the hidden getSimState(int slotIndex));
+            // both answer with the same value so the reading cannot depend on which is used.
+            val n = hookAll(tm, "getSimState", simStateHooker)
+            logI("device state spoof: TelephonyManager.getSimState hooks=$n")
+        }
+        findClass("android.telephony.SubscriptionManager", cl)?.let { sm ->
+            val n = hookAll(sm, "getActiveSubscriptionInfoCount", subscriptionCountHooker)
+            logI("device state spoof: SubscriptionManager hooks=$n")
+        }
+    }
+
+    private val keyguardHooker = WbInterface.Hooker { chain ->
+        if (pausedOn() || !deviceStateSpoofOn()) chain.proceed() else true
+    }
+
+    private val simStateHooker = WbInterface.Hooker { chain ->
+        if (pausedOn() || !deviceStateSpoofOn()) chain.proceed() else SIM_STATE_READY
+    }
+
+    private val subscriptionCountHooker = WbInterface.Hooker { chain ->
+        if (pausedOn() || !deviceStateSpoofOn()) chain.proceed() else 1
     }
 
     // ========================= B) NOTIFICATION SUPPRESSOR =========================
