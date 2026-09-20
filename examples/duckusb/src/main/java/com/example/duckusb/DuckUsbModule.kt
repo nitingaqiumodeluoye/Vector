@@ -143,7 +143,13 @@ class DuckUsbModule : WbModule() {
          * 一旦漏掉就是整个类的读取未被拦（Settings 与属性源矛盾 → 被检测）。
          */
         private val SETTINGS_TARGETS: List<Triple<String, String, Array<Class<*>>>> = buildList {
+            // The 2-arg getInt(cr, name) is hooked on purpose and must stay: MIUI/AOSP never route
+            // it through the 3-arg overload, so a 3-arg-only hook is installed but never fires.
+            // Verified on MIUI 13 / Android 12: with only the 3-arg overload installed,
+            // settingsHooker logged zero hits while the target read adb_enabled as 1 (FOUND).
             for (cls in arrayOf("android.provider.Settings\$Global", "android.provider.Settings\$Secure")) {
+                add(Triple(cls, "getInt",
+                    arrayOf(ContentResolver::class.java, String::class.java)))
                 add(Triple(cls, "getInt",
                     arrayOf(ContentResolver::class.java, String::class.java, Integer.TYPE)))
                 add(Triple(cls, "getString",
