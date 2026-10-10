@@ -247,6 +247,32 @@ Vector 的整体运行流程与 hook 实现分别使用两套已验证源码作�
     `native_init` 是否返回 nullptr 或 `native_init.list` 名称不匹配。禁止用脚本主动启动目标
     App 采集这些日志（见《安装重启后的启动约束》）。
 
+## 目标设备：以当前 adb 连接为准
+
+**Vector 不绑定任何固定机型或串号。**所有设备操作的唯一基准是当前 `adb` 连接的设备：
+
+```bash
+adb devices -l                            # 以实测输出为准，不预设型号
+adb shell getprop ro.product.model
+adb shell getprop ro.build.version.sdk
+```
+
+历史文档里出现过的“alioth / M2012K11AC”、“rubens / 22041211AC”等只是**当时那一次**测试
+所用的机器，不是本项目的目标机型。换机器后旧的设备相关结论（型号专属路径、
+OEM 行为、性能基线）必须重新实测，不得直接套用。
+
+设备特征（内核版本、Android 版本、页表粒度、KPM/root 方案）**必须在动手前实测**，
+例如：
+
+```bash
+adb shell 'su -c "uname -a"'                    # 内核版本
+adb shell getprop ro.build.version.release       # Android 版本
+adb shell getprop ro.product.cpu.abi             # ABI（Vector 目前只支持 arm64-v8a）
+```
+
+在多设备环境（同时插了多台机器）下，必须用 `adb -s <serial>` 显式指定目标，
+不得依赖 `adb` 的默认选择。
+
 ## 本机 Android SDK 环境
 
 本机存在可用 Android SDK：`D:\sdk`。
@@ -271,7 +297,8 @@ $env:ANDROID_SDK_ROOT = 'D:\sdk'
    - 可以先做只读性操作（读代码、logcat、/proc、dmesg 等取证与分析），分析结论可直接
      汇报给用户，但不构成修改授权。
 2. **未经允许不得启动编译/打包/安装/重启。**
-   - 不得自行触发 gradle 构建、产物打包、模块安装或设备重启。
+   - 不得自行触发 gradle 构建、产物打包、模块安装或设备重启；
+     **推送到 fork 触发 CI 也算“启动编译”**，同样需要先获准。
    - 只有用户明确要求构建、安装或“一条龙”验证时才允许执行；用户明确指定“仅编译”或
      “不要安装/重启”时按其范围停住。
 3. **与“编译验证节奏/Vector 构建自动衔接”的关系。**
@@ -281,6 +308,64 @@ $env:ANDROID_SDK_ROOT = 'D:\sdk'
 
 ## 编译验证节奏
 
+### Vector 构建走 CI，不走本地
+
+**Vector 的构建产物一律通过 GitHub Actions 产出**，不在本机跑 `gradlew`。
+
+**为什么**：
+
+- 本机 Windows 缺 `ninja`，且 CI 的 `Remove Android's cmake` 步骤会故意删掉
+  `$ANDROID_HOME/cmake` 以强制走 `externalNativeBuild` 的 ninja 路径 —— 本地环境
+  与此不等价，本地能编不代表 CI 能编。
+- CI 有 ccache 缓存（key 按 `build.gradle` 与 `CMakeLists.txt` 的 hash 分桶），
+  native 重编比本地快；本机没有这套缓存。
+- 公共仓库的 runner 不计费，没有省额度的必要。
+- 真出问题的是 CI，本地成功反而会掩盖分歧。
+
+**去哪跑**：本仓库 `origin` 直接指向上游 `JingMatrix/Vector`，**没有 push 权限**。
+必须 fork 到自己的账号后用 fork 作为 remote：
+
+```bash
+gh repo fork JingMatrix/Vector --remote=false --clone=false
+# 加为 remote（只加一次）
+git remote add fork https://github.com/<your-account>/Vector.git
+```
+
+**怎么触发**：上游的 `core.yml` 只在 `master` push / `v*` tag / PR /`workflow_dispatch`
+触发。为不污染 fork 的 `master`（保持与上游一致），按下面做：
+
+```bash
+# 1) 推当前开发分支到 fork（分支名保持原样）
+git push fork feature/rustfrida-art-hook-wxshadow
+
+# 2) 手动触发（workflow 文件在默认分支上，所以能在任意 ref 上跑）
+gh workflow run core.yml \
+  --repo <your-account>/Vector \
+  --ref feature/rustfrida-art-hook-wxshadow
+
+# 3) 找到刚触发的 run 并事件驱动等待
+gh run list --repo <your-account>/Vector --limit 3
+gh run watch <run-id> --repo <your-account>/Vector --exit-status --interval 30
+echo "退出码: $?"
+```
+
+**产物**：CI 跑 `./gradlew zipAll`，同时产出 Release 与 Debug 两个包（`zygisk/release/`），
+artifact 名就是 zip 文件名，形如：
+
+| artifact | 内容 |
+| --- | --- |
+| `Vector-v<versionName>-<versionCode>-Release` | R8 混淆后的框架包，日常装这个 |
+| `Vector-v<versionName>-<versionCode>-Debug` | 保留符号，排障用 |
+
+下载（GitHub 的 artifact 需要登录，`gh` 已登录故无此限制）：
+
+```bash
+gh run download <run-id> --repo <your-account>/Vector \
+  -n "Vector-v<versionName>-<versionCode>-Release" -D out/
+```
+
+CI 失败时用 `gh run view <run-id> --log` 取日志定位，**不要退回本地编译**。
+
 ### Vector 构建自动衔接
 
 对 Vector 执行任何会生成新构建产物的修改或构建请求时，默认必须在编译成功后自动继续完成：
@@ -288,7 +373,10 @@ $env:ANDROID_SDK_ROOT = 'D:\sdk'
 处自行停下，也不得继续使用旧版本产物。只有用户明确指定“仅编译”或“不要安装/重启”时，
 才允许停在编译或打包阶段；若安装、重启或验收失败，应继续处理到完成，或明确报告阻塞原因。
 
-进行 Vector 改造或问题修复时，不要每修改一点就立即编译。
+> 走 CI 后，“编译成功”的位置在 CI 跑完、产物已下载到本地。安装仍可用模块自带的任务链
+> （`installApatchRelease` 等），但也可以直接下载 CI 产物安装；两者产物等价（同一次构建）。
+
+进行 Vector 改造或问题修复时，不要每修改一点就立即触发一次 CI。
 
 应先完成当前问题相关的一组对齐改动，例如：
 
@@ -297,7 +385,8 @@ $env:ANDROID_SDK_ROOT = 'D:\sdk'
 - 修正同一问题链路上的调用、头文件、构建脚本或适配层；
 - 做完静态检查和引用搜索。
 
-确认这组改动已经收敛后，再一次性执行编译验证。除非用户明确要求快速验证某个单点，或者某个编译错误本身是当前唯一阻塞点，否则避免“边改一点边编译”的低效循环。
+确认这组改动已经收敛后，再一次性触发 CI。除非用户明确要求快速验证某个单点，或者某个
+CI 失败本身就是当前唯一阻塞点，否则避免“边改一点边跑一次”的低效循环。
 
 ## 版本号更新规则
 
@@ -446,11 +535,14 @@ Vector 注入被跳过，也不得单独作为注入失败原因。排查注入�
 
 ## simpleperf 在目标设备上禁用
 
-在当前目标设备（alioth / M2012K11AC，运行 wxshadow KPM 的内核）上**禁止使用 simpleperf 采样**
-（无论系统级 `record -a` 还是进程级）：实测 2026-09-05 两次系统级采样
+在当前 `adb` 连接的设备上（**不固定机型**，以 `adb devices` 实测为准）**禁止使用 simpleperf
+采样**（无论系统级 `record -a` 还是进程级）：实测 2026-09-05 两次系统级采样
 （`simpleperf record -a -g -e cpu-clock -f 4000`）均在采样窗口内引发**设备自发重启**，且重启
 与 Vector 注入与否无关。该内核 + wxshadow KPM 组合对 perf_event/NMI 路径脆弱（与 rustFrida
 历史提交 0d9b7e3 临时禁用同页 LDR literal relocate 时代排查的重启问题同源）。
+
+> 该结论是在一台运行 wxshadow KPM 的设备上得出的。换设备后若要在新机器上重新评估
+> perf 可用性，按第 3 条先做卸载态验证，不得直接沿用“已禁用”或“已可用”的预设。
 
 1. 排查 CPU/卡顿问题时不得再尝试 simpleperf；也不要向 AGENTS 之外的文档推荐该工具。
 2. 替代手段：`/proc/<pid>/task/<tid>/stat` 的 utime/stime（用户态/内核态 CPU 占比）、
