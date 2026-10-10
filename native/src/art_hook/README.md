@@ -1,7 +1,7 @@
 # Vector WxShadow ART backend
 
 This directory contains the ARM64 WxShadow router subset imported from
-`D:\crack\rsfrida\rustFrida\quickjs-hook`.
+`E:\52\rustFrida\quickjs-hook`.
 
 Vector uses the ART router, native replacement thunk, and ARM64 relocator to
 install hooks through the kernel-backed WxShadow write path. The adapter in

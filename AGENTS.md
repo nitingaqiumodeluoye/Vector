@@ -1,11 +1,52 @@
 # AGENTS.md
 
-## wxshadow KPM 源码位置
+## wxshadow KPM 源码位置与构建
 
-wxshadow KPM（内核模块，`PR_WXSHADOW_PATCH` 的内核实现）的**最新源码在 SSH 服务器上**，
-本地 `E:/52/mkpms/kpms/wxshadow/` 可能不是最新。涉及内核 patch 路径
-（stop_machine/全局锁/IPI/TLB 击落等）的排查与修改前，必须先通过 SSH 到服务器拉取
-最新源码（learn-ssh 技能，`MSYS_NO_PATHCONV=1`），不要直接改本地副本。
+wxshadow KPM（内核模块，`PR_WXSHADOW_PATCH` 的内核实现）的**最新源码就在本机**：
+`E:/52/mykpm/kpms/wxshadow/`，仓库 `nitingaqiumodeluoye/mykpm`。涉及内核 patch 路径
+（stop_machine/全局锁/IPI/TLB 击落等）的排查与修改，**直接改这份源码**，
+不再需要 SSH 到远端服务器拉取。
+
+> 早期文档写的 `E:/52/mkpms/kpms/wxshadow/`（“源码在 SSH 服务器上”）已作废：
+> `mkpms` 是 `mykpm` 的笔误，该目录从来不存在；服务器副本也已过期。
+
+同目录下还有 `kpms/karinahide/`（`karinahide.kpm`，供 rustFrida 的 `madvise`
+清 COW 路径调用）与其它 KPM。
+
+### 构建走 CI，不走本地也不走 SSH
+
+**wxshadow / karinahide 的 `.kpm` 一律通过 GitHub Actions 构建**，不要在本地跑
+`cmake`，也不要 SSH 到远端构建机。原因：
+
+- 本机 Windows 缺 `aarch64-linux-gnu-gcc` 与 `cmake`，本地构建不具可行性；
+- CI 的产物才是唯一权威产物，本地/远端手工编译会引入工具链漂移，
+  “本地能编”与“设备能跑”是两回事。
+
+```bash
+cd E:/52/mykpm
+# 改完源码推送即触发（`.github/workflows/build.yml`，push / PR / workflow_dispatch）
+git push origin master
+
+# 事件驱动等待，不要盲等固定时长
+gh run list  --repo nitingaqiumodeluoye/mykpm --limit 5
+gh run watch <run-id> --repo nitingaqiumodeluoye/mykpm --exit-status --interval 30
+echo "退出码: $?"
+
+# 取产物（-n 指定 artifact，避免 gh 多套一层目录）
+gh run download <run-id> --repo nitingaqiumodeluoye/mykpm -n wxshadow-kpm    -D out/
+gh run download <run-id> --repo nitingaqiumodeluoye/mykpm -n wxshadow-client -D out/
+```
+
+CI 的 `wxshadow` job（`ubuntu-latest` + `gcc-aarch64-linux-gnu`，抓 `.kp` 子模块头文件
+后 `cmake --build --target wxshadow.kpm wxshadow_client`）产出两个 artifact：
+
+| artifact | 文件 | 说明 |
+| --- | --- | --- |
+| `wxshadow-kpm` | `wxshadow.kpm` | ELF aarch64 relocatable 内核模块 |
+| `wxshadow-client` | `wxshadow_client` | 静态链接的 aarch64 用户态客户端 |
+
+另有 `kpm` job 产出 `karinahide.kpm`。发正式版打 tag 即可，release 流程自动出包。
+CI 失败时用 `gh run view <run-id> --log` 取日志按上面的失败行排查，**不要退回本地编译**。
 
 ## rawVector 与 rustFrida 双基准
 
@@ -22,7 +63,7 @@ Vector 的整体运行流程与 hook 实现分别使用两套已验证源码作�
 2. **hook 处理以 rustFrida 为准。**
    - ART layout、ArtMethod clone、router/controller、native replacement、WxShadow patch、
      trampoline、stack walk、deopt、原方法调用、callback 参数封装、ARM64 relocator、inline
-     hook 和缓存刷新等具体实现，必须优先对照 `D:\crack\rsfrida\rustFrida`。
+     hook 和缓存刷新等具体实现，必须优先对照 `E:\52\rustFrida`。
    - rustFrida 决定“hook 如何安装、路由、执行、恢复和清理”。不得用 rawVector 中的 LSPlant、
      Dobby 或其它旧 hook 后端替代 rustFrida 的 WxShadow 语义。
 
@@ -42,17 +83,31 @@ Vector 的整体运行流程与 hook 实现分别使用两套已验证源码作�
    - 不得只对照其中一个项目后就宣称整体链路已对齐。
 
 5. **源码可用性。**
-   - 如果 `D:\crack\rsfrida\rawVector` 或 `D:\crack\rsfrida\rustFrida` 不存在、关键文件缺失或
+   - 如果 `D:\crack\rsfrida\rawVector` 或 `E:\52\rustFrida` 不存在、关键文件缺失或
      对应逻辑无法定位，不得凭经验继续实现；应先报告缺失的基准和具体阻塞点。
+
+6. **构建一律走 CI，不走本地也不走 SSH。**
+   - **rustFrida**（`E:\52\rustFrida`，仓库 `nitingaqiumodeluoye/rustFrida`）：产物通过
+     GitHub Actions 构建，workflow `Build (Android aarch64)`，artifact
+     `rustfrida-aarch64-<sha>`（含 `rustfrida` / `libagent.so` / `zymbiote.elf` /
+     `rfclient` / `SHA256SUMS.txt`）。权威说明见该仓库的 `doc/build.md`，
+     `scripts/wait-ci.sh` 与 `scripts/check-module.sh` 是其配套脚本。
+     NDK 铉在 `/opt/android-ndk-r29`（与仓库内 `.cargo/config.toml` 一致）。
+   - **KPM**（wxshadow / karinahide）：见本文开头《wxshadow KPM 源码位置与构建》。
+   - 不要本地跑 `cargo` / NDK 构建，也不要 SSH 到远端构建机：本机工具链版本与 CI
+     不一致，本地产物与 CI 产物不等价，而且手工编译绕过 CI 会掩盖“本地能编、CI 编不过”
+     的真实分歧（如宏作用域、`unused import` 等 lint 升级为 error）。
+   - 需要改 rustFrida 源码时，直接改本机 `E:\52\rustFrida` 仓库并推送触发 CI，
+     不要在服务器副本上改。
 
 ## Vector ART Hook 改造约束
 
-当前项目正在进行 Vector 改造：将原本的 ART hook 实现改为 `D:\crack\rsfrida\rustFrida` 中的 wxshadow 模式 ART hook 实现。
+当前项目正在进行 Vector 改造：将原本的 ART hook 实现改为 `E:\52\rustFrida` 中的 wxshadow 模式 ART hook 实现。
 
 后续涉及 ART hook、WxShadow、ArtMethod、router、native trampoline、inline hook、deopt、原方法调用、callback 参数封装、ARM64 relocator 或相关构建接入的修改时，必须遵守以下规则：
 
 1. **不得凭经验或猜测实现。**
-   - 修改前必须先对照 `D:\crack\rsfrida\rustFrida` 中对应的 wxshadow 模式 ART hook 实现。
+   - 修改前必须先对照 `E:\52\rustFrida` 中对应的 wxshadow 模式 ART hook 实现。
    - 不确定语义时，先查源实现；源实现仍不明确时，停止并说明不确定点。
 
 2. **以 rustFrida 的 wxshadow ART hook 行为为准。**
@@ -69,16 +124,16 @@ Vector 的整体运行流程与 hook 实现分别使用两套已验证源码作�
    - 新增 hook 路径时应保留可回退路径，除非已确认替代路径在目标场景中完全覆盖。
 
 5. **源实现不可访问时不得继续猜测。**
-   - 如果 `D:\crack\rsfrida\rustFrida` 不存在、文件缺失、实现路径无法定位或关键函数无法确认，应先报告阻塞点，再请求明确指示。
+   - 如果 `E:\52\rustFrida` 不存在、文件缺失、实现路径无法定位或关键函数无法确认，应先报告阻塞点，再请求明确指示。
 
 6. **排障时优先对比原版 rustFrida。**
-   - 原版 `D:\crack\rsfrida\rustFrida` 已确认能在目标设备上正常使用。
+   - 原版 `E:\52\rustFrida` 已确认能在目标设备上正常使用。
    - 如果 Vector 移植逻辑在某个环节出现异常、崩溃、hook 不生效、参数/返回值错误、ART layout 推断失败、wxshadow patch 失败或行为不一致，应优先检查 Vector 当前实现与原版 rustFrida 对应逻辑的差异。
    - 排查结论应明确指出问题是来自 Vector 适配层、移植遗漏、构建差异、运行环境差异，还是与原版逻辑不一致。
 
 ## 当前 inline hook 基线
 
-下一阶段工作是对齐 `D:\crack\rsfrida\rustFrida` 的 inline hook 行为。开始改动前，先以以下 Vector 当前状态作为基线，随后逐项对照 rustFrida 源实现：
+下一阶段工作是对齐 `E:\52\rustFrida` 的 inline hook 行为。开始改动前，先以以下 Vector 当前状态作为基线，随后逐项对照 rustFrida 源实现：
 
 1. **Vector 当前 inline hook 统一入口。**
    - `HookInline()` / `UnhookInline()` 是兼容包装，但不得再包装 Dobby；普通 replacement 必须走 Vector 自带 ARM64 wxshadow hook engine：`hook_install(target, replacement, stealth=1)`，unhook 走 `hook_remove(target)`。
@@ -603,7 +658,8 @@ fork 时都要重新加载它一遍。Android 规定 `debuggable=true` 的 APK �
    对非移动的 Sticky / Young GC 不装 on_leave 同步。
 3. **KPM 快速路径**：`do_page_fault_before_impl` 对非 shadow 页的 fault 立即返回
    （当前每次 fault 都 get_task_mm + global_lock + list scan 后才判定），把单个 fault 的
-   固定开销降下来。这属于 KPM 侧，需 SSH 拉最新源再改。
+   固定开销降下来。这属于 KPM 侧，改本机源码 `E:/52/mykpm/kpms/wxshadow/` 后走 CI 出包
+   （见本文开头《wxshadow KPM 源码位置与构建》）。
 
 **特征**：
 - 保留 shadow 反检测（CRC/自校验读到原始字节）能力，不牺牲 stealth 语义。
