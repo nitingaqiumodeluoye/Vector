@@ -2,13 +2,16 @@
 
 ## wxshadow KPM 源码位置与构建
 
-wxshadow KPM（内核模块，`PR_WXSHADOW_PATCH` 的内核实现）的**最新源码就在本机**：
-`E:/52/mykpm/kpms/wxshadow/`，仓库 `nitingaqiumodeluoye/mykpm`。涉及内核 patch 路径
-（stop_machine/全局锁/IPI/TLB 击落等）的排查与修改，**直接改这份源码**，
+wxshadow KPM（内核模块，`PR_WXSHADOW_PATCH` 的内核实现）的**权威源码在本机**：
+`E:/52/mykpm/kpms/wxshadow/`，仓库 `nitingaqiumodeluoye/mykpm`（自有仓库，非 fork）。
+涉及内核 patch 路径（stop_machine/全局锁/IPI/TLB 击落等）的排查与修改，**直接改这份源码**，
 不再需要 SSH 到远端服务器拉取。
 
-> 早期文档写的 `E:/52/mkpms/kpms/wxshadow/`（“源码在 SSH 服务器上”）已作废：
-> `mkpms` 是 `mykpm` 的笔误，该目录从来不存在；服务器副本也已过期。
+> **不要与 `mkpms` 混淆**。`nitingaqiumodeluoye/mkpms`（fork 自 `kkkbbb/mkpms`）里也有一份
+> `kpms/wxshadow/`，但那是**旧的副本**（CHANGELOG 2523 B vs mykpm 12820 B；
+> `wxshadow.c` 60004 vs 62007，`wxshadow_scan.c` 40381 vs 50494）。
+> 早期文档写的 `E:/52/mkpms/kpms/wxshadow/` 指的就是那份旧副本，现本地克隆已不存在；
+> 即使存在也不得作为修改基准。
 
 同目录下还有 `kpms/karinahide/`（`karinahide.kpm`，供 rustFrida 的 `madvise`
 清 COW 路径调用）与其它 KPM。
