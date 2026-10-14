@@ -1159,12 +1159,16 @@ class DuckUsbModule : WbModule() {
         val result = try { chain.proceed() } catch (t: Throwable) {
             logE("usbStateHooker proceed failed", t); throw t
         }
+        // Both exits must be a *return value*: the hook's contract is the value it produces, so
+        // the rewritten Intent has to be the last expression. Returning `result` after computing
+        // the rewrite is what made the first fix look like it worked — the log line fired while
+        // the caller still got the original broadcast extras.
         try {
-            rewriteUsbStateIntent(result)
+            rewriteUsbStateIntent(result) ?: result
         } catch (t: Throwable) {
             logE("usbStateHooker rewrite failed", t)
+            result
         }
-        result
     }
 
     /**
