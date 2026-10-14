@@ -33,12 +33,27 @@ Within form 1 there is a second, quieter trap: `getInt(cr, name)` (2 args) does 
 fires. The symptom is a clean install log, zero hook hits, and `adb_enabled` still reading 1 —
 which is exactly what shipped in 1.0.9. `SETTINGS_TARGETS` now lists both overloads.
 
+A third form needs neither of the above, and it is the one that ends up on the ADB Runtime card:
+
+```
+// 3) the gadget's runtime state, as a sticky broadcast   (layer A7)
+registerReceiver(null, IntentFilter("android.hardware.usb.action.USB_STATE"))
+  .extras.getBoolean("adb")        // true while the adb function is applied
+```
+
+The extras there are built from `UsbDeviceManager.getAppliedFunctions()`. Nothing in this process
+hooks that path — it is not a Setting and not a property — so it kept answering `adb=true` while
+every getter above was already lying, and a detector that reads it sees the truth. Measured
+2026-10-14: `USB debugging setting: Disabled` / `init.svc.adbd: stopped` / `sys.usb.state: mtp`
+next to `USB runtime: adb (connected=true, configured=true)`. Layer A7 closes it.
+
 Layers that can lie:
 
 | Layer | Where it runs | How it works |
 |---|---|---|
 | **Per-app: settings** (default) | Each scoped app | Hooks the static `Settings.Global` / `Settings.Secure` getters (both `getInt` overloads) **and** the provider transport — `ContentResolver.query` (every overload; rebuilds a settings cursor with the `value` column substituted) and `ContentResolver.call` (rewrites the returned `Bundle["value"]` and marks it uncacheable). Covers both forms above with no server-side component. |
 | **Per-app: properties** | Each scoped app | `SystemProperties.native_get*`, and natively libc's `__system_property_get` / `__system_property_read` / `__system_property_read_callback` — plus, for the one path no in-process hook can reach (an exec'd `getprop`), wrapping `ProcessBuilder.start()` so the child's stdout carries the same overrides |
+| **Per-app: USB runtime** | Each scoped app | The sticky `android.hardware.usb.action.USB_STATE` broadcast, whose extras carry the gadget's applied state (`connected` / `configured` / `adb`). It is neither a Setting nor a property, so the two layers above cannot reach it — a detector reading it still saw `adb=true`. `registerReceiver` is hooked (`ContextWrapper` **and** `ContextImpl`, every overload) and the returned Intent is rebuilt with `adb=false` while `connected` / `configured` / `mtp` stay, so the story matches our own `sys.usb.state=mtp`. Gated on `configured=true` — a wireless-only session is exactly `adb=true` with no configured gadget, and rewriting that would make an active wireless session read as absent — plus a sysfs veto when `/sys/android_usb/android0/ffs/adb` reads `0` (the MTK layout; the same file is `/sys/class/android_usb/android0/ffs/adb` on other SoCs, and an unreadable path simply skips the veto). Skipped for `SPARE_PACKAGES` |
 | **Per-app: device state** | Each scoped app | The same detector cross-checks things that are not USB at all: `KeyguardManager.isDeviceSecure` / `isKeyguardSecure` (a device with *no* lock-screen password is the risk), `TelephonyManager.getSimState` (no SIM is the risk) and `SubscriptionManager.getActiveSubscriptionInfoCount`. Spoofing only the ADB paths leaves these reporting the real device. |
 | **Framework mode** (opt-in, experimental) | `system_server` | Hooks `ContentProvider.attachInfo` → waits for the settings provider (matched by **authority**) → hooks only that provider's `call()`, rewriting results per `Binder.getCallingUid()` |
 
@@ -123,6 +138,16 @@ nothing else.
 | `sys.usb.state` | `mtp` |
 | `init.svc.adbd` | `stopped` |
 | `persist.sys.usb.config` | `mtp` |
+
+Sticky `USB_STATE` broadcast extras (layer A7):
+
+| Extra | Forced | Why |
+|---|---|---|
+| `adb` | `false` | The one uncovered ADB evidence — see [the reason above](#what-the-module-does) |
+| `mtp` | `true` | Kept consistent with `sys.usb.state=mtp` |
+| `connected` | *untouched* | The phone really is on a cable; forcing `false` would contradict `sys.usb.state=mtp` |
+| `configured` | *untouched* (read as a gate) | `true` is required before `adb` is rewritten; a wireless-only session is `adb=true` with `configured=false`, and that case is left alone |
+| any other function flag | *untouched* | We only remove the adb claim |
 
 `sys.usb.ffs.ready` is deliberately **not** spoofed (it is machinery the USB stack acts on, not
 telemetry a detector reads). **Four of these five values are mirrored in PropMask and must stay
@@ -295,6 +320,8 @@ the intended path, not a failure.
 | Nothing happens in the detector app | `staticScope` is false here, so the app is simply not ticked yet — see [Scope](#scope) |
 | `cli scope ls` looks right, but `scope add` reports nonsense claims (`#`, comment words) | `scope.list` has comments in it. `readStaticScope` has no `#` syntax — every non-empty line is a claimed package. Keep that file to bare package names |
 | USB drops to charge-only | Something in `SPARE_PACKAGES` got spoofed; the property layer is the cause |
+| A detector still reports ADB on, via `USB_STATE` or the ADB runtime card | Is `verbose_log` on? Layer A7 logs `USB runtime state spoof: USB_STATE adb=true -> false` per hit. No line at all means no `USB_STATE` broadcast reached this process (`registerReceiver` never called, or the detector reads `UsbManager` state that never comes through the broadcast — see the [ADB Runtime note](#division-of-labour-with-propmask)). A line but still found means the extra names moved: check `UsbDeviceManager.makeUsbStateIntent` in the ROM |
+| ADB-over-Wi-Fi stops being detected (or wireless debugging looks wrong) | A7 must *not* have rewritten a wireless-only broadcast. Confirm `configured=false` there — the gate leaves those alone by design |
 
 ## Division of labour with PropMask
 
@@ -329,16 +356,29 @@ in PropMask's keep-out list on purpose: PropMask rewrites the process property v
 clears `runtime_flags`, so aiming it at the module that provides the hook backend would break the
 injection stack itself.
 
-**Known gap, on this side.** `USB_STATE` — the sticky `android.hardware.usb.action.USB_STATE`
-broadcast whose extras carry `connected` / `configured` / the `adb` function flag — is covered by
-neither half. It is not a property and not a file, so PropMask cannot touch it; the only per-process
-place to rewrite it is a Java hook here (`ContextImpl.registerReceiver` /
-`checkReceiverUnregistered`). Upstream Duck Detector grades it **warning only** by design
-("AOSP builds broadcast function flags from applied USB functions, so adb=true is not process
-proof" — `eltavine/Duck-Detector-Refactoring`, `feature/adbruntime/EVIDENCE.md`), so its absence
-costs a yellow card (`ADB Runtime / Headline: ADB enabled`), never a red one: the protocol-level
-Danger requires a local `_adb._tcp` endpoint that answers a real A_CNXN, which neither half can fake
-either. **Recorded, not implemented** — see the 2026-10-14 measured anchor in PropMask README §13.4.
+**USB_STATE (layer A7).** `USB_STATE` — the sticky `android.hardware.usb.action.USB_STATE`
+broadcast whose extras carry `connected` / `configured` / the `adb` function flag — was covered by
+neither half, because it is not a property and not a file: PropMask's bind-mounts cannot reach it,
+and none of the read hooks above are on that path. It is now handled here by layer **A7**
+(`installUsbStateSpoof`), the only per-process place it can be rewritten
+(`ContextWrapper.registerReceiver` and `ContextImpl.registerReceiver`, every overload). The design
+constraints come straight from the upstream detector's own evidence document —
+`eltavine/Duck-Detector-Refactoring`, `feature/adbruntime/EVIDENCE.md`: the flags are built from
+framework `UsbDeviceManager.getAppliedFunctions()`, so "adb=true is not process proof"; the channel
+is graded **warning only**; `connected` and `configured` describe the *gadget*, not adbd liveness.
+That is why A7 removes only the adb claim and leaves the gadget description standing, and why it
+never touches system_server or adbd: the real ADB session keeps working.
+
+The remaining uncovered ADB channel is the protocol-level one: a local `_adb._tcp` /
+`_adb-tls-connect._tcp` endpoint that answers a real A_CNXN. Nothing in-process can fake that
+(and it is the only path to a red card), but it also requires the detector to actually probe; the
+2026-10-14 scan reported `ADB mDNS: Not observed`, so no Danger was reachable. PropMask's README
+§13.5 lists it as the one channel neither module can hide.
+
+`sys.usb.ffs.ready` is still spoofed by neither half: it is machinery the USB stack acts on, and
+claiming `0` kills the gadget. A7 *reads* the sibling `/sys/android_usb/android0/ffs/adb`
+(veto only; the path lives under `/sys/class/android_usb/` on non-MTK SoCs and a read failure is
+treated as "no veto").
 
 Finally, out of both modules' remit by design: **package-enumeration signals** (a detector listing
 installed APKs and reading their meta-data, e.g. the `com.zhenxi.jnitrace` hit, or the `FolkPatch`

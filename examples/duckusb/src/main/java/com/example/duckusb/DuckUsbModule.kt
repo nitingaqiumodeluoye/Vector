@@ -4,6 +4,7 @@ import android.app.Application
 import android.app.Notification
 import android.content.ContentResolver
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.ApplicationInfo
 import android.content.res.Resources
@@ -54,13 +55,23 @@ import java.util.concurrent.TimeUnit
  *     cross-source "Diverged" signal measured with Duck Detector 526 (reflection mtp /
  *     getprop adb / native libc mtp).
  *
+ *  A7) USB RUNTIME STATE SPOOF (automatic, same scope). The sticky
+ *     `android.hardware.usb.action.USB_STATE` broadcast carries the gadget's applied state
+ *     (`connected` / `configured` / `adb`). It is the one ADB evidence that is neither a
+ *     Setting nor a property, so none of the layers above can reach it and a detector reading
+ *     it still sees adb=true. registerReceiver(...) is hooked and the returned Intent is
+ *     rebuilt with the adb flag cleared (MTP is kept, so the story stays consistent with our
+ *     own sys.usb.state=mtp). Never touches system_server or adbd itself.
+ *
  *  B) NOTIFICATION SUPPRESSOR (System Framework / System UI). Hides the persistent
  *     "USB debugging enabled" notification. That notification is posted by system_server, so
  *     this half deliberately DOES run in system_server and com.android.systemui — the ones the
  *     spoof half skips.
  *
- * Scope: this example ships a fixed scope (staticScope=true + scope.list) containing system and
- * com.android.systemui. Detector apps must be added explicitly; see README.md.
+ * Scope: `module.prop` sets `staticScope=false`, so `scope.list` (system, android,
+ * com.android.systemui) holds *recommendations* only — the daemon ignores it and every app is
+ * listed in the manager until you tick it. Tick `system` for framework mode or the notification
+ * suppressor; ticking the entry named `android` does not inject into system_server. See README.md.
  *
  * ── What changed in the port ───────────────────────────────────────────────────────────────
  * Only the API surface. Vector's modern API is the same design as libxposed's, so every entry
@@ -177,6 +188,27 @@ class DuckUsbModule : WbModule() {
         /** Bundle keys used by the settings-provider call protocol. */
         private const val CALL_VALUE = "value"                 // Settings.NameValueTable.VALUE
         private const val CALL_GENERATION_INDEX = "_generation_index" // CALL_METHOD_GENERATION_INDEX_KEY
+
+        /**
+         * A7) `android.hardware.usb.action.USB_STATE` — the sticky broadcast whose extras carry
+         * the USB gadget's *applied* state. Spelled as a literal instead of
+         * `UsbManager.ACTION_USB_STATE` so nothing here depends on a hidden field, and so the
+         * extra names below can be listed next to it.
+         */
+        private const val USB_STATE_ACTION = "android.hardware.usb.action.USB_STATE"
+
+        /** Extra names used by `UsbDeviceManager.makeUsbStateIntent()` (see the A7 note below). */
+        private const val USB_EXTRA_CONNECTED = "connected"
+        private const val USB_EXTRA_CONFIGURED = "configured"
+        private const val USB_EXTRA_ADB = "adb"
+        private const val USB_EXTRA_MTP = "mtp"
+
+        /**
+         * The adb function-filesystem flag: `1` while the adb function is linked into the
+         * gadget. Read by A7 only as a *veto* (see [usbAdbFunctionLinked]). Unreadable from an
+         * untrusted app on some ROMs, which is exactly why a read failure must not veto.
+         */
+        private const val SYSFS_FFS_ADB = "/sys/android_usb/android0/ffs/adb"
 
         /** Notification channels the ADB notifications live on (AOSP). */
         private val ADB_CHANNELS = setOf("DEVELOPER", "DEVELOPER_IMPORTANT")
@@ -346,10 +378,12 @@ class DuckUsbModule : WbModule() {
             } else {
                 installSystemPropertiesSpoof(cl)
                 installNativePropSpoof()
-                // A4) FLAG_DEBUGGABLE 清位（rustFrida 脚本 (2) 的等效实现，同 scope/guard）。
+                // A4) FLAG_DEBUGGABLE 清位(rustFrida 脚本 (2) 的等效实现,同 scope/guard)。
                 installDebuggableSpoof(param)
                 // A3) Covers the one read path the two layers above cannot reach.
                 installGetpropExecSpoof(cl)
+                // A7) USB 运行时粘性广播 —— 唯一不由 Settings/属性表达的 ADB 证据。
+                installUsbStateSpoof(cl)
             }
             // A5) Provider transport. Layer A hangs the static Settings getters, but a detector
             //     can name the provider instead and never touch them: query() on
@@ -983,6 +1017,142 @@ class DuckUsbModule : WbModule() {
 
     private val subscriptionCountHooker = WbInterface.Hooker { chain ->
         if (pausedOn() || !deviceStateSpoofOn()) chain.proceed() else 1
+    }
+
+    // ============ A7) USB RUNTIME STATE SPOOF (sticky broadcast) ============
+
+    /**
+     * `android.hardware.usb.action.USB_STATE` — the **sticky** broadcast whose extras carry the
+     * USB gadget's applied state, and the last piece of ADB evidence the layers above cannot
+     * reach. A (Settings) / A2 (properties) / A3 (exec'd getprop) / A5 (provider transport) all
+     * rewrite *reads*; a detector that reads the runtime broadcast instead still sees
+     * `connected=true, configured=true, adb=true` and concludes ADB is on.
+     *
+     * Measured 2026-10-14 (Duck Detector 2026.10.11 build 1018, on 22041211AC):
+     * ```
+     *   USB debugging setting : Disabled      <- layers A/A2 (ours)
+     *   init.svc.adbd         : stopped       <- layer A2  (ours)
+     *   sys.usb.state         : mtp           <- layer A2  (ours)
+     *   USB runtime           : adb (connected=true, configured=true)   <- truth, uncovered
+     *   => verdict [WARNING] ADB enabled
+     * ```
+     * That single uncovered line is what keeps the card out of "clear"; everything else already
+     * agrees. The upstream detector grades this channel warning-only by design —
+     * `UsbDeviceManager` builds the flags from `getAppliedFunctions()`, so "adb=true is not
+     * process proof" (`eltavine/Duck-Detector-Refactoring`, `feature/adbruntime/EVIDENCE.md`) —
+     * but a warning card is still a finding, and it is the one finding the module *can* fix.
+     *
+     * What is rewritten, and why not "everything off": the gadget really is configured, as MTP
+     * according to our own `sys.usb.state=mtp` / `sys.usb.config=mtp`. So the coherent story is
+     * *a phone plugged in for file transfer*: keep `connected`, keep `configured`, keep the `mtp`
+     * function flag, clear `adb`. Claiming `connected=false` would contradict the `sys.usb.state
+     * =mtp` we already report (that value means the gadget is applied).
+     *
+     * Returning a rebuilt Intent is safe with respect to intent-filter matching: `filterEquals()
+     * compares action / data / type / identity / flags, never extras`, so a caller's filter
+     * still matches exactly what it matched before the rewrite.
+     *
+     * Three deliberate limits:
+     *  - **Only the descriptor, never the device.** This rewrites the Intent handed to a caller
+     *    in *this* process; it never calls `UsbManager`, never touches system_server, and never
+     *    stops adbd — the real ADB session (and this module's own host) keeps working.
+     *  - **Wireless debugging is left alone.** The coherent USB story and the wireless one are not
+     *    the same broadcast: a detector can tell them apart from the extras themselves
+     *    (`connected` / `configured`), and the way it distinguishes a wireless-only session is
+     *    exactly `adb=true` with no configured gadget. Rewriting that case would make an active
+     *    wireless ADB session read as absent — a contradiction of its own — so the rewrite
+     *    requires `configured=true`, plus a sysfs veto when the adb function is demonstrably
+     *    unlinked.
+     *  - **A miss is possible, and accepted.** Software can keep answering `adb=true` outside what
+     *    this hook sees (its own `UsbManager` transport list, a cached registration, a native
+     *    read). A hidden ADB that is still visible through a channel we do not cover is the
+     *    intended trade: this layer removes the *coherent public story*, it does not police every
+     *    consumer — see the README's ADB Runtime note.
+     *
+     * Installed inside the same spoof branch as the property layers (so `SPARE_PACKAGES` are
+     * excluded too) and gated live by [spoofOn] plus the master pause, matching every other hook
+     * here. `ContextWrapper.registerReceiver` exists on every supported API; the
+     * `registerReceiverForAllUsers` variant only appears from API 29, and both `findClass` and
+     * [hookAll] skip whatever is absent, so `minSdk` 27 is fine.
+     */
+    private fun installUsbStateSpoof(cl: ClassLoader) {
+        // ContextWrapper covers Activity / Service / Application and every custom wrapper;
+        // ContextImpl covers code holding the real base (it does not extend ContextWrapper).
+        // Both are hooked because either can be the dispatched receiver; each call resolves to
+        // exactly one of them, so the result is rewritten once.
+        var total = 0
+        for (cls in arrayOf("android.content.ContextWrapper", "android.content.ContextImpl")) {
+            val c = findClass(cls, cl) ?: continue
+            var n = 0
+            for (m in arrayOf(
+                "registerReceiver",                    // both the 2-arg and the 3-arg overload
+                "registerReceiverForAllUsers",         // ContextImpl-only @hide variant
+            )) {
+                n += hookAll(c, m, usbStateHooker)
+            }
+            if (n > 0) logI("USB runtime state spoof: $cls hooks=$n")
+            total += n
+        }
+        if (total == 0) {
+            logE("USB runtime state spoof: no registerReceiver overload found")
+        }
+    }
+
+    private val usbStateHooker = WbInterface.Hooker { chain ->
+        val result = try { chain.proceed() } catch (t: Throwable) {
+            logE("usbStateHooker proceed failed", t); throw t
+        }
+        try {
+            rewriteUsbStateIntent(result)
+        } catch (t: Throwable) {
+            logE("usbStateHooker rewrite failed", t)
+        }
+        result
+    }
+
+    /**
+     * Returns the replacement Intent for a sticky `USB_STATE` result, or the original unchanged
+     * whenever there is nothing to hide — which is the common case in this process.
+     */
+    private fun rewriteUsbStateIntent(result: Any?): Any? {
+        val src = result as? Intent ?: return result
+        if (pausedOn() || !spoofOn()) return result
+        if (src.action != USB_STATE_ACTION) return result
+
+        val extras = try { src.extras } catch (_: Throwable) { null } ?: return result
+        // 1) Nothing to hide: the broadcast does not advertise the adb function.
+        if (!extras.getBoolean(USB_EXTRA_ADB, false)) return result
+        // 2) Wireless-only session (or nothing applied yet): the gadget is not configured, so
+        //    the adb flag here is not wired evidence — leave it, or ADB-over-Wi-Fi breaks.
+        if (!extras.getBoolean(USB_EXTRA_CONFIGURED, false)) return result
+        // 3) sysfs veto: if the adb function is demonstrably not linked, the broadcast is lagging
+        //    and there is nothing to rewrite. Unreadable -> no veto, the checks above stand.
+        if (usbAdbFunctionLinked() == false) return result
+
+        // Build a fresh Intent: never mutate the object the framework handed us, and never touch
+        // connected/configured/mtp — see the A7 note on why those must stay consistent with our
+        // own sys.usb.state=mtp.
+        val safe = Bundle(extras)
+        safe.putBoolean(USB_EXTRA_ADB, false)
+        safe.putBoolean(USB_EXTRA_MTP, true)
+        val replacement = Intent(USB_STATE_ACTION).replaceExtras(safe)
+        if (verboseOn()) {
+            logI("USB runtime state spoof: USB_STATE adb=true -> false, kept " +
+                "connected=${safe.getBoolean(USB_EXTRA_CONNECTED, false)} " +
+                "configured=true ${USB_EXTRA_MTP}=true")
+        }
+        return replacement
+    }
+
+    /**
+     * `null` when the adb function-filesystem flag cannot be read (absent file, denied access) —
+     * a veto needs positive evidence, so `null` must never suppress the rewrite.
+     */
+    private fun usbAdbFunctionLinked(): Boolean? = try {
+        val v = java.io.File(SYSFS_FFS_ADB).readText().trim()
+        if (v.isEmpty()) null else v != "0"
+    } catch (_: Throwable) {
+        null
     }
 
     // ========================= B) NOTIFICATION SUPPRESSOR =========================
