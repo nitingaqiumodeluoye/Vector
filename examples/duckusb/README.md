@@ -125,7 +125,10 @@ nothing else.
 | `persist.sys.usb.config` | `mtp` |
 
 `sys.usb.ffs.ready` is deliberately **not** spoofed (it is machinery the USB stack acts on, not
-telemetry a detector reads).
+telemetry a detector reads). **Four of these five values are mirrored in PropMask and must stay
+byte-identical** — see [Division of labour with PropMask](#division-of-labour-with-propmask);
+`persist.security.adbinput` / `persist.security.adbinstall` are PropMask-only for the reason given
+there, and are deliberately absent from `Config.PROP_OVERRIDES`.
 
 Device-state reads, spoofed by the per-app device-state layer:
 
@@ -292,6 +295,55 @@ the intended path, not a failure.
 | Nothing happens in the detector app | `staticScope` is false here, so the app is simply not ticked yet — see [Scope](#scope) |
 | `cli scope ls` looks right, but `scope add` reports nonsense claims (`#`, comment words) | `scope.list` has comments in it. `readStaticScope` has no `#` syntax — every non-empty line is a claimed package. Keep that file to bare package names |
 | USB drops to charge-only | Something in `SPARE_PACKAGES` got spoofed; the property layer is the cause |
+
+## Division of labour with PropMask
+
+This module is only one half of the ADB/USB lie. The other half is **PropMask**
+(`E:/52/propmask`, a Zygisk module + companion KPM), which covers the two channels no in-process
+hook can reach. The full coverage matrix, the value-parity table and the measured evidence live in
+that repository's README §13 (**「与 Vector/duckusb 的联合边界(检测通道覆盖矩阵)」**) — read it
+before interpreting any detector report. What matters here:
+
+**PropMask owns what a Java/native hook structurally cannot see:**
+
+| Channel | Why not here | Handled by |
+|---|---|---|
+| Raw prop_area read — `openat("/dev/__properties__/...")` + `mmap` + hand-parsed trie | No hook in this process is on that path | PropMask: bind-mounts a patched copy into the app's mount ns, plus `patch_inherited_property_maps()` for the zygote-inherited COW page |
+| File metadata of the patched copy | — | PropMask: `copy_stat_meta` + `propmask-hide.kpm` drops the three mount tables |
+| init.rc static scan | — | PropMask: equal-length rewrite (0 hits on this device) |
+| Freshness / cross-channel drift | — | PropMask: rebuilds the copy image and compares it byte for byte before reuse |
+
+**Parity is a hard requirement, not a courtesy.** The spoofed values must be byte-identical on
+both sides or a detector flags *source divergence* instead of reading the lie. `sys.usb.config`,
+`sys.usb.state` and `persist.sys.usb.config` are `mtp` in both, `init.svc.adbd` is `stopped` in
+both. The single deliberate exception is `persist.security.adbinput` / `persist.security.adbinstall`
+(empty string): **only PropMask covers them**, because this module's hooks cannot reach an exec'd
+`getprop` child, and spoofing them here alone would manufacture exactly the mismatch the pair
+exists to avoid. `sys.usb.ffs.ready` is deliberately spoofed by neither — it is machinery the USB
+stack acts on, and claiming `0` kills the gadget.
+
+**Scope is not shared.** PropMask decides by uid rule (`uid % 100000 ∈ [10000,19999]` + keep-out)
+and covers *every* app process; this module uses Vector's module scope, which is **empty until you
+tick something** (see [Scope](#scope)). Neither side manages the other. This module's own package is
+in PropMask's keep-out list on purpose: PropMask rewrites the process property view, bind-mounts and
+clears `runtime_flags`, so aiming it at the module that provides the hook backend would break the
+injection stack itself.
+
+**Known gap, on this side.** `USB_STATE` — the sticky `android.hardware.usb.action.USB_STATE`
+broadcast whose extras carry `connected` / `configured` / the `adb` function flag — is covered by
+neither half. It is not a property and not a file, so PropMask cannot touch it; the only per-process
+place to rewrite it is a Java hook here (`ContextImpl.registerReceiver` /
+`checkReceiverUnregistered`). Upstream Duck Detector grades it **warning only** by design
+("AOSP builds broadcast function flags from applied USB functions, so adb=true is not process
+proof" — `eltavine/Duck-Detector-Refactoring`, `feature/adbruntime/EVIDENCE.md`), so its absence
+costs a yellow card (`ADB Runtime / Headline: ADB enabled`), never a red one: the protocol-level
+Danger requires a local `_adb._tcp` endpoint that answers a real A_CNXN, which neither half can fake
+either. **Recorded, not implemented** — see the 2026-10-14 measured anchor in PropMask README §13.4.
+
+Finally, out of both modules' remit by design: **package-enumeration signals** (a detector listing
+installed APKs and reading their meta-data, e.g. the `com.zhenxi.jnitrace` hit, or the `FolkPatch`
+root-manager match in the same report). That is "what is installed on the device", not a view any
+process can lie about in-process.
 
 ## Provenance and licence
 
