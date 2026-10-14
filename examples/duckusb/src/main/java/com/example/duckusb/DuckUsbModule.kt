@@ -204,11 +204,26 @@ class DuckUsbModule : WbModule() {
         private const val USB_EXTRA_MTP = "mtp"
 
         /**
-         * The adb function-filesystem flag: `1` while the adb function is linked into the
-         * gadget. Read by A7 only as a *veto* (see [usbAdbFunctionLinked]). Unreadable from an
-         * untrusted app on some ROMs, which is exactly why a read failure must not veto.
+         * The adb function-filesystem flag: `1` while the adb function is linked into the gadget.
+         * Read by A7 only as a *veto* (see [usbAdbFunctionLinked]). Two spellings, because the sysfs
+         * root is SoC-dependent: MTK puts it under `/sys/android_usb/`, the AOSP reference tree and
+         * most other SoCs under `/sys/class/android_usb/`. Absent or unreadable paths are skipped —
+         * a veto needs positive evidence, so "cannot read" must never suppress the rewrite.
          */
-        private const val SYSFS_FFS_ADB = "/sys/android_usb/android0/ffs/adb"
+        private val SYSFS_FFS_ADB = arrayOf(
+            "/sys/android_usb/android0/ffs/adb",
+            "/sys/class/android_usb/android0/ffs/adb",
+        )
+
+        /**
+         * **`android.app.ContextImpl`** — what concrete `Context` instances are, and where
+         * `applicationContext.registerReceiver` really lands. NOT `android.content`: no such class
+         * exists there, and writing it that way makes `findClass` return null. That mistake shipped
+         * once and cost two silent failures — the A7 USB_STATE rewrite never fired, and A4's
+         * `getApplicationInfo` fallback was dead while its absence got blamed on the hidden-API
+         * list. Single source of truth so it cannot drift again.
+         */
+        private const val CONTEXT_IMPL = "android.app.ContextImpl"
 
         /** Notification channels the ADB notifications live on (AOSP). */
         private val ADB_CHANNELS = setOf("DEVELOPER", "DEVELOPER_IMPORTANT")
@@ -687,9 +702,11 @@ class DuckUsbModule : WbModule() {
         // 2) 兜底一：Application.attach 时再清一次（部分 ROM 在 attach 里重新赋值）。
         findClass("android.app.Application", cl)?.let { hookAll(it, "attach", appAttachHooker) }
 
-        // 3) 兜底二：ContextImpl.getApplicationInfo。该 @hide 类在部分环境被隐藏 API 名单
-        //    挡住（findClass 返回 null 属预期），拿得到就多兜一层，拿不到不影响主路径。
-        val cimpl = findClass("android.content.ContextImpl", cl)
+        // 3) 兜底二:ContextImpl.getApplicationInfo。该 @hide 类在部分环境被隐藏 API 名单
+        //    挡住(findClass 返回 null 属预期),拿得到就多兜一层,拿不到不影响主路径。
+        //    ★ 类名是 android.app.ContextImpl,不是 android.content.* —— 后者根本不存在。
+        //     写错会让这里永远拿不到类,而日志只留一句“hidden-API”把它掩盖过去。
+        val cimpl = findClass(CONTEXT_IMPL, cl)
         if (cimpl != null) {
             hookAll(cimpl, "getApplicationInfo", debuggableHooker)
         } else if (verboseOn()) {
@@ -1076,25 +1093,65 @@ class DuckUsbModule : WbModule() {
      * [hookAll] skip whatever is absent, so `minSdk` 27 is fine.
      */
     private fun installUsbStateSpoof(cl: ClassLoader) {
-        // ContextWrapper covers Activity / Service / Application and every custom wrapper;
-        // ContextImpl covers code holding the real base (it does not extend ContextWrapper).
-        // Both are hooked because either can be the dispatched receiver; each call resolves to
-        // exactly one of them, so the result is rewritten once.
         var total = 0
-        for (cls in arrayOf("android.content.ContextWrapper", "android.content.ContextImpl")) {
-            val c = findClass(cls, cl) ?: continue
+
+        // 1) ContextWrapper covers Activity / Service / Application and every custom wrapper: a
+        //    caller holding a wrapper delegates down, so this catches it before it reaches the base.
+        val wrapper = findClass("android.content.ContextWrapper", cl)
+        if (wrapper != null) {
             var n = 0
-            for (m in arrayOf(
-                "registerReceiver",                    // both the 2-arg and the 3-arg overload
-                "registerReceiverForAllUsers",         // ContextImpl-only @hide variant
-            )) {
-                n += hookAll(c, m, usbStateHooker)
+            for (m in arrayOf("registerReceiver", "registerReceiverForAllUsers")) {
+                n += hookAll(wrapper, m, usbStateHooker)
             }
-            if (n > 0) logI("USB runtime state spoof: $cls hooks=$n")
+            if (n > 0) logI("USB runtime state spoof: ContextWrapper hooks=$n")
             total += n
         }
+
+        // 2) The @hide sibling, and the one that actually matters: `ContextImpl` is what a plain
+        //    `getApplicationContext()` / `applicationContext` is, and it OVERRIDES registerReceiver
+        //    rather than delegating to ContextWrapper — so a ContextWrapper-only hook never fires
+        //    for it. `context.applicationContext.registerReceiver(null, filter)` (the shape a sticky
+        //    reader uses) lands here and nowhere else, which is why a wrapper-only A7 was a no-op.
+        //    Verified against AOSP android-12.0.0_r1: `class ContextImpl extends Context`, and its
+        //    own registerReceiver does not call super.
+        val cimpl = findClass(CONTEXT_IMPL, cl)
+        if (cimpl != null) {
+            var n = 0
+            for (m in arrayOf(
+                "registerReceiver",                    // 2-arg and 3-arg overloads
+                "registerReceiverForAllUsers",         // @hide variant, API 29+
+                "registerReceiverAsUser",              // @hide variant
+            )) {
+                n += hookAll(cimpl, m, usbStateHooker)
+            }
+            if (n > 0) logI("USB runtime state spoof: $CONTEXT_IMPL hooks=$n")
+            total += n
+        } else {
+            logE("USB runtime state spoof: $CONTEXT_IMPL not found (hidden-API?) — " +
+                "applicationContext.registerReceiver stays unspoofed")
+        }
+
         if (total == 0) {
             logE("USB runtime state spoof: no registerReceiver overload found")
+        }
+    }
+
+    /**
+     * One-shot per process: the first rewrite is logged unconditionally (like
+     * `settingsHooker SPOOF`), everything after that only under `verbose_log`. Without this a
+     * verbose-off install gives no evidence at all that A7 fired — the install line alone cannot
+     * distinguish "hook never runs" from "hook runs and rewrites", which is exactly how the
+     * `android.content.ContextImpl` typo stayed invisible.
+     */
+    @Volatile
+    private var usbRewriteLogged = false
+
+    private fun logUsbRewrite(firstTime: Boolean, connected: Boolean) {
+        if (firstTime) {
+            logI("USB runtime state spoof: USB_STATE rewritten (adb=true -> false, " +
+                "connected=$connected configured=true mtp=true)")
+        } else if (verboseOn()) {
+            logI("USB runtime state spoof: USB_STATE rewritten again (adb=true -> false)")
         }
     }
 
@@ -1136,21 +1193,32 @@ class DuckUsbModule : WbModule() {
         safe.putBoolean(USB_EXTRA_ADB, false)
         safe.putBoolean(USB_EXTRA_MTP, true)
         val replacement = Intent(USB_STATE_ACTION).replaceExtras(safe)
-        if (verboseOn()) {
-            logI("USB runtime state spoof: USB_STATE adb=true -> false, kept " +
-                "connected=${safe.getBoolean(USB_EXTRA_CONNECTED, false)} " +
-                "configured=true ${USB_EXTRA_MTP}=true")
-        }
+        val firstTime = !usbRewriteLogged
+        usbRewriteLogged = true
+        logUsbRewrite(firstTime, safe.getBoolean(USB_EXTRA_CONNECTED, false))
         return replacement
     }
 
     /**
-     * `null` when the adb function-filesystem flag cannot be read (absent file, denied access) —
-     * a veto needs positive evidence, so `null` must never suppress the rewrite.
+     * The adb function-filesystem flag as a *veto*: `true` = the adb function is linked,
+     * `false` = demonstrably unlinked, `null` = could not tell.
+     *
+     * Two independent sysfs layouts: MTK keeps the flags directly under
+     * `/sys/android_usb/android0/`, while the AOSP reference tree and other SoCs (Qualcomm /
+     * Exynos) expose them under `/sys/class/android_usb/android0/`. On the measured device
+     * (rubens, MTK 5.10) only the former exists — `/sys/class/android_usb/android0/ffs/` is
+     * absent — and even that path is unreadable from an untrusted app, so the result is normally
+     * `null` ("no veto"). A veto needs positive evidence, so every unreadable or absent path is
+     * skipped rather than treated as `false`.
      */
     private fun usbAdbFunctionLinked(): Boolean? = try {
-        val v = java.io.File(SYSFS_FFS_ADB).readText().trim()
-        if (v.isEmpty()) null else v != "0"
+        for (path in SYSFS_FFS_ADB) {
+            val file = java.io.File(path)
+            if (!file.exists()) continue
+            val v = try { file.readText().trim() } catch (_: Throwable) { continue }
+            if (v.isNotEmpty()) return v != "0"
+        }
+        null
     } catch (_: Throwable) {
         null
     }

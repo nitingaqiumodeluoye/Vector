@@ -360,8 +360,10 @@ injection stack itself.
 broadcast whose extras carry `connected` / `configured` / the `adb` function flag — was covered by
 neither half, because it is not a property and not a file: PropMask's bind-mounts cannot reach it,
 and none of the read hooks above are on that path. It is now handled here by layer **A7**
-(`installUsbStateSpoof`), the only per-process place it can be rewritten
-(`ContextWrapper.registerReceiver` and `ContextImpl.registerReceiver`, every overload). The design
+(`installUsbStateSpoof`), the only per-process place it can be rewritten. The hook has to sit on
+`android.app.ContextImpl` (plus `ContextWrapper`), because `applicationContext` — the reference the
+detector actually holds — resolves there and `ContextImpl` overrides `registerReceiver` rather than
+delegating to `ContextWrapper`. The design
 constraints come straight from the upstream detector's own evidence document —
 `eltavine/Duck-Detector-Refactoring`, `feature/adbruntime/EVIDENCE.md`: the flags are built from
 framework `UsbDeviceManager.getAppliedFunctions()`, so "adb=true is not process proof"; the channel

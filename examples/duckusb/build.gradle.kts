@@ -24,8 +24,8 @@ android {
 
     defaultConfig {
         applicationId = "com.example.duckusb"
-        versionCode = 12
-        versionName = "1.0.11"
+        versionCode = 15
+        versionName = "1.0.14"
     }
 
     packaging {
