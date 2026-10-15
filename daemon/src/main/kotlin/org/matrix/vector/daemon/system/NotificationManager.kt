@@ -157,18 +157,31 @@ object NotificationManager {
         PendingIntent.getBroadcast(
             context, 1, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
 
-    val notif =
-        Notification.Builder(context, STATUS_CHANNEL_ID)
-            .setContentTitle(context.getString(R.string.vector_running_notification_title))
-            .setContentText(context.getString(R.string.vector_running_notification_content))
-            .setSmallIcon(getNotificationIcon())
-            .setContentIntent(pi)
-            .setVisibility(Notification.VISIBILITY_SECRET)
-            .setOngoing(true)
-            .build()
-            .apply { extras.putString("android.substName", BuildConfig.FRAMEWORK_NAME) }
-
+    // Build and enqueue are guarded together, and the channels are created first so a build
+    // failure cannot leave the channel list unregistered for a later notice. Building a
+    // Notification touches the platform (it renders the small icon and resolves every string), so
+    // a throw here is as reachable as one from enqueue — and on a vendor ROM it is not
+    // hypothetical: MediaTek's drawable cache raises out of the icon load on MIUI, which is why
+    // [getBitmap] exists in the shape it does. This notice carries no callback, so there is nobody
+    // to answer and the only correct response is to log and carry on. `requestModuleScope` has the
+    // same guard for the same reason, and additionally answers the module when it fails.
     createChannels()
+    val notif =
+        runCatching {
+              Notification.Builder(context, STATUS_CHANNEL_ID)
+                  .setContentTitle(context.getString(R.string.vector_running_notification_title))
+                  .setContentText(context.getString(R.string.vector_running_notification_content))
+                  .setSmallIcon(getNotificationIcon())
+                  .setContentIntent(pi)
+                  .setVisibility(Notification.VISIBILITY_SECRET)
+                  .setOngoing(true)
+                  .build()
+                  .apply { extras.putString("android.substName", BuildConfig.FRAMEWORK_NAME) }
+            }
+            .onFailure { Log.e(TAG, "Failed to build the status notification", it) }
+            .getOrNull()
+
+    if (notif == null) return
     runCatching {
       nm?.enqueueNotificationWithTag("android", opPkg, null, STATUS_NOTIF_ID, notif, 0)
     }
@@ -615,19 +628,27 @@ object NotificationManager {
         PendingIntent.getBroadcast(
             context, 3, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
 
-    val notif =
-        Notification.Builder(context, UPDATED_CHANNEL_ID)
-            .setContentTitle(title)
-            .setContentText(content)
-            .setSmallIcon(getNotificationIcon())
-            .setContentIntent(pi)
-            .setVisibility(Notification.VISIBILITY_SECRET)
-            .setAutoCancel(true)
-            .setStyle(Notification.BigTextStyle().bigText(content))
-            .build()
-            .apply { extras.putString("android.substName", BuildConfig.FRAMEWORK_NAME) }
-
+    // Same guard as the other two notices: the build is inside the runCatching along with the
+    // enqueue, because rendering the small icon is a resource load that this ROM raises from. No
+    // callback rides on this notice — it is informational — so the only response to a build failure
+    // is to log it.
     createChannels()
+    val notif =
+        runCatching {
+              Notification.Builder(context, UPDATED_CHANNEL_ID)
+                  .setContentTitle(title)
+                  .setContentText(content)
+                  .setSmallIcon(getNotificationIcon())
+                  .setContentIntent(pi)
+                  .setVisibility(Notification.VISIBILITY_SECRET)
+                  .setAutoCancel(true)
+                  .setStyle(Notification.BigTextStyle().bigText(content))
+                  .build()
+                  .apply { extras.putString("android.substName", BuildConfig.FRAMEWORK_NAME) }
+            }
+            .onFailure { Log.e(TAG, "Failed to build the module-updated notification", it) }
+            .getOrNull()
+
     // The two notices this function posts are told apart, because only one of them can be made
     // wrong by something the user does later: "not activated yet" stops being true the moment the
     // module is activated, and [cancelModuleUpdated] takes it down from there; "force stop the apps
@@ -645,6 +666,7 @@ object NotificationManager {
     // what [linkUserId] above is for — the tag stays user-free and the destination stops depending
     // on the order two broadcasts arrived in.
     val tag = if (enabled) modulePackageName else notActivatedTag(modulePackageName)
+    if (notif == null) return
     runCatching {
       nm?.enqueueNotificationWithTag("android", opPkg, tag, tag.hashCode(), notif, 0)
     }

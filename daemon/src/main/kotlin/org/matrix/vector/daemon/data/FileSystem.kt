@@ -179,12 +179,23 @@ object FileSystem {
    * `requestScope` prompts never reaching the notification shade.
    *
    * <p>**Be precise about what is established here.** The NPE above is measured. That supplying
-   * real metrics clears it is *not*: the failing frame is `String.equals` invoked on a null
-   * receiver, and which field of the vendor cache is null was never determined — a missing
-   * `DisplayMetrics` is a plausible cause and is the one thing about this construction that was
-   * plainly wrong, so it is fixed, but it is a hypothesis rather than a proven repair. The
-   * guaranteed fix is [NotificationManager]'s: it no longer lets a resource failure escape. Treat
-   * this change as an attempt to remove the trigger, not as the reason notifications work again.
+   * real metrics clears it is *not* — and has since been **measured not to**: with this
+   * construction in place on the same device, the vendor cache still raises out of the icon load
+   * (`W/VectorNotificationManager: Could not render the icon for drawable 2130771968`, stack
+   * through `putCacheList`, `cacheDrawable`, `Resources.getDrawable`) exactly as before. The
+   * failing frame is `String.equals` invoked on a null receiver, and which field of the vendor
+   * cache is null was never determined. A missing `DisplayMetrics` was the one thing about this
+   * construction that was plainly wrong, so it stays fixed, but it is not the trigger and not the
+   * repair. The guaranteed fix is [NotificationManager]'s: it no longer lets a resource failure
+   * escape, which is why notifications reach the shade again.
+   *
+   * <p>The remaining trigger is deliberately left alone. It was measured for fallout over a full
+   * boot cycle: it fires **once per boot** (the status notice; the drawable is not re-read after
+   * that) and costs a 1x1 placeholder icon on that one notice. Title, text, tap action, action
+   * buttons, visibility and the daemon itself are unaffected, and the fallback keeps the failure
+   * out of the `IWbService` binder transaction, which was the only part that ever broke scope
+   * sync. Chasing the null would mean reverse-engineering a closed vendor class for a cosmetic
+   * win; the trade was declined on purpose. Do not re-open it without a functional reason.
    *
    * <p>`DisplayMetrics()` runs `setToDefaults()` itself, so `density` is already a sane scale
    * factor and needs no override (`DENSITY_DEFAULT` is 160 *dpi*, not a density *ratio* — assigning

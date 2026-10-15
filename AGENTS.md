@@ -1077,6 +1077,42 @@ su -c "/data/adb/lspd/cli scope add <模块包名> <目标包名>"
 且 `NotificationManager.getBitmap()` / `getNotificationIcon()` 对资源加载兜底 ——
 签名失败退回内置占位图,绝不让异常穿到 binder stub 或后台协程。
 
+三条通知路径的构建与入队**必须都包在 `runCatching` 里**(`notifyStatusNotification` /
+`requestModuleScope` / `notifyModuleUpdated`)。只包 `enqueue` 不够:
+渲染 small icon 本身就会读资源,抛点在建 `Notification` 时就到了 ——
+`runCatching` 的边界必须包住 `.build()`。
+
+### 实测验收(同一台 rubens,修复前后对照)
+
+> 这是**实测结论**,不是设计意图。后续改动请以这里为准,别按推理重推一遍。
+
+| 判据 | 修复前 | 修复后 |
+| --- | --- | --- |
+| MTK NPE 是否抛出 | 是 | **仍然抛出**,次数不变(每开机约 1 次) |
+| 是否穿透 `Resources.getDrawable` | 是 | **否**,截断在这里 |
+| `Caught fatal coroutine exception` | 有 | **0 次** |
+| `Caught a RuntimeException from the binder stub` | 有(打断 `requestScope`) | **0 次** |
+| `vector_status` 是否在通知栏 | 否 | **是**(id=2000) |
+
+两条改动的实际作用必须分清:
+
+- **`runCatching` 兜底 = 实测有效**,是通知能恢复的唯一原因。
+- **`DisplayMetrics()`/`Configuration()` = 实测无效**,完全没消除 NPE。它保留了,
+  因为原写法确实错(缺 metrics),语义更正确且无害 —— 但**不要**把它当成修复,
+  更不要据此认为触发点已定位。
+
+### 未闭合项(已知无害残留,故意不修)
+
+**真正的根因仍未定位。** 新线索:异常消息里 `org.matrix.vector.daemon:drawable/ic_statue_monochrome`
+这个**资源名是解析成功的**,所以那个 null 字段**不是资源名**,而是 MTK 缓存里别的字段
+(疑与手搓 `AssetManager` 缺正常 package 关联有关)。
+
+**不继续挖的理由(实测权衡,非偷懒)**:该 NPE 每开机只触发约 1 次(状态通知那一次,
+之后 drawable 被系统缓存不再重读),代价仅为该通知图标退化成 1×1 白色占位块;
+标题、正文、点击跳转、动作按钮、可见性、daemon 稳定性**全部不受影响**。
+唯一的真实故障(scope 同步被打断)已由兜底消除。
+为一个纯视觉问题去逆向闭源厂商类不划算 —— **要重开必须有功能性理由。**
+
 ### 验证日志串
 
 成功(root CLI 通道):
@@ -1100,6 +1136,21 @@ W Binder: Caught a RuntimeException from the binder stub implementation.
 E VectorDaemon: Caught fatal coroutine exception in background task!
   ... at com.mediatek.res.AsyncDrawableCache.putCacheList(...)
 ```
+
+修复后。上面两种形态都不应再出现。**新日志里唯一会看到的是这一行,它是正常的、预期内的:**
+
+```
+W VectorNotificationManager: Could not render the icon for drawable 2130771968
+```
+
+它代表"图标退化成占位图,其余全部正常"。判据很硬:
+
+- 这行是 `W` 且**后面不接** `Caught fatal coroutine exception` / `Caught a RuntimeException`;
+- 堆栈**止于** `Resources.getDrawable`,不再往 `ad.onTransact` / `Binder.execTransact` 跑;
+- 次数上每开机约 1 次(`grep -c` 计数不会随使用时间增长)。
+
+反过来说,若看到这行**同时**又看到上面的形态一/二,说明兜底被绕过了,
+那时才需要重新查 —— 不要因为看到 `putCacheList` 字样就当成回归。
 
 ## wxshadow 启动卡顿:治标 vs 治本
 
