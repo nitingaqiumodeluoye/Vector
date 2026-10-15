@@ -109,10 +109,16 @@ object NotificationManager {
    * `FileSystem.resources` reached MediaTek's `AsyncDrawableCache` and raised
    * `NullPointerException` out of `ResourcesImpl.cacheDrawable` — on rubens (`mt6895`,
    * Android 12) that is what kept `requestScope` prompts off the shade. `FileSystem.resources` now
-   * carries real metrics in an attempt to stop that happening, but that change is a hypothesis (see
-   * its comment) while *this* one is not: whatever the vendor hooks raise, and from wherever, no
-   * resource load here can take a notification down with it. That is the property worth relying on,
-   * because a vendor ROM is not something this code can test against.
+   * carries real metrics in an attempt to stop that happening, but that change is **measured not to
+   * help** (see its comment) while *this* one is not: whatever the vendor hooks raise, and from
+   * wherever, no resource load here can take a notification down with it. That is the property
+   * worth relying on, because a vendor ROM is not something this code can test against.
+   *
+   * The measured fallout is the placeholder: on rubens every notification build fails the icon
+   * load, so every notice carries the 1x1 square. That is the whole cost, and it is the reason
+   * nothing downstream of this needs its own handler for the icon -- but it is *not* a reason to
+   * relax the guard around `Notification.Builder.build()`, which can still raise for reasons that
+   * have nothing to do with the icon.
    *
    * A bitmap is still produced in the common case. The fallback is a small opaque square, which
    * keeps `Notification.Builder.setSmallIcon(Icon)` happy and leaves the rest of the notification
