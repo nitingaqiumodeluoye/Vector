@@ -244,11 +244,22 @@ Vector 的整体运行流程与 hook 实现分别使用两套已验证源码作�
    必须 `.so` 结尾、不得含 `/` 或 `\`，且 soLoader 目前只支持 arm64-v8a。
 9. **模块 APK 必须 release（非 debuggable）+ debug 签名**，且 release 前先 bump
    `versionCode`/`versionName`（见《版本号更新规则》与《模块 APK 必须使用非 debuggable 构建》）。
-10. **改完必须按验收日志串自检**：`Loaded native libraries for ...`、
+10. **改完必须按验收日志串自检**:`Loaded native libraries for ...`、
     `Firing deferred native_init entrypoints for ...`、`FirePendingNativeInits: pending_count=`、
     `registered library-load callback`。缺 `registered library-load callback` 优先查
     `native_init` 是否返回 nullptr 或 `native_init.list` 名称不匹配。禁止用脚本主动启动目标
-    App 采集这些日志（见《安装重启后的启动约束》）。
+    App 采集这些日志(见《安装重启后的启动约束》)。
+11. **manifest 里一律不得声明 `xposedmodule` / `xposedminversion` / `xposeddescription` /
+    `xposedscope` / `xposedsharedprefs`。** 模块身份只由 `META-INF/xposed/` 下的 marker 承载,
+    MODERN 路线(`targetApiVersion >= 101`)不看 manifest。这几个键是零运行时成本的包级
+    泄露面,安全扫描器(如 DuckDetector 的 LSPosed 卡片)只要 `getInstalledApplications(
+    GET_META_DATA)` 扫一遍就会把模块判成 Xposed 残留。详见《模块 manifest 禁止声明
+    `xposed*` meta-data》。
+12. **要用框架服务(scope / RemotePreferences / 远程文件)时,`.WbService` provider 必须
+    在 APK 里真实存在,且其 jar 必须是 `implementation` 而非 `compileOnly`。** daemon 是
+    按 authority "<applicationId>.WbService" 调 `getContentProviderExternal` 找进程投递
+    binder 的;少了 provider 会静默重试 3 次然后节流 60s。详见《模块要用框架服务
+    (scope / RemotePreferences)必须打 `.WbService` provider》。
 
 ## 目标设备：以当前 adb 连接为准
 
@@ -733,10 +744,311 @@ fork 时都要重新加载它一遍。Android 规定 `debuggable=true` 的 APK �
    # 确认 odex 存在（路径从 pm path 的目录拼接 /oat/arm64/base.odex）：
    adb shell su -c 'ls -la "$(pm path <模块包名> | sed s/package://;s/base.apk/base.odex)"'
    ```
-4. 排查"宿主启动慢/注入后变卡"时，先检查所有已启用模块 APK 是否 debuggable
-   （dumpsys 看 run-from-apk），再考虑 Vector 框架侧原因。
+4. 排查"宿主启动慢/注入后变卡"时,先检查所有已启用模块 APK 是否 debuggable
+   (dumpsys 看 run-from-apk),再考虑 Vector 框架侧原因。
 
-## wxshadow 启动卡顿：治标 vs 治本
+---
+
+## 模块 manifest 禁止声明 `xposed*` meta-data(安全扫描器的包级泄露面)
+
+**新建/修改任何模块时,manifest 里一律不得出现 `xposedmodule` / `xposedminversion` /
+`xposeddescription` / `xposedscope` / `xposedsharedprefs`。** 那套 meta-data 是 legacy
+Xposed 时代的模块发现机制,Vector 的 MODERN 路线根本不读它(见下),留着只有害处。
+
+### 为什么:2026-10-15 实测(com.zhenxi.jnitrace 被 DuckDetector 报 LSPosed)
+
+一台设备上装了 FunJni(已改造为 Vector MODERN 模块),DuckDetector 扫描报告出现:
+
+```
+[▲ WARNING] LSPosed — 1 LSPosed residue signal(s)
+  [Package]
+    • FunJni: Module
+        com.zhenxi.jnitrace
+        Meta-data: xposedmodule, xposedminversion, xposeddescription, xposedsharedprefs
+```
+
+根因是当时该模块**新旧两套身份声明同时存在**:
+
+| 位置 | 内容 | 谁读 |
+| --- | --- | --- |
+| `META-INF/xposed/module.prop` | `minApiVersion` / `targetApiVersion` | ✅ daemon(MODERN 策略) |
+| `META-INF/xposed/java_init.list` | 入口类 | ✅ daemon |
+| `META-INF/xposed/native_init.list` | 模块 so 名 | ✅ daemon |
+| manifest `<meta-data android:name="xposed*"/>` | 旧式残留 | ❌ **daemon 不读,只被扫描器看见** |
+
+`daemon/.../FileSystem.kt:loadModule()` 的策略选择证明 manifest 与模块发现无关:
+
+```kotlin
+val strategy = when {
+  targetApi >= 101 -> "MODERN"        // ← 所有现代模块走这条,完全不看 manifest
+  hasLegacyFile    -> "LEGACY"        // assets/xposed_init
+  targetApi == 100 -> "UNSUPPORTED"
+  else             -> "NONE"
+}
+```
+
+而扫描器侧(DuckDetector `LSPosedPackageProbe.kt`)只做一件事 —— 对全部已安装包调
+`getInstalledApplications(GET_META_DATA)`,命中这五个键就报"Xposed 模块":
+
+```kotlin
+private val XPOSED_METADATA_KEYS = listOf(
+    "xposedmodule", "xposedminversion", "xposeddescription",
+    "xposedscope", "xposedsharedprefs",
+)
+```
+
+所以这是一条**零运行时成本的包级信号**:不需要任何 hook 证据、不需要 root、不需要运行时
+痕迹,光是 manifest 里有这个键就被判成 Xposed 模块残留。报告自己把它定性为 softer
+residue("package-only signals are softer residue"),但它是 WARNING 级,会直接毁掉
+「模块对检测器隐身」的目标。
+
+### 怎么改
+
+删掉 manifest 里全部 `xposed*` meta-data,**只保留 `META-INF/xposed/` 下的 marker 文件**。
+模块身份、入口类、native 库、scope 全部由 marker 承载,MODERN 路线一切照常。
+
+参考 `E:/52/XposedJniTrace` 的做法(commit `c403116`):manifest 里那四个 meta-data 删除后
+留一段注释说明为什么不能加回来。
+
+### 删掉之后的行为变化(必须知道的代价)
+
+这两条 meta-data 曾经**被 Vector 的 legacy 兼容层读**,删掉会改变行为:
+
+1. `legacy/.../LegacyDelegateImpl.java:hookNewXSP()` 依赖 `xposedminversion > 92` 或
+   `xposedsharedprefs` 才会给目标进程装 `ContextImpl.getPreferencesDir()` 与
+   `ContextImpl.checkMode()` 重定向钩子;
+2. `legacy/.../XSharedPreferences.java` 据此决定读「共享 prefs 目录」
+   (`<misc_path>/prefs/<模块包名>/`)还是读模块私有 `/data/data/<模块>/shared_prefs/`。
+
+删除后:`XSharedPreferences` 退回读模块私有目录,而**目标进程读不了另一个 uid 的私有目录**
+(MCS 类别不匹配,chmod 777 也无效)。
+
+**处置:靠 root `cp` 兜底,不要为了这条路把 meta-data 加回来。**
+把配置 `cp` 一份到目标 App 私有目录(cp 新建 inode,由 root 生成,标签不带 MCS 类别,
+任何 App 的类别集合都能覆盖),模块在目标进程里从那里读。参考 `E:/52/XposedJniTrace`
+`MainListViewAdapter.initConfig()` + `LHook.onModuleLoaded()` 的二次尝试读取。
+
+若模块确实需要无 root 也能读配置,正确做法是用 Vector 的 **RemotePreferences**
+(`WbService.getRemotePreferences` / `WbInterface.getRemotePreferences`),那走的是框架
+自己的 IPC,不依赖 meta-data —— 见下一节。
+
+### 排查清单
+
+改完模块后自检 APK 里没有漏网的键:
+
+```bash
+# 解出二进制的 AndroidManifest.xml 后按 UTF-16LE 计数(string pool 是 UTF-16)
+python3 - <<'EOF'
+import zipfile
+d = zipfile.ZipFile('app-release.apk').read('AndroidManifest.xml')
+for k in ('xposedmodule','xposedminversion','xposeddescription','xposedscope','xposedsharedprefs'):
+    n = d.count(k.encode('utf-16-le'))
+    print(f'{k:22s} {n}{"  <-- 仍存在!" if n else "  OK"}')
+EOF
+```
+
+CI 里也可以固化这道检查(`.github/workflows/build.yml`),任一个键非 0 就 fail。
+
+---
+
+## 模块要用框架服务(scope / RemotePreferences)必须打 `.WbService` provider
+
+**只在构建脚本里 `compileOnly` 框架类是不够的 —— provider 必须在 APK 里真实存在。**
+
+同一轮实测里发现的另一个坑:FunJni 声明的 native 入口一切正常,但 daemon 日志一直在刷
+
+```
+W/VectorModuleAppService: com.zhenxi.jnitrace/10252 failed to take its binder
+                          3 times in a row; retrying at most once every 60s
+```
+
+原因是 `daemon/.../ModuleAppService.kt:sendBinder()` 的投递方式:
+
+```kotlin
+val authority = name + AUTHORITY_SUFFIX          // "<applicationId>.WbService"
+val provider = activityManager?.getContentProviderExternal(authority, userId, token, "vector")
+provider?.call(..., "SendBinder", ..., Bundle().apply { putBinder("binder", asBinder()) })
+```
+
+daemon 是**按 authority 直接找进程**并把框架的 `IWbService` binder 投过去的。没有这个
+provider,`getContentProviderExternal` 返回 null,投递必然失败,于是模块 App 拿不到
+`WbService` —— `requestScope`、`getRemotePreferences`、`listRemoteFiles` 全部不可用,
+而且失败会静默重试 + 节流。
+
+### 规则
+
+1. 需要框架服务的模块,manifest 里必须有:
+   ```xml
+   <provider
+       android:name="de.wwb.android.wbosed.service.WbProvider"
+       android:authorities="${applicationId}.WbService"
+       android:exported="true"
+       tools:ignore="ExportedContentProvider" />
+   ```
+   推荐直接依赖 `:services:libxposed-service`(它自带这份 manifest 片段,合并即生效),
+   如 `examples/duckusb`;不引模块时则手写上面这段 + 导入 service jar。
+2. **`WbProvider` 所在的 jar 必须是 `implementation`,不能是 `compileOnly`。** `compileOnly`
+   能编过但类不在 dex 里,运行期 `ClassNotFoundException`,现象与「没写 provider」一模一样。
+3. `exported="true"` 是必需的:daemon 以 uid 1000、包名 `"android"` 的身份调用它。
+4. 只有 scope 被批准后才谈得上注入;`requestScope` 是**需要用户知情同意**的操作
+   (`ModuleAppService.requestScope` → `NotificationManager.requestModuleScope` 弹高优先级
+   通知),所以第一次必然要用户点一次「允许」,这是设计而非缺陷。
+5. ci 里建议加两道校验,防 `compileOnly` 回归:
+   ```bash
+   # provider authority 在 manifest 里
+   aapt2 dump xmltree --file AndroidManifest.xml "$APK" \
+     | grep -q 'authorities.*<applicationId>.WbService'
+   # provider 类真的在 classes.dex 里
+   dexdump classes.dex | grep -q 'Class descriptor.*WbProvider'
+   dexdump classes.dex | grep -q 'Class descriptor.*WbServiceHelper'
+   ```
+
+### 验收日志串
+
+provider 生效后,daemon 投递成功,**只应有这些正向日志、不应有节流警告**:
+
+```
+D/WbProvider: binder received: android.os.BinderProxy@...
+I/...ScopeSync: Vector service bound: Vector <ver> (api 102)
+I/...ScopeSync: Vector service listener registered
+```
+
+反向判据:`failed to take its binder 3 times in a row` 出现即说明 provider 缺失或类没打进 dex。
+
+> 注意 `WbServiceHelper.registerListener()` 必须早于任何 `requestScope` 调用。它在注册前
+> 收到的 binder 只会被缓存、不回调,注册后会把缓存里的一并交回,所以放在
+> `Application.onCreate()` 里是最稳的。
+
+---
+
+## daemon 通知图标在 MIUI/MTK 上会崩,`requestScope` 通知通道整条不可用
+
+**结论:模块要把自己加进 scope,优先走 root CLI,不要只依赖 `requestScope` 通知。**
+
+### 现象
+
+模块调 `IWbService.requestScope` 后,用户根本看不到那条「作用域请求」通知,
+模块侧只能等到自己设的超时:
+
+```
+I/...ScopeSync: ScopeSync sync result: success=false msg=等待 Vector 授权超时,请在通知栏点"允许"后重试
+```
+
+### 根因:daemon 构建通知图标时被联发科私有类打崩
+
+2026-10-15 实测(rubens / `ro.hardware=mt6895`,MT6895Z/TCZA,Android 12)。
+客户端发出 `requestScope` 后 **11 毫秒**,daemon 的 binder 线程抛异常:
+
+```
+13:40:19.571  FunJni 保存配置 + requestScope(com.zhenxi.hunter)
+13:40:19.582  W Binder: Caught a RuntimeException from the binder stub implementation.
+                android.content.res.Resources$NotFoundException:
+                  Drawable org.matrix.vector.daemon:drawable/ic_statue_monochrome
+                  with resource ID #0x7f010000
+                Caused by: java.lang.NullPointerException:
+                  Attempt to invoke virtual method 'boolean java.lang.String.equals(...)'
+                  on a null object reference
+                    at com.mediatek.res.AsyncDrawableCache.putCacheList(AsyncDrawableCache.java:165)
+                    at com.mediatek.res.ResOptExtImpl.putCacheList(ResOptExtImpl.java:69)
+                    at android.content.res.ResourcesImpl.cacheDrawable(ResourcesImpl.java:800)
+                    at android.content.res.MiuiResourcesImpl.loadDrawable(MiuiResourcesImpl.java:307)
+                    at android.content.res.Resources.loadDrawable(Resources.java:1017)
+                    at ad.onTransact(...)      <-- daemon 的 IWbService binder stub
+13:41:19.578  FunJni: ScopeSync sync result: success=false(60s 超时)
+```
+
+事故点在 `NotificationManager.getBitmap()`:
+
+```kotlin
+// daemon/src/main/kotlin/org/matrix/vector/daemon/system/NotificationManager.kt
+private fun getBitmap(id: Int): Bitmap {
+    val r = FileSystem.resources                  // <-- 问题在这里
+    var res = r.getDrawable(id, r.newTheme())     // <-- MTK 缓存在这里抛 NPE
+    ...
+}
+```
+
+而 [`FileSystem.resources`](./daemon/src/main/kotlin/org/matrix/vector/daemon/data/FileSystem.kt)
+是**反射手工构造**的,且两个参数都给 null:
+
+```kotlin
+val resources: Resources by lazy {
+    val am = AssetManager::class.java.getDeclaredConstructor().newInstance()
+    addAssetPath.invoke(am, daemonApkPath.toString())
+    @Suppress("DEPRECATION") Resources(am, null, null)   // <-- 无 DisplayMetrics / Configuration
+}
+```
+
+`Resources(assets, null, null)` 走的是无 `DisplayMetrics`/`Configuration` 的构造路径。
+在 MIUI 上这会被挂上 `MiuiResourcesImpl`,而 MTK 在里面插的 `AsyncDrawableCache`
+会因某个字段为 null 在 `cacheDrawable` 里 NPE。
+
+**关键点:异常从 `getBitmap()` 一路穿到 binder stub,把整个 binder 事务打断。**
+因为 `requestScope` 的全部工作(登记待答请求 + 构建 + 入队通知)都在这个事务里,
+所以通知根本没进过通知栏,用户无从点击。
+
+同一个堆栈在后台 coroutine 路径也出现过(同一设备 13:31:41,
+`E VectorDaemon: Caught fatal coroutine exception in background task!`),说明这是
+**图标签名路径整体不可用**,不是 `requestScope` 独有。
+
+### 为什么容易误判
+
+- `AsyncDrawableCache: can not found res: NNNN, maybe dynamic res id` 是**无关的普通 warning**,
+  任何进程(包括普通 App)都会打。它在 `W` 级别且含 `AsyncDrawableCache` 字样,
+  容易在 grep 时被当成崩溃堆栈计数。真正的判据是带 `putCacheList`
+  堆栈帧的 `NullPointerException` / `Resources$NotFoundException`。
+- 通知构建失败后 daemon 侧**不会留下显眼的错误日志**(异常被 `Binder.execTransact` 袢住只打
+  `W Binder`),所以只看 daemon 日志很容易误以为"请求发出去了"。
+
+### 处置
+
+**模块侧(不改 Vector,立即可用):优先 root CLI。**
+
+```bash
+su -c "/data/adb/lspd/cli scope add <模块包名> <目标包名>"
+# Successfully appended 1 apps to <模块包名> scope.   退出码 0
+```
+
+走的是 daemon 的 LocalSocket(`/data/adb/lspd/.cli_sock`)→ `CliHandler.handleScope`,
+完全不碰通知与资源,所以不受此 bug 影响;零交互、加完立即生效。
+参考 `E:/52/XposedJniTrace` 的 `ScopeSyncUtils.syncScope()`:先试 CLI,
+不可用(无 root / cli 缺失 / socket 不通)才回退到 `requestScope` 通知。
+
+实现上两个坑:
+
+1. **必须读退出码**,不能用 `RootUtils.execShell`(它不等 `waitFor`、不返回退出码,
+   会把"su 被拒"当成成功)。CLI 的 `OutputFormatter.print()` 成功返 0、失败返 1。
+2. **必须 `redirectErrorStream(true)` 或另起线程读 stderr**。CLI 的错误走
+   `System.err.println("Error: ...")`,只读 stdout 的话 stderr 缓冲区写满会把
+   子进程和 stdout 一起堵死(经典管道死锁)。
+
+**框架侧(治本,需重建 Vector + 重启手机):**
+
+- `FileSystem.resources` 换成带真实 `DisplayMetrics`/`Configuration` 的构造,
+  避开 MTK 的缓存分支;
+- 且 `getBitmap()` 应对 `getDrawable` 做兜底 —— 图标签名失败不该让整条通知事务爆掉,
+  退回内置占位图/`Icon.createWithResource` 即可。
+
+### 验证日志串
+
+成功(root CLI 通道):
+
+```
+E Zhenxi: checkGetRootAuth  ture
+I Zhenxi: [Zhenxi] ScopeSync vector-cli exit=0 out=Successfully appended 1 apps to ... scope.
+I Zhenxi: [Zhenxi] ScopeSync sync result: success=true msg=已同步进 Vector scope(root CLI): [...]
+```
+
+失败(通知通道被打断):
+
+```
+W Binder: Caught a RuntimeException from the binder stub implementation.
+  ... Resources$NotFoundException: Drawable ...:drawable/ic_statue_monochrome
+  ... at com.mediatek.res.AsyncDrawableCache.putCacheList(...)
+  ... at ad.onTransact(...)
+```
+
+## wxshadow 启动卡顿:治标 vs 治本
 
 > 背景见「xff/com.demo.addapp 启动卡顿根因」一章。这里是修复路径的决策说明，
 > 任何改动前必须先明确是走治标还是治本，两者目标、范围、风险完全不同。
