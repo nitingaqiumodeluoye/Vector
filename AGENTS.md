@@ -921,23 +921,45 @@ I/...ScopeSync: Vector service listener registered
 
 ---
 
-## daemon 通知图标在 MIUI/MTK 上会崩,`requestScope` 通知通道整条不可用
+## daemon 通知图标在 MIUI/MTK 上会抛 NPE,三条通知路径都可能整条失败
 
 **结论:模块要把自己加进 scope,优先走 root CLI,不要只依赖 `requestScope` 通知。**
 
-### 现象
+`getNotificationIcon()` → `getBitmap()` 在这个平台上**会抛异常**,而异常会穿透到调用者,
+把整条通知事务/协程任务弄挂。它**不是确定性故障**——同一个函数有时成功有时失败,
+取决于 MTK 那个缓存当下的状态。
 
-模块调 `IWbService.requestScope` 后,用户根本看不到那条「作用域请求」通知,
-模块侧只能等到自己设的超时:
+### 受影响的三条路径
+
+`getBitmap()` 只有一个调用者 `getNotificationIcon()`,而后者被三个发通知的函数调用:
+
+| 调用点 | 函数 | 用途 |
+| --- | --- | --- |
+| `NotificationManager.kt:130` | `notifyStatusNotification` | 状态栏常驻的「Vector 运行中」 |
+| `NotificationManager.kt:444` | `requestModuleScope` | **scope 授权请求** |
+| `NotificationManager.kt:575` | `notifyModuleUpdated` | 「模块已启用 / 未激活」提示 |
+
+失败后的表现按调用路径不同:
+
+- 走 **binder** 的 `requestModuleScope`:异常从 `IWbService` stub 穿出来,
+  `Binder.execTransact` 把整个事务撂倒 —— 通知从未构建,用户无从点击,
+  模块只能等到自己设的超时。
+- 走 **后台协程**的 `notifyStatusNotification` / `notifyModuleUpdated`:
+  `E VectorDaemon: Caught fatal coroutine exception in background task!`,该次通知不发,
+  但 daemon 本身不死(下一个协程任务照常跑)。
+
+### 实测证据(rubens / `ro.hardware=mt6895`,MT6895Z/TCZA,Android 12,2026-10-15)
+
+daemon 从 00:50 启动到 14:00 的日志里共 **4 次**该堆栈,时间点:
 
 ```
-I/...ScopeSync: ScopeSync sync result: success=false msg=等待 Vector 授权超时,请在通知栏点"允许"后重试
+00:50:27.625  后台协程
+11:57:30.085  后台协程
+13:31:41.317  后台协程
+13:40:19.582  binder stub   <-- 这一次打断了 requestScope
 ```
 
-### 根因:daemon 构建通知图标时被联发科私有类打崩
-
-2026-10-15 实测(rubens / `ro.hardware=mt6895`,MT6895Z/TCZA,Android 12)。
-客户端发出 `requestScope` 后 **11 毫秒**,daemon 的 binder 线程抛异常:
+13:40 那次的完整链(客户端发请求到 daemon 抛异常只隔 11ms):
 
 ```
 13:40:19.571  FunJni 保存配置 + requestScope(com.zhenxi.hunter)
@@ -957,39 +979,68 @@ I/...ScopeSync: ScopeSync sync result: success=false msg=等待 Vector 授权超
 13:41:19.578  FunJni: ScopeSync sync result: success=false(60s 超时)
 ```
 
+**这四个时间点只说明它反复发生,不说明它必定发生。** 同一时段内
+`vector_status` 通知确实成功挂在了通知栏上(说明 `notifyStatusNotification`
+至少成功过),所以这是颤振式失败,不是永久失效。判断某台设备是否受影响,要看
+日志里有没有这个堆栈,不能靠推测。
+
+### 现场:抛异常的位置,以及它不是稳定的
+
 事故点在 `NotificationManager.getBitmap()`:
 
 ```kotlin
 // daemon/src/main/kotlin/org/matrix/vector/daemon/system/NotificationManager.kt
 private fun getBitmap(id: Int): Bitmap {
-    val r = FileSystem.resources                  // <-- 问题在这里
+    val r = FileSystem.resources                  // <-- 手搓的 Resources
     var res = r.getDrawable(id, r.newTheme())     // <-- MTK 缓存在这里抛 NPE
     ...
 }
 ```
 
 而 [`FileSystem.resources`](./daemon/src/main/kotlin/org/matrix/vector/daemon/data/FileSystem.kt)
-是**反射手工构造**的,且两个参数都给 null:
+是**反射手工构造**的 —— `vectord` 是 `service.sh` 直接 exec 出来的独立 `app_process`
+(uid 1000,PPID 1,无 `ActivityThread`),拿不到框架给的 `Resources`,只能自己拼:
 
 ```kotlin
-val resources: Resources by lazy {
-    val am = AssetManager::class.java.getDeclaredConstructor().newInstance()
-    addAssetPath.invoke(am, daemonApkPath.toString())
-    @Suppress("DEPRECATION") Resources(am, null, null)   // <-- 无 DisplayMetrics / Configuration
-}
+val am = AssetManager::class.java.getDeclaredConstructor().newInstance()
+addAssetPath.invoke(am, daemonApkPath.toString())
+@Suppress("DEPRECATION") Resources(am, null, null)   // <-- 两个参数都是 null
 ```
 
-`Resources(assets, null, null)` 走的是无 `DisplayMetrics`/`Configuration` 的构造路径。
-在 MIUI 上这会被挂上 `MiuiResourcesImpl`,而 MTK 在里面插的 `AsyncDrawableCache`
-会因某个字段为 null 在 `cacheDrawable` 里 NPE。
+### 已知 / 未知,要分清楚
 
-**关键点:异常从 `getBitmap()` 一路穿到 binder stub,把整个 binder 事务打断。**
-因为 `requestScope` 的全部工作(登记待答请求 + 构建 + 入队通知)都在这个事务里,
-所以通知根本没进过通知栏,用户无从点击。
+**已证实(有堆栈、有时间对齐):**
 
-同一个堆栈在后台 coroutine 路径也出现过(同一设备 13:31:41,
-`E VectorDaemon: Caught fatal coroutine exception in background task!`),说明这是
-**图标签名路径整体不可用**,不是 `requestScope` 独有。
+1. 抛出点在 `com.mediatek.res.AsyncDrawableCache.putCacheList`,异常形态是
+   **某个 null 引用上调用 `String.equals`**,由 `ResourcesImpl.cacheDrawable` 调到;
+2. 它出现在四条通知路径中至少一条上(见上表),其中 `requestScope` 那条会直接打断
+   binder 事务;
+3. 它是**颤振式**的 —— 同一台设备上同一份代码有时成功有时失败。
+
+**未证实(不要把猜测写成结论):**
+
+- **`Resources(am, null, null)` 是不是触发器,并没有被证实。** 传 null 看着可疑,
+  但 AOSP 的 `ResourcesImpl` 构造里对 `metrics`/`config` 各自做 `setToDefaults()`,
+  所以「传 null」与「传新建的空 `DisplayMetrics()`/`Configuration()`」在语义上几乎等价 ——
+  只改这里很可能完全不改变行为。现在改成传真实对象,是**消除一个明显的异常之处**,
+  不是已验证的修复。
+- 到底是 MTK 缓存里哪个字段为 null、为什么为 null,尚未定位。可能是资源名/包名关联
+  (手搓的 `AssetManager` 没有正常的 package 关联),也可能是别的。
+
+### 真正可靠的那层修复
+
+`getBitmap()` 只做图标签名这一件小事,却能把 binder 事务/协程任务整条拖死。
+所以**不依赖任何资源加载成功**才是可依赖的性质:
+
+- `getBitmap()` 改为返回 `Bitmap?`,内部 `runCatching` + `onFailure` 记日志;
+- 调用处 `?: getPlaceholderBitmap()` 退回 1x1 占位图;
+- **`Notification.Builder.build()` 也一并移进 `runCatching`** —— 原代码只包了
+  `enqueue`,所以构建期抛异常仍会穿出去。两者都失败时走已有的
+  `OutstandingScopeRequests.claim(tag)?.onScopeRequestFailed(...)`,把占用的名额
+  还给模块并回答它,而不是让它等超时。
+
+这样无论资源层出什么幺蛾子,通知本身照常发出(只是图标变占位图),
+用户仍能看到「允许/拒绝」。
 
 ### 为什么容易误判
 
@@ -997,8 +1048,8 @@ val resources: Resources by lazy {
   任何进程(包括普通 App)都会打。它在 `W` 级别且含 `AsyncDrawableCache` 字样,
   容易在 grep 时被当成崩溃堆栈计数。真正的判据是带 `putCacheList`
   堆栈帧的 `NullPointerException` / `Resources$NotFoundException`。
-- 通知构建失败后 daemon 侧**不会留下显眼的错误日志**(异常被 `Binder.execTransact` 袢住只打
-  `W Binder`),所以只看 daemon 日志很容易误以为"请求发出去了"。
+- 走 binder 的那次失败在 daemon 侧**没有显眼的错误日志**(异常被 `Binder.execTransact`
+  拦住只打 `W Binder`),所以只看 daemon 日志很容易误以为"请求发出去了"。
 
 ### 处置
 
@@ -1022,12 +1073,9 @@ su -c "/data/adb/lspd/cli scope add <模块包名> <目标包名>"
    `System.err.println("Error: ...")`,只读 stdout 的话 stderr 缓冲区写满会把
    子进程和 stdout 一起堵死(经典管道死锁)。
 
-**框架侧(治本,需重建 Vector + 重启手机):**
-
-- `FileSystem.resources` 换成带真实 `DisplayMetrics`/`Configuration` 的构造,
-  避开 MTK 的缓存分支;
-- 且 `getBitmap()` 应对 `getDrawable` 做兜底 —— 图标签名失败不该让整条通知事务爆掉,
-  退回内置占位图/`Icon.createWithResource` 即可。
+**框架侧(治本):** `FileSystem.resources` 带真实 `DisplayMetrics`/`Configuration`,
+且 `NotificationManager.getBitmap()` / `getNotificationIcon()` 对资源加载兜底 ——
+签名失败退回内置占位图,绝不让异常穿到 binder stub 或后台协程。
 
 ### 验证日志串
 
@@ -1039,13 +1087,18 @@ I Zhenxi: [Zhenxi] ScopeSync vector-cli exit=0 out=Successfully appended 1 apps 
 I Zhenxi: [Zhenxi] ScopeSync sync result: success=true msg=已同步进 Vector scope(root CLI): [...]
 ```
 
-失败(通知通道被打断):
+受此 bug 影响(两种形态):
 
 ```
+# 形态一:binder 路径,整个 requestScope 事务被打断
 W Binder: Caught a RuntimeException from the binder stub implementation.
   ... Resources$NotFoundException: Drawable ...:drawable/ic_statue_monochrome
   ... at com.mediatek.res.AsyncDrawableCache.putCacheList(...)
   ... at ad.onTransact(...)
+
+# 形态二:后台协程路径,该次通知不发
+E VectorDaemon: Caught fatal coroutine exception in background task!
+  ... at com.mediatek.res.AsyncDrawableCache.putCacheList(...)
 ```
 
 ## wxshadow 启动卡顿:治标 vs 治本

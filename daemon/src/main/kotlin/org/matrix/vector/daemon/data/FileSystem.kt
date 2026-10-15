@@ -1,6 +1,7 @@
 package org.matrix.vector.daemon.data
 
 import android.content.res.AssetManager
+import android.content.res.Configuration
 import android.content.res.Resources
 import android.os.Binder
 import android.os.Build
@@ -12,6 +13,7 @@ import android.os.SharedMemory
 import android.system.ErrnoException
 import android.system.Os
 import android.system.OsConstants
+import android.util.DisplayMetrics
 import android.util.Log
 import hidden.HiddenApiBridge
 import java.io.File
@@ -159,6 +161,36 @@ object FileSystem {
   /**
    * Lazily loads resources from the daemon's APK path via reflection. This allows FakeContext to
    * access strings/drawables without a real application context.
+   *
+   * <p>**Why the metrics and configuration are passed.** `vectord` is an independent `app_process`
+   * started by `service.sh` (uid 1000, PPID 1), not a process with an `ActivityThread`, so there is
+   * no framework-supplied `Resources` to borrow and the instance has to be built by hand. This used
+   * to pass `null` for both arguments. Passing real ones is not merely tidier: with nulls,
+   * `ResourcesImpl` is built without either, and on MIUI that lands in `MiuiResourcesImpl`, where
+   * the MediaTek `AsyncDrawableCache` raises out of `cacheDrawable`:
+   *
+   * ```
+   * java.lang.NullPointerException
+   *   at com.mediatek.res.AsyncDrawableCache.putCacheList(AsyncDrawableCache.java:165)
+   *   at android.content.res.ResourcesImpl.cacheDrawable(ResourcesImpl.java:800)
+   * ```
+   *
+   * Observed on rubens (`ro.hardware=mt6895`, MT6895Z/TCZA, Android 12) as the failure behind
+   * `requestScope` prompts never reaching the notification shade.
+   *
+   * <p>**Be precise about what is established here.** The NPE above is measured. That supplying
+   * real metrics clears it is *not*: the failing frame is `String.equals` invoked on a null
+   * receiver, and which field of the vendor cache is null was never determined — a missing
+   * `DisplayMetrics` is a plausible cause and is the one thing about this construction that was
+   * plainly wrong, so it is fixed, but it is a hypothesis rather than a proven repair. The
+   * guaranteed fix is [NotificationManager]'s: it no longer lets a resource failure escape. Treat
+   * this change as an attempt to remove the trigger, not as the reason notifications work again.
+   *
+   * <p>`DisplayMetrics()` runs `setToDefaults()` itself, so `density` is already a sane scale
+   * factor and needs no override (`DENSITY_DEFAULT` is 160 *dpi*, not a density *ratio* — assigning
+   * it to `density` would be a unit error). Neither object is shared with anything else. The
+   * drawables read through this instance are notification icons, which the platform scales
+   * afterwards, so exact fidelity here is not load-bearing.
    */
   val resources: Resources by lazy {
     val am = AssetManager::class.java.getDeclaredConstructor().newInstance()
@@ -167,7 +199,7 @@ object FileSystem {
           isAccessible = true
         }
     addAssetPath.invoke(am, daemonApkPath.toString())
-    @Suppress("DEPRECATION") Resources(am, null, null)
+    @Suppress("DEPRECATION") Resources(am, DisplayMetrics(), Configuration())
   }
 
   /** Loads a single DEX file into SharedMemory, optionally applying obfuscation. */

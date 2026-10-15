@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.drawable.AdaptiveIconDrawable
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Icon
@@ -94,26 +95,59 @@ object NotificationManager {
         .onFailure { Log.e(TAG, "Failed to create notification channels", it) }
   }
 
-  private fun getBitmap(id: Int): Bitmap {
-    val r = FileSystem.resources
-    var res = r.getDrawable(id, r.newTheme())
-    if (res is BitmapDrawable) {
-      return res.bitmap
-    } else {
-      if (res is AdaptiveIconDrawable) {
-        res = LayerDrawable(arrayOf(res.background, res.foreground))
-      }
-      val bitmap =
-          Bitmap.createBitmap(res.intrinsicWidth, res.intrinsicHeight, Bitmap.Config.ARGB_8888)
-      val canvas = Canvas(bitmap)
-      res.setBounds(0, 0, canvas.width, canvas.height)
-      res.draw(canvas)
-      return bitmap
-    }
+  /**
+   * The bitmap for a notification small icon, or null when it cannot be produced.
+   *
+   * **This must never throw.** Every caller builds a `Notification` around the result, and the
+   * callers sit on two paths that a throw takes down whole: the `IWbService` binder stub (where an
+   * exception stops the entire `requestScope` transaction, so the prompt is never enqueued and the
+   * module waits out its own timeout) and the background coroutine (where it is logged as a fatal
+   * coroutine exception and that notice is simply lost). A missing icon is a cosmetic problem; a
+   * lost notification is not.
+   *
+   * The throw this guards against is real and was observed: on MIUI the hand-built
+   * `FileSystem.resources` reached MediaTek's `AsyncDrawableCache` and raised
+   * `NullPointerException` out of `ResourcesImpl.cacheDrawable` — on rubens (`mt6895`,
+   * Android 12) that is what kept `requestScope` prompts off the shade. `FileSystem.resources` now
+   * carries real metrics in an attempt to stop that happening, but that change is a hypothesis (see
+   * its comment) while *this* one is not: whatever the vendor hooks raise, and from wherever, no
+   * resource load here can take a notification down with it. That is the property worth relying on,
+   * because a vendor ROM is not something this code can test against.
+   *
+   * A bitmap is still produced in the common case. The fallback is a small opaque square, which
+   * keeps `Notification.Builder.setSmallIcon(Icon)` happy and leaves the rest of the notification
+   * (title, text, actions, and therefore the Approve/Deny buttons) intact.
+   */
+  private fun getBitmap(id: Int): Bitmap? {
+    return runCatching {
+          val r = FileSystem.resources
+          var res = r.getDrawable(id, r.newTheme())
+          if (res is BitmapDrawable) {
+            return@runCatching res.bitmap
+          }
+          if (res is AdaptiveIconDrawable) {
+            res = LayerDrawable(arrayOf(res.background, res.foreground))
+          }
+          // A malformed or zero-sized drawable would make createBitmap throw.
+          val width = res.intrinsicWidth
+          val height = res.intrinsicHeight
+          require(width > 0 && height > 0) { "drawable $id has no intrinsic size ($width x $height)" }
+          val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+          val canvas = Canvas(bitmap)
+          res.setBounds(0, 0, canvas.width, canvas.height)
+          res.draw(canvas)
+          bitmap
+        }
+        .onFailure { Log.w(TAG, "Could not render the icon for drawable $id", it) }
+        .getOrNull()
   }
 
+  /** A 1x1 opaque square, so a notification whose icon failed still has a valid small icon. */
+  private fun getPlaceholderBitmap(): Bitmap =
+      Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.WHITE) }
+
   private fun getNotificationIcon(): Icon {
-    return Icon.createWithBitmap(getBitmap(R.drawable.ic_statue_monochrome))
+    return Icon.createWithBitmap(getBitmap(R.drawable.ic_statue_monochrome) ?: getPlaceholderBitmap())
   }
 
   fun notifyStatusNotification() {
@@ -432,64 +466,77 @@ object NotificationManager {
           PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
     }
 
-    val notif =
-        Notification.Builder(context, SCOPE_CHANNEL_ID)
-            .setContentTitle(context.getString(R.string.xposed_module_request_scope_title))
-            .setContentText(
-                context.getString(
-                    R.string.xposed_module_request_scope_content,
-                    modulePkg,
-                    userName,
-                    scopePkgs.joinToString()))
-            .setSmallIcon(getNotificationIcon())
-            .addAction(
-                Notification.Action.Builder(
-                        null,
-                        context.getString(R.string.scope_approve),
-                        createActionIntent("approve", 4))
-                    .build())
-            .addAction(
-                Notification.Action.Builder(
-                        null, context.getString(R.string.scope_deny), createActionIntent("deny", 5))
-                    .build())
-            .addAction(
-                Notification.Action.Builder(
-                        null,
-                        context.getString(R.string.never_ask_again),
-                        createActionIntent("block", 6))
-                    .build())
-            // Swiping the prompt away, or leaving it alone until it expires, has to answer the
-            // module too. Without a delete intent the "delete" branch of dispatchModuleScope was
-            // unreachable and a dismissed prompt left the module's IWbScopeCallback waiting
-            // for an answer that could no longer arrive from anywhere. It takes a request code of
-            // its own because that is half of what identifies a PendingIntent: 4, 5 and 6 are the
-            // buttons above, and 1 and 3 the status and module-updated notifications.
-            .setDeleteIntent(createActionIntent("delete", 7))
-            .setTimeoutAfter(SCOPE_REQUEST_TIMEOUT_MS)
-            .setAutoCancel(true)
-            .setStyle(
-                Notification.BigTextStyle()
-                    .bigText(
-                        context.getString(
-                            R.string.xposed_module_request_scope_content,
-                            modulePkg,
-                            userName,
-                            // The whole list, wrapped over as many lines as it takes. Approve
-                            // answers for all of it at once, so all of it is what the user is
-                            // agreeing to; the collapsed line above is one line whatever we put in
-                            // it, and this is where a request naming more packages than fit there
-                            // becomes readable. Comma-separated rather than one per line because
-                            // the string this fills is a sentence and the list sits mid-way
-                            // through it.
-                            scopePkgs.joinToString())))
-            .build()
-            .apply { extras.putString("android.substName", BuildConfig.FRAMEWORK_NAME) }
-
     createChannels()
+    // Everything from building the notification to posting it is one guarded step. Building
+    // touches the platform just as much as posting does — it renders the small icon through
+    // `FileSystem.resources` and resolves every string — so a throw from either half has to
+    // leave the same state behind. Leaving the build outside meant a failure there reached the
+    // `IWbService` binder stub and stopped the whole `requestScope` transaction: the prompt was
+    // never enqueued *and* the module's callback never fired, the worst of the two, because the
+    // request had already been registered as outstanding just above.
     val enqueued =
         runCatching {
+              val built =
+                  Notification.Builder(context, SCOPE_CHANNEL_ID)
+                      .setContentTitle(
+                          context.getString(R.string.xposed_module_request_scope_title))
+                      .setContentText(
+                          context.getString(
+                              R.string.xposed_module_request_scope_content,
+                              modulePkg,
+                              userName,
+                              scopePkgs.joinToString()))
+                      .setSmallIcon(getNotificationIcon())
+                      .addAction(
+                          Notification.Action.Builder(
+                                  null,
+                                  context.getString(R.string.scope_approve),
+                                  createActionIntent("approve", 4))
+                              .build())
+                      .addAction(
+                          Notification.Action.Builder(
+                                  null,
+                                  context.getString(R.string.scope_deny),
+                                  createActionIntent("deny", 5))
+                              .build())
+                      .addAction(
+                          Notification.Action.Builder(
+                                  null,
+                                  context.getString(R.string.never_ask_again),
+                                  createActionIntent("block", 6))
+                              .build())
+                      // Swiping the prompt away, or leaving it alone until it expires, has to
+                      // answer the module too. Without a delete intent the "delete" branch of
+                      // dispatchModuleScope was unreachable and a dismissed prompt left the
+                      // module's IWbScopeCallback waiting for an answer that could no longer
+                      // arrive from anywhere. It takes a request code of its own because that is
+                      // half of what identifies a PendingIntent: 4, 5 and 6 are the buttons
+                      // above, and 1 and 3 the status and module-updated notifications.
+                      .setDeleteIntent(createActionIntent("delete", 7))
+                      .setTimeoutAfter(SCOPE_REQUEST_TIMEOUT_MS)
+                      .setAutoCancel(true)
+                      .setStyle(
+                          Notification.BigTextStyle()
+                              .bigText(
+                                  context.getString(
+                                      R.string.xposed_module_request_scope_content,
+                                      modulePkg,
+                                      userName,
+                                      // The whole list, wrapped over as many lines as it takes.
+                                      // Approve answers for all of it at once, so all of it is
+                                      // what the user is agreeing to; the collapsed line above is
+                                      // one line whatever we put in it, and this is where a request
+                                      // naming more packages than fit there becomes readable.
+                                      // Comma-separated rather than one per line because the string
+                                      // this fills is a sentence and the list sits mid-way through
+                                      // it.
+                                      scopePkgs.joinToString())))
+                      .build()
+                      .apply {
+                        extras.putString("android.substName", BuildConfig.FRAMEWORK_NAME)
+                      }
               val service = checkNotNull(nm) { "the notification manager is not available" }
-              service.enqueueNotificationWithTag("android", opPkg, tag, tag.hashCode(), notif, 0)
+              service.enqueueNotificationWithTag("android", opPkg, tag, tag.hashCode(), built, 0)
             }
             .onFailure { Log.e(TAG, "Failed to post the scope prompt $tag", it) }
             .isSuccess
