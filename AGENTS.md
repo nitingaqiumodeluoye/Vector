@@ -1088,7 +1088,7 @@ su -c "/data/adb/lspd/cli scope add <模块包名> <目标包名>"
 
 | 判据 | 修复前 | 修复后 |
 | --- | --- | --- |
-| MTK NPE 是否抛出 | 是 | **仍然抛出**,次数不变(每开机约 1 次) |
+| MTK NPE 是否抛出 | 是 | **仍然抛出**,次数不变(**每条通知各一次**) |
 | 是否穿透 `Resources.getDrawable` | 是 | **否**,截断在这里 |
 | `Caught fatal coroutine exception` | 有 | **0 次** |
 | `Caught a RuntimeException from the binder stub` | 有(打断 `requestScope`) | **0 次** |
@@ -1101,14 +1101,21 @@ su -c "/data/adb/lspd/cli scope add <模块包名> <目标包名>"
   因为原写法确实错(缺 metrics),语义更正确且无害 —— 但**不要**把它当成修复,
   更不要据此认为触发点已定位。
 
+**观测覆盖面(别把推断当观测):** 上表对**状态通知**与**模块更新通知**两条路径是直接实测的
+(后者用 `pm install -r` 重装一个测试模块触发 `PACKAGE_CHANGED`,通知确实挂出,
+`tag=...:not-activated`)。**scope 授权路径(`requestModuleScope`)本轮未能在真机触发**:
+daemon 没在 servicemanager 注册可 `service call` 的名字,`WbProvider.call()` 只是接收端,
+而 `requestScope` 只能由模块主动发起 —— 所以它靠“同一段 `runCatching` 模式 + 之前已验证
+CLI 通道可用”推断,不是本轮观测。要直接验它,需要写一个最小的 Wb 模块去发起请求。
+
 ### 未闭合项(已知无害残留,故意不修)
 
 **真正的根因仍未定位。** 新线索:异常消息里 `org.matrix.vector.daemon:drawable/ic_statue_monochrome`
 这个**资源名是解析成功的**,所以那个 null 字段**不是资源名**,而是 MTK 缓存里别的字段
 (疑与手搓 `AssetManager` 缺正常 package 关联有关)。
 
-**不继续挖的理由(实测权衡,非偷懒)**:该 NPE 每开机只触发约 1 次(状态通知那一次,
-之后 drawable 被系统缓存不再重读),代价仅为该通知图标退化成 1×1 白色占位块;
+**不继续挖的理由(实测权衡,非偷懒)**:该 NPE **每构建一条通知就触发一次**(实测比例
+严格 1:1),代价仅为该次通知的图标退化成 1×1 白色占位块;
 标题、正文、点击跳转、动作按钮、可见性、daemon 稳定性**全部不受影响**。
 唯一的真实故障(scope 同步被打断)已由兜底消除。
 为一个纯视觉问题去逆向闭源厂商类不划算 —— **要重开必须有功能性理由。**
@@ -1147,7 +1154,9 @@ W VectorNotificationManager: Could not render the icon for drawable 2130771968
 
 - 这行是 `W` 且**后面不接** `Caught fatal coroutine exception` / `Caught a RuntimeException`;
 - 堆栈**止于** `Resources.getDrawable`,不再往 `ad.onTransact` / `Binder.execTransact` 跑;
-- 次数上每开机约 1 次(`grep -c` 计数不会随使用时间增长)。
+- 次数上**与构建通知的次数成正比**(实测严格 1:1):一条通知一次,而不是每个开机一次。
+  因为它每次都在同一个地方失败,失败就意味着这个 drawable 从未进过缓存,所以"下次就读缓存"
+  这个退路根本不存在。所以 `grep -c` 的计数会随着你触发通知而增长,这是正常的。
 
 反过来说,若看到这行**同时**又看到上面的形态一/二,说明兜底被绕过了,
 那时才需要重新查 —— 不要因为看到 `putCacheList` 字样就当成回归。

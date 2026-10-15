@@ -190,8 +190,10 @@ object FileSystem {
    * escape, which is why notifications reach the shade again.
    *
    * <p>The remaining trigger is deliberately left alone. It was measured for fallout over a full
-   * boot cycle: it fires **once per boot** (the status notice; the drawable is not re-read after
-   * that) and costs a 1x1 placeholder icon on that one notice. Title, text, tap action, action
+   * boot cycle: it fires **once per notification build** (the ratio to builds was 1:1 over two
+   * builds in one boot — one status notice, one module-updated notice — so it is not a per-boot
+   * cost, and it will not stop on its own, because a drawable that failed to cache is never
+   * cached) and costs a 1x1 placeholder icon on that notice. Title, text, tap action, action
    * buttons, visibility and the daemon itself are unaffected, and the fallback keeps the failure
    * out of the `IWbService` binder transaction, which was the only part that ever broke scope
    * sync. Chasing the null would mean reverse-engineering a closed vendor class for a cosmetic
