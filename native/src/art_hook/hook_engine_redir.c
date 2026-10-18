@@ -88,38 +88,25 @@ static void emit_save_native_hook_context(Arm64Writer* w, uint64_t target_pc) {
                                         NATIVE_STACK_METHOD_SLOT_SIZE + 344);
 }
 
-static void emit_store_replacement_for_stackvisitor(Arm64Writer* w, uint64_t original_method) {
-    uint64_t lbl_loop = arm64_writer_new_label_id(w);
-    uint64_t lbl_found = arm64_writer_new_label_id(w);
-    uint64_t lbl_done = arm64_writer_new_label_id(w);
-
-    /* Default to the ArtMethod we were entered with (x0), never 0.
+static void emit_store_replacement_for_stackvisitor(Arm64Writer* w, uint64_t replacement_method) {
+    /* Bake the replacement ArtMethod* into the frame's stack-walk method slot.
      *
-     * Measured (tombstone_06, Hunter 2.1.21): a miss in this scan left SP+0 at
-     * 0, ART's WalkStack then did `ldr w20,[x24,#4]` on a NULL ArtMethod and
-     * faulted at 0x4; TryHandleNullOatHeader rewrote x24 to g_dummy_oat_header,
-     * so the rest of the walk ran on a fake method and ended in
-     * CHECK(existing_entry_point != nullptr) -> PrettyMethod(dummy) -> SEGV.
-     * A miss is reachable whenever the entry is gone from g_art_router_table
-     * (hook removed, table compacted concurrently, stale baked key), and the
-     * generic JNI trampoline always enters here with x0 = the replacement
-     * ArtMethod*, which is exactly what the hit path writes below. */
-    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_SP, 0);
-
-    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, (uint64_t)g_art_router_table);
-    arm64_writer_put_label(w, lbl_loop);
-    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X16, 0);
-    arm64_writer_put_cbz_reg_label(w, ARM64_REG_X17, lbl_done);
-    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X15, original_method);
-    arm64_writer_put_cmp_reg_reg(w, ARM64_REG_X17, ARM64_REG_X15);
-    arm64_writer_put_b_cond_label(w, ARM64_COND_EQ, lbl_found);
-    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_X16, ARM64_REG_X16, sizeof(ArtRouterEntry));
-    arm64_writer_put_b_label(w, lbl_loop);
-
-    arm64_writer_put_label(w, lbl_found);
-    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X16, 8);
-    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_SP, 0);
-    arm64_writer_put_label(w, lbl_done);
+     * Measured history for this slot:
+     *   - originally 0 ("default"), then overwritten by a scan of
+     *     g_art_router_table. A miss in that scan (hook removed, table
+     *     compacted concurrently, stale baked key) left SP+0 == 0, ART's
+     *     WalkStack then read access_flags_/entry_ from NULL and died in
+     *     CHECK(existing_entry_point != nullptr) (tombstone_06).
+     *   - a scan-free variant is required: the generic JNI trampoline enters
+     *     this thunk with x0 = JNIEnv* (device libart 0x222244: x0 was
+     *     reloaded from the JNI arg buffer), so x0 can never be used here.
+     *
+     * The replacement is a kAccNative ArtMethod whose entry_ is
+     * art_quick_generic_jni_trampoline, which is exactly what a walked native
+     * frame must look like: entry_ != 0 and IsQuickGenericJniStub() true. The
+     * value is known at generation time, so no table scan is needed at all. */
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, replacement_method);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_SP, 0);
 }
 
 static void emit_native_callback_call(Arm64Writer* w, HookCallback callback, void* user_data) {
@@ -299,7 +286,7 @@ void* hook_remove_redirect(uint64_t key) {
 static void* generate_native_hook_thunk(HookCallback on_enter,
                                          void* user_data,
                                          uint64_t current_pc_hint,
-                                         uint64_t original_method,
+                                         uint64_t frame_method,
                                          void* thunk_mem,
                                          size_t* thunk_size_out) {
     Arm64Writer w;
@@ -308,7 +295,7 @@ static void* generate_native_hook_thunk(HookCallback on_enter,
     arm64_writer_init(&w, body_mem, (uint64_t)body_mem, body_alloc);
 
     emit_save_native_hook_context(&w, current_pc_hint);
-    emit_store_replacement_for_stackvisitor(&w, original_method);
+    emit_store_replacement_for_stackvisitor(&w, frame_method);
 
     /* Call on_enter(ctx, user_data) */
     emit_native_callback_call(&w, on_enter, user_data);
@@ -352,7 +339,7 @@ static void* generate_native_hook_thunk(HookCallback on_enter,
  * Returns the thunk address to be stored in ArtMethod.data_ field.
  * Uses the redirect entry list for tracking (shares hook_remove_redirect for cleanup). */
 void* hook_create_native_trampoline(uint64_t key, HookCallback on_enter, void* user_data,
-                                    uint64_t current_pc_hint) {
+                                    uint64_t current_pc_hint, uint64_t replacement_method) {
     if (!g_engine.initialized || !on_enter)
         return NULL;
 
@@ -364,7 +351,9 @@ void* hook_create_native_trampoline(uint64_t key, HookCallback on_enter, void* u
     if (!thunk_mem) return NULL;
 
     size_t thunk_size = 0;
-    void* thunk = generate_native_hook_thunk(on_enter, user_data, current_pc_hint, key, thunk_mem, &thunk_size);
+    void* thunk = generate_native_hook_thunk(on_enter, user_data, current_pc_hint,
+                                             replacement_method ? replacement_method : key,
+                                             thunk_mem, &thunk_size);
     if (!thunk) {
         hook_unlock(&g_engine.lock);
         return NULL;

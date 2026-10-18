@@ -3686,7 +3686,8 @@ std::unique_ptr<MethodState> Install(JNIEnv *env, jobject reflected_method,
     // sentinels and router lookup; callback userdata remains the raw JNI id
     // used by Vector's HookItem registry.
     void *thunk = hook_create_native_trampoline(state->original_art_method, callback,
-                                                 reinterpret_cast<void *>(key), 0);
+                                                 reinterpret_cast<void *>(key), 0,
+                                                 state->replacement);
     if (perf_start != 0) {
         // 诊断：覆盖 hook_create_native_trampoline（g_engine 锁 + exec pool hook_alloc + thunk 生成）。
         LOGI("[perf] art_method_install stage=thunk method={} thunk={} elapsedUs={}",

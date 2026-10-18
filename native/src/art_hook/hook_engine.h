@@ -336,7 +336,7 @@ void* hook_remove_redirect(uint64_t key);
  * @return               Thunk address (to store in ArtMethod.data_), NULL on failure
  */
 void* hook_create_native_trampoline(uint64_t key, HookCallback on_enter, void* user_data,
-                                    uint64_t current_pc_hint);
+                                    uint64_t current_pc_hint, uint64_t replacement_method);
 
 /*
  * ART router lookup table — inline C-side table for O(N) scan in generated thunk.
