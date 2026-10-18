@@ -195,6 +195,17 @@ void hook_engine_clear_pool_ranges(void);
  */
 int hook_is_in_exec_pool(uint64_t pc);
 
+/*
+ * Diagnostics only: the ART router builds its HookContext in a per-thread TLS
+ * table (see ArtRouterTlsSlot in hook_engine_art.c), not inside the ART-visible
+ * 224-byte frame. A probe that infers the frame from `ctx - 16` is therefore
+ * reading TLS, not the stack, on that route.
+ *
+ * Returns the owning router frame's sp when `ctx` is one of those TLS contexts,
+ * and 0 when `ctx` is a real stack-resident HookContext (inline / native thunk).
+ */
+uint64_t hook_art_router_ctx_frame_sp(const void* ctx);
+
 /* Thunk 在途计数。由 thunk 入口 LDADDAL inc, 出口 LDADDAL dec 直接配对。
  * cleanup 侧：
  *   1. 先反装所有 hook (切断新入口)

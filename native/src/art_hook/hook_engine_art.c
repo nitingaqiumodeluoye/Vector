@@ -160,6 +160,30 @@ __attribute__((__unused__)) static ArtRouterTlsSlot* hook_get_art_router_tls_slo
     return hook_get_art_router_tls_slot(thread);
 }
 
+/* Diagnostics: map a HookContext* back to the router frame it was prepared for.
+ *
+ * The router keeps its context in g_art_router_tls_slots so the ART-visible frame
+ * can stay the exact 224-byte SaveRefsAndArgs shape. Anything that derives the
+ * frame from the ctx address (`ctx - 16`) is only valid for the stack-resident
+ * contexts emitted by emit_save_hook_context / emit_save_native_hook_context;
+ * on the router route it reads TLS memory instead. This lookup makes that
+distinction exact instead of inferred. */
+uint64_t hook_art_router_ctx_frame_sp(const void* ctx) {
+    if (ctx == NULL) return 0;
+    for (int i = 0; i < (int)(sizeof(g_art_router_tls_slots) / sizeof(g_art_router_tls_slots[0])); i++) {
+        ArtRouterTlsSlot* slot = &g_art_router_tls_slots[i];
+        if (__atomic_load_n(&slot->thread, __ATOMIC_ACQUIRE) == 0) continue;
+        uint32_t depth = __atomic_load_n(&slot->depth, __ATOMIC_ACQUIRE);
+        if (depth > ART_ROUTER_CTX_MAX_DEPTH) depth = ART_ROUTER_CTX_MAX_DEPTH;
+        for (uint32_t d = 0; d < depth; d++) {
+            if ((const void*)&slot->entries[d].ctx == ctx) {
+                return slot->entries[d].frame_sp;
+            }
+        }
+    }
+    return 0;
+}
+
 /* ============================================================================
  * ART router table management
  * ============================================================================ */
@@ -2208,16 +2232,56 @@ static void emit_art_router_found_path_blr(Arm64Writer* w, uint64_t lbl_found,
  *
  * 实验结果（2026-09-15）：偏向 (a) 成立——清零后 hunter 同负载 220s+ 零崩溃
  * （原 mask 下 1~2 分钟必崩一次），未出现标量误标形态。本改动保留（见文件头实测修订）。
+ *
+ * A/B 对照（2026-10-19）：0u 与 rustFrida 真实 mask 至今没有在同一版本上正面对比过，
+ * 所以不再把它固化成编译期常量，而是**生成 thunk 时读一次**属性来决定（thunk 一旦生成
+ * 就固定，因此必须在目标进程 fork 之前 setprop）：
+ *   debug.vector.art.spill_mask_ab=0（默认） → 两个 mask 全 0，等价 3283 行为
+ *   debug.vector.art.spill_mask_ab=1         → rustFrida 的真实 mask
+ * 选择结果会 hook_log 一次，跑完能确认到底走了哪条臂。
+ * native thunk（hook_engine_redir.c）的伪 codeinfo 在 Vector 与 rustFrida 两侧都不声明
+ * 任何 spill，所以 A/B 的作用面只有 router thunk —— 正是两侧唯一的实质偏离点。
  * --------------------------------------------------------------------------- */
-#define FAKE_CORE_SPILL_MASK 0u
-#define FAKE_FP_SPILL_MASK 0u
-#define FAKE_CORE_SPILL_MASK_ORIGINAL \
+#define FAKE_CORE_SPILL_MASK_ZERO 0u
+#define FAKE_FP_SPILL_MASK_ZERO 0u
+/* rustFrida quickjs-hook/src/hook_engine_art.c 的真实值（未做任何删改）。 */
+#define FAKE_CORE_SPILL_MASK_REAL \
     ((1u << 30) | \
      (1u << 29) | (1u << 28) | (1u << 27) | (1u << 26) | (1u << 25) | \
      (1u << 24) | (1u << 23) | (1u << 22) | (1u << 21) | (1u << 20) | \
      (1u << 7)  | (1u << 6)  | (1u << 5)  | (1u << 4)  | (1u << 3)  | \
      (1u << 2)  | (1u << 1))
-#define FAKE_FP_SPILL_MASK_ORIGINAL 0xffu
+#define FAKE_FP_SPILL_MASK_REAL 0xffu
+
+/* 读一次并缓存。只在生成/升级 thunk 时调用，不在 dispatch 热路径上。 */
+static void fake_codeinfo_select_spill_masks(uint32_t* core_out, uint32_t* fp_out) {
+    static int cached = -1;
+    static uint32_t core_value = FAKE_CORE_SPILL_MASK_ZERO;
+    static uint32_t fp_value = FAKE_FP_SPILL_MASK_ZERO;
+    if (cached < 0) {
+        int real = 0;
+        const char* env = getenv("VECTOR_ART_SPILL_MASK_AB");
+        if (env != NULL && env[0] == '1' && env[1] == '\0') {
+            real = 1;
+        } else {
+#ifdef __ANDROID__
+            char prop[PROP_VALUE_MAX] = {0};
+            if (__system_property_get("debug.vector.art.spill_mask_ab", prop) > 0 &&
+                prop[0] == '1') {
+                real = 1;
+            }
+#endif
+        }
+        core_value = real ? FAKE_CORE_SPILL_MASK_REAL : FAKE_CORE_SPILL_MASK_ZERO;
+        fp_value = real ? FAKE_FP_SPILL_MASK_REAL : FAKE_FP_SPILL_MASK_ZERO;
+        cached = real;
+        hook_log("[art_router] fake codeinfo spill mask A/B: arm=%s core=0x%x fp=0x%x "
+                 "(debug.vector.art.spill_mask_ab)",
+                 real ? "real-rustFrida" : "zero-3283", core_value, fp_value);
+    }
+    *core_out = core_value;
+    *fp_out = fp_value;
+}
 
 static void fake_codeinfo_write_bits(uint8_t* buf, size_t* bit_offset,
                                      uint32_t value, size_t bit_count) {
@@ -2254,12 +2318,15 @@ static void fake_codeinfo_write_interleaved_varints(uint8_t* buf,
 static void encode_fake_codeinfo_v2(uint8_t buf[FAKE_OAT_CODEINFO_BYTES],
                                      uint32_t code_size, uint32_t frame_packed) {
     memset(buf, 0, FAKE_OAT_CODEINFO_BYTES);
+    uint32_t core_mask = 0;
+    uint32_t fp_mask = 0;
+    fake_codeinfo_select_spill_masks(&core_mask, &fp_mask);
     uint32_t values[7] = {
         0,
         code_size,
         frame_packed,
-        FAKE_CORE_SPILL_MASK,
-        FAKE_FP_SPILL_MASK,
+        core_mask,
+        fp_mask,
         0,
         0,
     };

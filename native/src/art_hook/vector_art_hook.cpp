@@ -1376,6 +1376,31 @@ void LoadReadableRanges() {
     g_cached_range_count = n;
 }
 
+// libart's own range, resolved once. IsInArtModule() calls FindModuleRange() which
+// fopen()s /proc/self/maps, so it cannot be used from the stack-walk probe or from
+// a signal handler. This cached form is safe in both places.
+struct CachedArtRange {
+    uintptr_t lo;
+    uintptr_t hi;
+    bool valid;
+};
+
+const CachedArtRange &CachedArtModuleRange() {
+    static CachedArtRange range{0, 0, false};
+    static std::once_flag once;
+    std::call_once(once, [] {
+        uintptr_t lo = 0;
+        uintptr_t hi = 0;
+        if (FindModuleRange("libart.so", &lo, &hi)) {
+            range.lo = lo;
+            range.hi = hi;
+            range.valid = true;
+        }
+    });
+    return range;
+}
+
+
 bool IsCachedReadable(uintptr_t address) {
     std::call_once(g_cached_ranges_once, LoadReadableRanges);
     const uintptr_t addr = address & kPacStripMask;
@@ -2775,9 +2800,48 @@ std::atomic<unsigned long> g_delivered_sigsegv_count{0};
  * futex/ConditionVariable 上的线程执行 kill(tid, SIGSEGV)，期待处理器接管、让线程就地
  * 进入 suspend 检查（线程根本没有 faulting 地址，tombstone 里正是 `fault addr --------`）。
  * 识别它的价值：这种信号既无处可重定向、也不应被当成崩溃。
+ *
+ * 已知缺陷（交接文档 2.6）：si_code 只说明「有人 kill 了我」，并不区分
+ *   (a) ART 的 implicit-suspend 通知，还是
+ *   (b) 真实崩溃之后某个环节把自己的 SIGSEGV 重投回本线程。
+ * 两种情况都是 SI_TKILL/SI_USER，所以这里一律 return true 接管，于是 (b) 形态
+ * 就连 debuggerd 都走不到（13421：`exited due to signal 11` 但 4 分钟里没有任何
+ * crash_dump）。是否真在吞掉真实崩溃，只能靠日志取证，不能靠推理，所以调用方会打印
+ * 那份不改行为的证据行。
  */
 static bool IsDeliveredSigsegv(const siginfo_t *info) {
     return info != nullptr && (info->si_code == SI_USER || info->si_code == SI_TKILL);
+}
+
+/*
+ * Undelivered-SIGSEGV 证据行：纯粹为了看清「被我们接管的那条信号是什么」。
+ *
+ * 约束（信号处理器上下文）：
+ *   - 不分配、不加锁、不 fopen(/proc)；只读寄存器与 siginfo。
+ *   - 不改返回值、不改任何状态（除了下面这个限频计数器）。
+ *
+ * 判读方法（下次 hunter 崩后再看）：
+ *   真实崩溃被重投 → pc 落在一个「会取址」的指令上，且 si_addr 形如有效地址/小偏移；
+ *   ART 挂起通知   → 线程停在 futex/ConditionVariable，pc 在 syscall 或自旋点，
+ *                    si_addr 通常为 NULL，且与该线程的 suspend 请求时刻对得上。
+ */
+static void LogDeliveredSigsegvEvidence(const siginfo_t *info, void *context) {
+    const auto *machine = context ? &reinterpret_cast<ucontext_t *>(context)->uc_mcontext : nullptr;
+    const auto pc = machine ? static_cast<uintptr_t>(machine->pc) & kPacStripMask : 0;
+    const auto sp = machine ? static_cast<uintptr_t>(machine->sp) & kPacStripMask : 0;
+    const auto lr = machine ? static_cast<uintptr_t>(machine->regs[30]) & kPacStripMask : 0;
+    const auto x0 = machine ? static_cast<uintptr_t>(machine->regs[0]) & kPacStripMask : 0;
+    // Only cache-backed probes here. IsMappedExecutable() fopen()s /proc/self/maps,
+    // which is not reentrant-safe inside a signal handler that may have interrupted
+    // the loader; IsInArtModule() and hook_is_in_exec_pool() use already-built state.
+    LOGW("WxShadow SIGSEGV delivered evidence: code={} errno={} addr={} pc={} sp={} lr={} x0={} "
+         "pc_in_art={} pc_in_pool={} pid={} tid={}",
+         info ? info->si_code : -1, info ? info->si_errno : -1,
+         info ? info->si_addr : nullptr, reinterpret_cast<void *>(pc),
+         reinterpret_cast<void *>(sp), reinterpret_cast<void *>(lr),
+         reinterpret_cast<void *>(x0), IsInArtModule(pc) ? "yes" : "no",
+         hook_is_in_exec_pool(pc) ? "yes" : "no", static_cast<long>(getpid()),
+         static_cast<long>(gettid()));
 }
 
 extern "C" bool ArtSigchainHandler(int signal, siginfo_t *info, void *context) {
@@ -2793,8 +2857,8 @@ extern "C" bool ArtSigchainHandler(int signal, siginfo_t *info, void *context) {
     if (signal == SIGSEGV && IsDeliveredSigsegv(info)) {
         const unsigned long n =
             g_delivered_sigsegv_count.fetch_add(1, std::memory_order_relaxed) + 1;
-        // 热路径限频：前 3 次全打，之后 1/64。
-        if (n <= 3 || (n & 63u) == 0) {
+        // 热路径限频：前 8 次全打（够看清开头几次的 pc 归属），之后 1/64。
+        if (n <= 8 || (n & 63u) == 0) {
             const auto pc = context
                                 ? static_cast<uintptr_t>(
                                       reinterpret_cast<ucontext_t *>(context)->uc_mcontext.pc) &
@@ -2802,6 +2866,9 @@ extern "C" bool ArtSigchainHandler(int signal, siginfo_t *info, void *context) {
                                 : 0;
             LOGW("WxShadow SIGSEGV delivered (implicit suspend) handled count={} pc={} tid={}",
                  n, reinterpret_cast<void *>(pc), static_cast<long>(gettid()));
+            // 同一条信号再打一行证据（不改返回、不改状态）：用来回答「13421 那种
+            // signal 11 无 crash_dump 是不是被这一支吞掉的」。
+            LogDeliveredSigsegvEvidence(info, context);
         }
         return true;
     }
@@ -3350,8 +3417,14 @@ void SetManagerProcess(bool is_manager) {
 // ---------------------------------------------------------------------------
 constexpr size_t kNativeThunkMethodSlotSize = 16;
 constexpr size_t kNativeThunkFrameSize = 368;
+// The ART router's frame is a SaveRefsAndArgs shape: SUB SP,#0xE0 (224).
+constexpr size_t kRouterFrameSize = 224;
+// router frame +136..+216 are the slots FAKE_CORE_SPILL_MASK declares (x20..x28)
+// plus the return-PC slot. Distinct from the inline thunk's 352/280 layout.
+constexpr size_t kRouterSlotWindowOffset = 136;
 constexpr size_t kFrameProbeEntries = 32;
-constexpr size_t kFrameProbeStride = 72;  // 7 scalars + tail[8] + 8 chain hops of 7
+// 7 scalars + 8 ctx/route scalars + tail[8] + reserved + router_slots[11] + 8 chain hops of 7
+constexpr size_t kFrameProbeStride = 91;
 // ManagedStack::link_ follows top_quick_frame_ on API >= 23 (rustFrida
 // art_thread.rs get_managed_stack_spec). The offset is relative to the
 // ManagedStack, which is embedded at Thread+managed_stack_offset.
@@ -3372,19 +3445,39 @@ struct FrameChainHop {
 };
 
 struct FrameProbeEntry {
+    // --- what the probe could always see -------------------------------------
     uint64_t seq;
-    uint64_t frame_base;
-    uint64_t top_quick_frame;
-    uint64_t method_slot;
+    uint64_t frame_base;      // the frame this entry is about (see flags bit4/bit5)
+    uint64_t top_quick_frame; // ManagedStack::top_quick_frame_ at call time
+    uint64_t method_slot;     // RAW u64 at frame_base -- never synthesised
     uint64_t jni_frame_expected;
     uint64_t tid;
     uint64_t flags;
+    // --- route / HookContext identity ---------------------------------------
+    // The old probe inferred the frame from `ctx - 16` on every route. That is
+    // only valid for the stack-resident contexts; the ART router keeps its ctx
+    // in a per-thread TLS table, where `ctx - 16` is unrelated memory. These
+    // fields record the ctx itself plus the route, so slot == 0 can finally be
+    // attributed instead of guessed (handover 6.1).
+    uint64_t ctx;             // HookContext* handed to the callback
+    uint64_t ctx_sp;          // ctx->sp
+    uint64_t ctx_pc;          // ctx->pc
+    uint64_t ctx_delta;       // ctx_sp - ctx  (352 = stack frame, other = TLS ctx)
+    uint64_t ctx_x0;          // ctx->x[0]: the method dispatch routes on
+    uint64_t ctx_x0_class;    // ProbeMethodClass bits for ctx_x0
+    uint64_t slot_class;      // ProbeMethodClass bits for method_slot
+    // Router-only: the real 224-byte frame sp, 0 on every other route.
+    uint64_t router_frame;
     // Frame tail captured AT CALL TIME. Reading these afterwards is useless:
     // the stack is already unwound and reused (verified on device). These are
     // frame+0x160..0x1a0, i.e. the region ART would land on if it advances by
     // 384 bytes instead of our declared 368.
     uint64_t tail[8];
     uint64_t reserved;
+    // Router frame+136 .. +216: exactly the slots FAKE_CORE_SPILL_MASK declares
+    // (x20..x28) plus the return-PC slot at +216. Captured at call time so the
+    // spill-mask A/B can be judged from data instead of from crash shape.
+    uint64_t router_slots[11];
     // The walker's ManagedStack chain, captured at call time. This is the part
     // that matters now: the probe already proved our own [sp+0] holds a valid
     // ArtMethod, yet the crashes dereference a stack address as a method, so the
@@ -3427,6 +3520,58 @@ bool FrameProbeEnabled() {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// What is in a slot that ART is about to treat as an ArtMethod*?
+//
+// The crashes in this family are all "ART read a non-ArtMethod out of a frame
+// slot". Recording the raw value is not enough to act on it: 0x0, a stack
+// address, a Thread* and a real method look the same in a log of hex numbers.
+// These bits classify the value cheaply. Crucially they use only caches built
+// once (LoadReadableRanges for readability, hook_is_in_exec_pool for our own
+// code, a call_once module range for libart) -- no fopen("/proc/self/maps") --
+// because this runs on the GC thread's stack-walk path.
+// ---------------------------------------------------------------------------
+constexpr uint64_t kProbeMethodZero = 1u << 0;
+constexpr uint64_t kProbeMethodReadable = 1u << 1;
+constexpr uint64_t kProbeMethodInPool = 1u << 2;
+constexpr uint64_t kProbeMethodNullEntry = 1u << 3;
+constexpr uint64_t kProbeMethodInArt = 1u << 4;
+constexpr uint64_t kProbeMethodStackLike = 1u << 5;
+
+uint64_t ClassifyProbeMethod(uintptr_t value, uintptr_t anchor) {
+    if (value == 0) return kProbeMethodZero;
+    const uintptr_t v = value & kPacStripMask;
+    uint64_t bits = 0;
+    if (IsCachedReadable(v)) bits |= kProbeMethodReadable;
+    if (hook_is_in_exec_pool(v)) bits |= kProbeMethodInPool;
+    const auto &art = CachedArtModuleRange();
+    if (art.valid && v >= art.lo && v < art.hi) bits |= kProbeMethodInArt;
+    // Same "this thread's stack" test the chain walk uses. A method that lands
+    // here is the tombstone_10 shape, never legitimate.
+    if (anchor != 0) {
+        const uintptr_t delta = v > anchor ? v - anchor : anchor - v;
+        if (delta < (8u * 1024u * 1024u)) bits |= kProbeMethodStackLike;
+    }
+    // entry_ lives at data_+8 once the layout probe has run. Check the exact
+    // address being read, not just `v`: a method at the end of a mapping would
+    // otherwise fault here, and this runs on the GC thread's stack-walk path.
+    const size_t entry_offset = g_layout.entry_offset;
+    if (entry_offset != 0 && entry_offset + sizeof(uintptr_t) <= 64 &&
+        IsCachedReadable(v + entry_offset)) {
+        const auto entry = *reinterpret_cast<volatile const uintptr_t *>(v + entry_offset);
+        if (entry == 0) bits |= kProbeMethodNullEntry;
+    }
+    return bits;
+}
+
+// Which hook route produced this probe entry. The three shapes differ in frame
+// size (224 / 352 / 368) and in whether a method slot exists at all, so every
+// log line names the route rather than leaving the reader to guess from numbers.
+const char *ProbeRouteName(bool native_entry_route, bool router_route) {
+    if (router_route) return "art_router";
+    return native_entry_route ? "native_entry" : "trampoline";
+}
+
 void ProbeNativeThunkFrame(HookContext *ctx, bool native_entry_route) {
 #if defined(__aarch64__)
     if (!ctx) return;
@@ -3434,8 +3579,7 @@ void ProbeNativeThunkFrame(HookContext *ctx, bool native_entry_route) {
 
     // The native trampoline frame starts 16 bytes before the HookContext
     // (reserved method slot). The registered-native-entry route has no such
-    // slot, so the base is different: probing it with the trampoline numbers
-    // produced a false "slot == 0" alarm.
+    // slot, so the base is different.
     //
     // Expected top_quick_frame, MEASURED rather than derived. Two independent
     // drops agree on the same relation, which is why it is trustworthy:
@@ -3448,15 +3592,33 @@ void ProbeNativeThunkFrame(HookContext *ctx, bool native_entry_route) {
     // probe bug and led to an unnecessary 368->384 change (now reverted).
     // The registered-native-entry route has no JNI trampoline above it, so it
     // carries no extra 16.
-    const uintptr_t frame = reinterpret_cast<uintptr_t>(ctx) -
-                            (native_entry_route ? 0 : kNativeThunkMethodSlotSize);
-    const uintptr_t declared = native_entry_route ? 352 : kNativeThunkFrameSize;
-    const uintptr_t caller_gap = native_entry_route ? 0 : 16;
-    const uintptr_t expected_jni_frame = frame + declared + caller_gap;
-    const uintptr_t slot = native_entry_route
-                               ? 0
-                               : *reinterpret_cast<volatile const uintptr_t *>(frame);
+    //
+    // Where does this ctx actually live? Three shapes reach this probe:
+    //   * inline engine: 352-byte stack frame, ctx IS the frame;
+    //   * native thunk:  368-byte stack frame, ctx sits after a 16-byte slot;
+    //   * ART router quick path: the context is a slot in a per-thread TLS table
+    //     and `ctx - 16` points at unrelated TLS memory.
+    // The previous revision only knew the first two, so on the router route it
+    // read the TLS block and reported `slot=0x0` -- the exact value the handover
+    // could not attribute. Ask the engine instead of inferring from an offset.
+    const uintptr_t router_frame = hook_art_router_ctx_frame_sp(ctx);
+    const bool router_route = router_frame != 0;
 
+    const uintptr_t frame =
+        router_route ? router_frame
+                     : reinterpret_cast<uintptr_t>(ctx) -
+                           (native_entry_route ? 0 : kNativeThunkMethodSlotSize);
+    const uintptr_t declared = router_route
+                                   ? kRouterFrameSize
+                                   : (native_entry_route ? 352 : kNativeThunkFrameSize);
+    const uintptr_t caller_gap = (router_route || native_entry_route) ? 0 : 16;
+    const uintptr_t expected_jni_frame = frame + declared + caller_gap;
+    // Always read the word instead of synthesising 0 for a route: on the
+    // registered-native route this is the last saved register before the
+    // context, and the classification below says what it actually is.
+    const uintptr_t slot = *reinterpret_cast<volatile const uintptr_t *>(frame);
+    const uint64_t slot_class = ClassifyProbeMethod(slot, frame);
+    const uint64_t ctx_x0_class = ClassifyProbeMethod(ctx->x[0], frame);
     uintptr_t top = 0;
     const uintptr_t thread = CurrentArtThreadForProbe();
     if (thread && g_thread_layout.valid) {
@@ -3497,24 +3659,51 @@ void ProbeNativeThunkFrame(HookContext *ctx, bool native_entry_route) {
     entry.method_slot = slot;
     entry.jni_frame_expected = expected_jni_frame;
     entry.tid = static_cast<uint64_t>(gettid());
+    entry.ctx = reinterpret_cast<uint64_t>(ctx);
+    entry.ctx_sp = ctx->sp;
+    entry.ctx_pc = ctx->pc;
+    entry.ctx_delta = ctx->sp - reinterpret_cast<uint64_t>(ctx);
+    entry.ctx_x0 = ctx->x[0];
+    entry.ctx_x0_class = ctx_x0_class;
+    entry.slot_class = slot_class;
+    entry.router_frame = router_frame;
     // flags bit0: top_quick_frame agrees with the frame size we declare
     // flags bit1: thread/ManagedStack readable
     // flags bit2: registered-native-entry route (no method slot, 352 by design)
     // flags bit3: the walker's own frame holds our replacement method (i.e. ART
     //             is looking at THIS frame, not some other one)
+    // flags bit4: ctx is a router TLS context, so frame_base came from the
+    //             engine's TLS table, NOT from ctx-16
+    // flags bit5: ctx_sp - ctx == 352, i.e. a stack-resident context whose
+    //             layout matches emit_save_hook_context
     // flags bit0 compares the UNTAGGED frame pointer: TopQuickFrame carries a
     // tag in bit0 (and, as measured, the raw value is odd), so comparing the raw
     // pointer against an aligned expected address was always false and produced a
     // spurious MISMATCH on every single call.
     entry.flags = ((top & ~uintptr_t{1}) == expected_jni_frame ? 1u : 0u) |
                   (thread ? 2u : 0u) | (native_entry_route ? 4u : 0u) |
-                  (!native_entry_route && slot && top_method == slot ? 8u : 0u);
+                  (!native_entry_route && slot && top_method == slot ? 8u : 0u) |
+                  (router_route ? 16u : 0u) |
+                  (entry.ctx_delta == sizeof(HookContext) ? 32u : 0u);
 
     // Capture the tail now: after the thunk returns the stack is reused, so a
     // post-mortem read records whatever took its place (verified on device).
-    for (size_t i = 0; i < 8; ++i) {
-        entry.tail[i] = *reinterpret_cast<volatile const uint64_t *>(
-            frame + 352 + i * sizeof(uint64_t));
+    // The router frame is 224 bytes; reading a 368-byte tail past it would
+    // describe its caller, not us, so that route records router_slots instead.
+    // Clear the other window: ring entries are reused, and a stale value from a
+    // previous entry would read as if it belonged to this frame.
+    if (router_route) {
+        for (size_t i = 0; i < 8; ++i) entry.tail[i] = 0;
+        for (size_t i = 0; i < 11; ++i) {
+            entry.router_slots[i] = *reinterpret_cast<volatile const uint64_t *>(
+                frame + kRouterSlotWindowOffset + i * sizeof(uint64_t));
+        }
+    } else {
+        for (size_t i = 0; i < 11; ++i) entry.router_slots[i] = 0;
+        for (size_t i = 0; i < 8; ++i) {
+            entry.tail[i] = *reinterpret_cast<volatile const uint64_t *>(
+                frame + 352 + i * sizeof(uint64_t));
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -3573,7 +3762,7 @@ void ProbeNativeThunkFrame(HookContext *ctx, bool native_entry_route) {
         if (n <= 6) {
             LOGI("WxShadow ART frame probe: route={} top_quick_frame={} frame={} "
                  "declared={} expected={} delta={} slot={} top_method={} same={} tid={} n={}",
-                 native_entry_route ? "native_entry" : "trampoline",
+                 ProbeRouteName(native_entry_route, router_route),
                  reinterpret_cast<void *>(top), reinterpret_cast<void *>(frame),
                  static_cast<unsigned long>(declared),
                  reinterpret_cast<void *>(expected_jni_frame),
@@ -3583,15 +3772,60 @@ void ProbeNativeThunkFrame(HookContext *ctx, bool native_entry_route) {
                  static_cast<long>(gettid()), n);
         }
     }
+    // The handover's open question (6.1): a probe entry said `slot=0x0` and it
+    // was impossible to tell whether that slot belonged to a native trampoline
+    // frame at all. Log every entry whose slot is not something ART could use as
+    // an ArtMethod, together with the identity of the context that produced it.
+    //   ctx_delta = ctx_sp - ctx : 352 => stack-resident HookContext
+    //                              other => not our frame (router TLS ctx)
+    //   slot_class / x0_class    : see kProbeMethod* bits
+    {
+        static std::atomic<uint32_t> attributed{0};
+        const bool unusable =
+            slot == 0 ||
+            !(slot_class & (kProbeMethodReadable | kProbeMethodInPool));
+        if (unusable) {
+            const uint32_t n = attributed.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 24) {
+                LOGW("WxShadow ART frame probe SLOT: route={} tid={} ctx={} ctx_sp={} "
+                     "ctx_delta={} frame={} slot={} slot_class={:#x} "
+                     "ctx_x0={} x0_class={:#x} flags={:#x} n={}",
+                     ProbeRouteName(native_entry_route, router_route),
+                     static_cast<long>(gettid()), reinterpret_cast<void *>(ctx),
+                     reinterpret_cast<void *>(ctx->sp),
+                     static_cast<long>(entry.ctx_delta),
+                     reinterpret_cast<void *>(frame), reinterpret_cast<void *>(slot),
+                     slot_class, reinterpret_cast<void *>(ctx->x[0]), ctx_x0_class,
+                     entry.flags, n);
+                if (router_route) {
+                    LOGW("WxShadow ART frame probe   router_slots[+136..+216]: "
+                         "x20={} x21={} x22={} x23={} x24={} x25={} x26={} x27={} "
+                         "x28={} pad={} ret_pc={}",
+                         reinterpret_cast<void *>(entry.router_slots[0]),
+                         reinterpret_cast<void *>(entry.router_slots[1]),
+                         reinterpret_cast<void *>(entry.router_slots[2]),
+                         reinterpret_cast<void *>(entry.router_slots[3]),
+                         reinterpret_cast<void *>(entry.router_slots[4]),
+                         reinterpret_cast<void *>(entry.router_slots[5]),
+                         reinterpret_cast<void *>(entry.router_slots[6]),
+                         reinterpret_cast<void *>(entry.router_slots[7]),
+                         reinterpret_cast<void *>(entry.router_slots[8]),
+                         reinterpret_cast<void *>(entry.router_slots[9]),
+                         reinterpret_cast<void *>(entry.router_slots[10]));
+                }
+            }
+        }
+    }
     // Geometry violation only: compare the untagged pointer, otherwise the tag
-    // bit makes this fire on every call.
-    if (thread && top && (top & ~uintptr_t{1}) != expected_jni_frame) {
+    // bit makes this fire on every call. The router route declares its own
+    // 224-byte geometry, so it is excluded the same way native_entry is.
+    if (!router_route && thread && top && (top & ~uintptr_t{1}) != expected_jni_frame) {
         static std::atomic<uint32_t> reported{0};
         const uint32_t n = reported.fetch_add(1, std::memory_order_relaxed) + 1;
         if (n <= 8) {
             LOGW("WxShadow ART frame probe GEOMETRY: route={} top_quick_frame={} frame={} "
                  "declared={} expected={} delta={} slot={} tid={} n={}",
-                 native_entry_route ? "native_entry" : "trampoline",
+                 ProbeRouteName(native_entry_route, router_route),
                  reinterpret_cast<void *>(top), reinterpret_cast<void *>(frame),
                  static_cast<unsigned long>(declared),
                  reinterpret_cast<void *>(expected_jni_frame),
@@ -3624,18 +3858,23 @@ void ProbeNativeThunkFrame(HookContext *ctx, bool native_entry_route) {
             if (m >= lo && m <= hi) suspicious = true;
         }
         if (n <= 4 || suspicious) {
-            LOGW("WxShadow ART frame probe CHAIN: tid={} our_frame={} slot={} hops={} susp={} n={}",
+            LOGW("WxShadow ART frame probe CHAIN: route={} tid={} our_frame={} slot={} "
+                 "slot_class={:#x} flags={:#x} hops={} susp={} n={}",
+                 ProbeRouteName(native_entry_route, router_route),
                  static_cast<long>(gettid()), reinterpret_cast<void *>(frame),
-                 reinterpret_cast<void *>(slot), static_cast<int>(kMaxManagedStackFragments),
+                 reinterpret_cast<void *>(slot), slot_class, entry.flags,
+                 static_cast<int>(kMaxManagedStackFragments),
                  suspicious ? "yes" : "no", n);
             for (size_t i = 0; i < kMaxManagedStackFragments; ++i) {
                 const auto &hop = entry.chain[i];
                 if (!hop.fragment) break;
-                LOGW("WxShadow ART frame probe   hop[{}] frag={} top={} frame={} method={} ours={}",
+                LOGW("WxShadow ART frame probe   hop[{}] frag={} top={} frame={} method={} "
+                     "class={:#x} ours={}",
                      i, reinterpret_cast<void *>(hop.fragment),
                      reinterpret_cast<void *>(hop.top_raw),
                      reinterpret_cast<void *>(hop.frame),
                      reinterpret_cast<void *>(hop.frame_method),
+                     ClassifyProbeMethod(hop.frame_method, frame),
                      (hop.flags & 2u) ? "yes" : "no");
             }
         }
