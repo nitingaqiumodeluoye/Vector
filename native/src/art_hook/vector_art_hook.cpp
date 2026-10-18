@@ -1340,14 +1340,83 @@ void MaybeLogStackMethodOatLookup(uintptr_t method, uintptr_t lr) {
 // are in the low hundreds of thousands.
 constexpr uint32_t kImplausibleDexMethodIndex = 0x01000000u;
 
+// Readable mappings cached ONCE per process.
+//
+// A fixed address window cannot work here: this device maps ART and its
+// ArtMethods around 0x70xxxxxx while another boot put the same process at
+// 0x77ff... - and an earlier revision used [0x7000000000, 0x8000000000), which
+// silently rejected every real method (0x7025ba98 < 0x7000000000) and made this
+// diagnostic report nothing at all. Validate against the process's own maps
+// instead, parsed once so the GC walk path never touches /proc.
+constexpr size_t kCachedRangeMax = 1024;
+struct MappedRange {
+    uintptr_t lo;
+    uintptr_t hi;
+};
+MappedRange g_cached_ranges[kCachedRangeMax];
+size_t g_cached_range_count = 0;
+std::once_flag g_cached_ranges_once;
+
+void LoadReadableRanges() {
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) return;
+    char line[512];
+    size_t n = 0;
+    while (n < kCachedRangeMax && fgets(line, sizeof(line), maps)) {
+        unsigned long start = 0;
+        unsigned long end = 0;
+        char perms[5] = {};
+        if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) != 3) continue;
+        if (perms[0] != 'r') continue;
+        g_cached_ranges[n].lo = start;
+        g_cached_ranges[n].hi = end;
+        ++n;
+    }
+    fclose(maps);
+    g_cached_range_count = n;
+}
+
+bool IsCachedReadable(uintptr_t address) {
+    std::call_once(g_cached_ranges_once, LoadReadableRanges);
+    const uintptr_t addr = address & kPacStripMask;
+    // Ranges from /proc/self/maps are in ascending order, and this sits on
+    // GetOatQuickMethodHeader which ART calls on the order of 100k/s, so a
+    // linear scan over up to 1024 entries would cost far too much.
+    size_t lo = 0;
+    size_t hi = g_cached_range_count;
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo) / 2;
+        if (addr < g_cached_ranges[mid].lo) {
+            hi = mid;
+        } else if (addr >= g_cached_ranges[mid].hi) {
+            lo = mid + 1;
+        } else {
+            return true;
+        }
+    }
+    return false;
+}
+
 void MaybeLogImplausibleMethodIndex(uintptr_t method, uintptr_t lr) {
     if (!method) return;
-    // Every address an app can map on this device lives in this range, so the
-    // two reads below cannot fault on an unmapped hole in practice.
-    if (method < 0x7000000000ull || method >= 0x8000000000ull) return;
-    const auto flags = *reinterpret_cast<volatile const uint32_t *>(method + 4);
-    const auto index = *reinterpret_cast<volatile const uint32_t *>(method + 8);
-    if (index < kImplausibleDexMethodIndex) return;
+    const uintptr_t m = method & kPacStripMask;
+    // Needs the method header to be readable; ask the cached maps rather than
+    // assuming an address range.
+    if (!IsCachedReadable(m + 12)) return;
+    const auto flags = *reinterpret_cast<volatile const uint32_t *>(m + 4);
+    const auto index = *reinterpret_cast<volatile const uint32_t *>(m + 8);
+
+    // Two distinct ways a non-ArtMethod reaches the OAT lookup, both observed:
+    //   index: ART read a garbage dex_method_index_ and aborted in FindOatMethodFor
+    //          (<<invalid-method-idx-NNN>>, seen 351803424 / 349474360 / 345416752)
+    //   entry: ART read entry_ == 0 and aborted in CHECK(existing_entry_point)
+    uintptr_t entry = 0;
+    if (g_layout.valid && g_layout.entry_offset + sizeof(uintptr_t) <= 64) {
+        entry = *reinterpret_cast<volatile const uintptr_t *>(m + g_layout.entry_offset);
+    }
+    const bool bad_index = index >= kImplausibleDexMethodIndex;
+    const bool null_entry = (entry == 0);
+    if (!bad_index && !null_entry) return;
 
     static std::atomic<uint32_t> reported{0};
     const uint32_t n = reported.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1366,8 +1435,9 @@ void MaybeLogImplausibleMethodIndex(uintptr_t method, uintptr_t lr) {
     // jni_env at +0xD0) from "the frame held some other non-method value".
     const bool looks_like_thread = thread && (method & kPacStripMask) == thread;
     LOGW("WxShadow ART OAT lookup got a NON-ArtMethod: method={} flags=0x{:x} idx={} "
-         "is_thread={} lr={} thread={} tid={} n={}",
-         reinterpret_cast<void *>(method), flags, index,
+         "entry={} bad_index={} null_entry={} is_thread={} lr={} thread={} tid={} n={}",
+         reinterpret_cast<void *>(method), flags, index, reinterpret_cast<void *>(entry),
+         bad_index ? "yes" : "no", null_entry ? "yes" : "no",
          looks_like_thread ? "yes" : "no", reinterpret_cast<void *>(lr),
          reinterpret_cast<void *>(thread), static_cast<long>(gettid()), n);
 }
