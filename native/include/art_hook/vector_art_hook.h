@@ -125,4 +125,20 @@ bool LookupDispatchFrame(jmethodID target, HookContext **ctx, jobjectArray *valu
 /** Deoptimize one method through ART instrumentation when its symbols are available. */
 bool Deoptimize(JNIEnv *env, const MethodState &state);
 
+/** Diagnostic only, gated by debug.vector.art.frame_probe=1.
+ *
+ * Records one native-thunk frame into a fixed ring buffer and checks the one
+ * geometric invariant the stack walker depends on: the generic JNI trampoline
+ * publishes its own 224-byte frame as managed_stack_.top_quick_frame_, and our
+ * 368-byte thunk frame must sit immediately below it. If that does not hold,
+ * ART cannot advance from the JNI frame onto our frame and will read whatever
+ * the wrong offset happens to contain instead of an ArtMethod.
+ *
+ * Does nothing (and costs one predictable branch) when the property is unset. */
+void ProbeNativeThunkFrame(HookContext *ctx);
+
+/** Copies the probe ring out for post-mortem analysis. Returns the number of
+ * entries written; safe to call at any time. */
+size_t ReadNativeThunkFrameProbe(uint64_t *out, size_t capacity);
+
 }  // namespace vector::native::art

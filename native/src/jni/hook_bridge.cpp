@@ -691,6 +691,10 @@ static uint64_t ReadNativeArgument(HookContext *ctx, const ValueKind kind, size_
 
 static void VectorArtHookCallback(HookContext *ctx, void *raw_user_data) {
     if (!ctx || !raw_user_data) return;
+    // Diagnostic: verifies the one geometric contract the ART stack walker relies
+    // on (JNI frame published as top_quick_frame_ == our 368-byte frame + 224).
+    // No-op unless debug.vector.art.frame_probe is set.
+    art::ProbeNativeThunkFrame(ctx);
     auto target = reinterpret_cast<jmethodID>(raw_user_data);
     HookItem *item = nullptr;
     hooked_methods.if_contains(target, [&item](const auto &entry) { item = entry.second.get(); });

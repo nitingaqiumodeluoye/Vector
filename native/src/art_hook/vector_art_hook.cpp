@@ -3115,6 +3115,143 @@ void SetManagerProcess(bool is_manager) {
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// Frame-probe diagnostic (debug.vector.art.frame_probe=1)
+//
+// The stack walker reaches a hooked method through a chain that has exactly one
+// geometric contract:
+//   GenericJNI frame (224 B, method = replacement, native)
+//     <- published as managed_stack_.top_quick_frame_
+//   our thunk frame (368 B = 16 B method slot + 352 B HookContext), directly
+//     below it, because the trampoline calls through with sp == its own frame.
+// If ART ever advances from the JNI frame by anything other than 224, or from
+// our frame by anything other than 368, the "method" it reads next is one of
+// the registers we saved, not an ArtMethod. Every observed crash is consistent
+// with that: a non-native method with a garbage dex_method_index_.
+//
+// This probe therefore records, per thunk entry, the four values needed to
+// verify the contract, plus whether top_quick_frame really is frame + 368.
+// It is off unless the property is set, and it never allocates or takes locks.
+// ---------------------------------------------------------------------------
+constexpr size_t kNativeThunkMethodSlotSize = 16;
+constexpr size_t kNativeThunkFrameSize = 368;
+constexpr size_t kFrameProbeEntries = 32;
+constexpr size_t kFrameProbeStride = 8;
+
+struct FrameProbeEntry {
+    uint64_t seq;
+    uint64_t frame_base;
+    uint64_t top_quick_frame;
+    uint64_t method_slot;
+    uint64_t jni_frame_expected;
+    uint64_t tid;
+    uint64_t flags;
+    uint64_t reserved;
+};
+
+static_assert(sizeof(FrameProbeEntry) == kFrameProbeStride * sizeof(uint64_t),
+              "probe entry must stay stride-aligned");
+
+// Externally visible so a post-mortem reader can find it without symbols.
+alignas(64) FrameProbeEntry g_native_thunk_frame_probe[kFrameProbeEntries]{};
+std::atomic<size_t> g_native_thunk_frame_probe_count{0};
+std::atomic<bool> g_frame_probe_state{false};  // false = not yet checked
+
+uintptr_t CurrentArtThreadForProbe() {
+    uintptr_t tls = 0;
+#if defined(__aarch64__)
+    asm volatile("mrs %0, tpidr_el0" : "=r"(tls));
+#else
+    tls = reinterpret_cast<uintptr_t>(__builtin_thread_pointer());
+#endif
+    if (!tls) return 0;
+    return *reinterpret_cast<volatile const uintptr_t *>(tls + 7 * sizeof(uintptr_t)) &
+           kPacStripMask;
+}
+
+bool FrameProbeEnabled() {
+    const bool cached = g_frame_probe_state.load(std::memory_order_relaxed);
+    if (cached) return true;
+    char value[PROP_VALUE_MAX] = {};
+    if (__system_property_get("debug.vector.art.frame_probe", value) <= 0) return false;
+    if (value[0] == '0' || value[0] == '\0') return false;
+    g_frame_probe_state.store(true, std::memory_order_relaxed);
+    LOGI("WxShadow ART frame probe enabled (debug.vector.art.frame_probe)");
+    return true;
+}
+
+void ProbeNativeThunkFrame(HookContext *ctx) {
+#if defined(__aarch64__)
+    if (!ctx) return;
+    if (!FrameProbeEnabled()) return;
+
+    const uintptr_t frame = reinterpret_cast<uintptr_t>(ctx) - kNativeThunkMethodSlotSize;
+    const uintptr_t expected_jni_frame = frame + kNativeThunkFrameSize;
+    const uintptr_t slot = *reinterpret_cast<volatile const uintptr_t *>(frame);
+
+    uintptr_t top = 0;
+    const uintptr_t thread = CurrentArtThreadForProbe();
+    if (thread && g_thread_layout.valid) {
+        top = *reinterpret_cast<volatile const uintptr_t *>(
+            thread + g_thread_layout.managed_stack_offset);
+    }
+
+    const size_t index = g_native_thunk_frame_probe_count.fetch_add(
+                             1, std::memory_order_relaxed) % kFrameProbeEntries;
+    auto &entry = g_native_thunk_frame_probe[index];
+    entry.seq = index;
+    entry.frame_base = frame;
+    entry.top_quick_frame = top;
+    entry.method_slot = slot;
+    entry.jni_frame_expected = expected_jni_frame;
+    entry.tid = static_cast<uint64_t>(gettid());
+    // flags bit0: top_quick_frame agrees with frame+368 (contract holds)
+    // flags bit1: thread/ManagedStack readable
+    entry.flags = (top == expected_jni_frame ? 1u : 0u) | (thread ? 2u : 0u);
+
+    // Log the first few entries whether or not the contract holds: an absent
+    // warning would otherwise be ambiguous between "geometry is fine" and
+    // "probe never ran".
+    {
+        static std::atomic<uint32_t> sampled{0};
+        const uint32_t n = sampled.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 4) {
+            LOGI("WxShadow ART frame probe: top_quick_frame={} frame={} expected={} "
+                 "delta={} slot={} tid={} n={}",
+                 reinterpret_cast<void *>(top), reinterpret_cast<void *>(frame),
+                 reinterpret_cast<void *>(expected_jni_frame),
+                 static_cast<long>(top - frame), reinterpret_cast<void *>(slot),
+                 static_cast<long>(gettid()), n);
+        }
+    }
+    // A violation is the finding, not the noise: on a healthy device every entry
+    // satisfies top_quick_frame == frame + 368.
+    if (thread && top && top != expected_jni_frame) {
+        static std::atomic<uint32_t> reported{0};
+        const uint32_t n = reported.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 8) {
+            LOGW("WxShadow ART frame probe MISMATCH: top_quick_frame={} frame={} "
+                 "expected={} delta={} slot={} tid={} n={}",
+                 reinterpret_cast<void *>(top), reinterpret_cast<void *>(frame),
+                 reinterpret_cast<void *>(expected_jni_frame),
+                 static_cast<long>(top - frame), reinterpret_cast<void *>(slot),
+                 static_cast<long>(gettid()), n);
+        }
+    }
+#else
+    (void)ctx;
+#endif
+}
+
+size_t ReadNativeThunkFrameProbe(uint64_t *out, size_t capacity) {
+    if (!out) return 0;
+    const size_t written = std::min(g_native_thunk_frame_probe_count.load(), kFrameProbeEntries);
+    const size_t n = std::min(written, capacity / kFrameProbeStride);
+    auto *words = reinterpret_cast<const uint64_t *>(g_native_thunk_frame_probe);
+    std::memcpy(out, words, n * kFrameProbeStride * sizeof(uint64_t));
+    return n;
+}
+
 MethodState::~MethodState() {
 #if defined(__aarch64__)
     UnregisterActiveState(this);
