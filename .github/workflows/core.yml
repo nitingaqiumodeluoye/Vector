@@ -33,6 +33,10 @@ jobs:
       CCACHE_NOHASHDIR: "true"
       CCACHE_HARDLINK: "true"
       CCACHE_BASEDIR: "${{ github.workspace }}"
+      # Bound the directory the workflow uploads at the end of every run. ccache is
+      # content addressed and evaluates its own entries, so this only caps how much
+      # is stored and transferred; it never causes a miss that correctness depends on.
+      CCACHE_MAXSIZE: "1G"
 
     steps:
       - name: Checkout
@@ -97,6 +101,12 @@ jobs:
         run: |
           echo 'android.native.buildOutput=verbose' >> ~/.gradle/gradle.properties
           echo 'org.gradle.parallel=true' >> ~/.gradle/gradle.properties
+          # Reuse task outputs across runs instead of only across builds in one run.
+          # Without this Gradle never consults its build cache, so every workflow
+          # re-executed every task whose inputs had not changed. setup-gradle already
+          # persists ~/.gradle/caches/build-cache-1, so this is what makes that
+          # persistent cache actually get used.
+          echo 'org.gradle.caching=true' >> ~/.gradle/gradle.properties
           echo 'org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8 -XX:+UseParallelGC' >> ~/.gradle/gradle.properties
 
       - name: Setup ninja
@@ -110,9 +120,17 @@ jobs:
           path: |
             ~/.ccache
             ${{ github.workspace }}/.ccache
-          key: ${{ runner.os }}-ccache-${{ hashFiles('**/build.gradle') }}-${{ hashFiles('**/CMakeLists.txt') }}
+          # Rolling key over the inputs ccache actually hashes. It has to change when
+          # those change, otherwise actions/cache keeps the entry it saved first and
+          # never stores newer objects: a cache keyed on a file that does not exist in
+          # this repository (the old key hashed **/build.gradle, while every module
+          # here uses build.gradle.kts) produced a constant key, so the entry was
+          # written once and never updated again. restore-keys falls back to the most
+          # recent entry whenever the exact key misses, so unchanged translation units
+          # still hit while the newly compiled ones get added for next time.
+          key: ccache-${{ runner.os }}-${{ hashFiles('native/**/*.c', 'native/**/*.cc', 'native/**/*.cpp', 'native/**/*.h', 'native/**/*.hpp', 'external/**/*.c', 'external/**/*.cc', 'external/**/*.cpp', 'external/**/*.h', 'external/**/*.hpp', '**/CMakeLists.txt', '**/*.cmake') }}
           restore-keys: |
-            ${{ runner.os }}-ccache-
+            ccache-${{ runner.os }}-
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
@@ -124,6 +142,17 @@ jobs:
       - name: Build with Gradle
         run: |
           ./gradlew zipAll
+
+      # Printed even when the build above fails, because the hit rate is the whole
+      # reason the ccache step exists and a regression there is invisible otherwise.
+      - name: Report ccache statistics
+        if: always()
+        run: |
+          if command -v ccache >/dev/null 2>&1; then
+            ccache --show-stats --verbose || true
+          else
+            echo 'ccache is not installed; native builds ran without it.'
+          fi
 
       - name: Prepare artifact
         if: success()

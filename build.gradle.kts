@@ -3,11 +3,24 @@ import com.android.build.api.dsl.CommonExtension
 import com.android.build.gradle.api.AndroidBasePlugin
 import com.ncorti.ktfmt.gradle.tasks.KtfmtFormatTask
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.nio.file.Paths
 import javax.inject.Inject
 import org.gradle.api.provider.Property
 import org.gradle.api.provider.ValueSource
 import org.gradle.api.provider.ValueSourceParameters
 import org.gradle.process.ExecOperations
+
+/** Absolute path of an executable on PATH, or null when it is absent. */
+fun findInPath(executable: String): String? =
+    (System.getenv("PATH") ?: "")
+        .split(File.pathSeparator)
+        .filter { it.isNotEmpty() }
+        .map { folder ->
+            Paths.get(folder, executable + if (org.gradle.internal.os.OperatingSystem.current().isWindows) ".exe" else "").toFile()
+        }
+        .firstOrNull { it.exists() }
+        ?.absolutePath
 
 plugins {
     alias(libs.plugins.agp.lib) apply false
@@ -304,13 +317,26 @@ subprojects {
                     )
 
                 val args =
-                    listOf(
-                        "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
-                        "-DVECTOR_ROOT=${rootDir.absolutePath}",
+                    buildList {
+                        add("-DCMAKE_EXPORT_COMPILE_COMMANDS=ON")
+                        add("-DVECTOR_ROOT=${rootDir.absolutePath}")
                         // Enforce 16 KB page size alignment for Android 15+ compatibility
-                        "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,-z,max-page-size=16384",
-                        "-DCMAKE_EXE_LINKER_FLAGS=-Wl,-z,max-page-size=16384",
-                    )
+                        add("-DCMAKE_SHARED_LINKER_FLAGS=-Wl,-z,max-page-size=16384")
+                        add("-DCMAKE_EXE_LINKER_FLAGS=-Wl,-z,max-page-size=16384")
+                        // Route every translation unit through ccache.
+                        //
+                        // The bundled libraries under external/ already do this in their own
+                        // CMakeLists, but Vector's own native sources did not, so every run of
+                        // the Core workflow recompiled all ~17k lines of them even when a single
+                        // diagnostics line changed. Setting the compiler launcher here covers
+                        // every externalNativeBuild target of this module at once.
+                        //
+                        // Guarded on presence so a machine without ccache still builds.
+                        findInPath("ccache")?.let { ccache ->
+                            add("-DCMAKE_C_COMPILER_LAUNCHER=$ccache")
+                            add("-DCMAKE_CXX_COMPILER_LAUNCHER=$ccache")
+                        }
+                    }
 
                 externalNativeBuild {
                     cmake {
