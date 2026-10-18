@@ -3136,7 +3136,25 @@ void SetManagerProcess(bool is_manager) {
 constexpr size_t kNativeThunkMethodSlotSize = 16;
 constexpr size_t kNativeThunkFrameSize = 368;
 constexpr size_t kFrameProbeEntries = 32;
-constexpr size_t kFrameProbeStride = 16;  // seq..flags(7) + tail[8] + pad
+constexpr size_t kFrameProbeStride = 72;  // 7 scalars + tail[8] + 8 chain hops of 7
+// ManagedStack::link_ follows top_quick_frame_ on API >= 23 (rustFrida
+// art_thread.rs get_managed_stack_spec). The offset is relative to the
+// ManagedStack, which is embedded at Thread+managed_stack_offset.
+constexpr size_t kManagedStackLinkOffset = 8;
+// How many ManagedStack fragments to follow before giving up. A hook nested a
+// few levels deep is normal; a long chain means we are chasing garbage.
+constexpr size_t kMaxManagedStackFragments = 8;
+
+// One fragment of the walker's chain, captured in the same ring entry.
+struct FrameChainHop {
+    uint64_t fragment;       // ManagedStack* itself
+    uint64_t top_raw;        // fragment->top_quick_frame_ (tagged)
+    uint64_t frame;          // top_raw with bit0 cleared
+    uint64_t frame_method;   // *(frame) - the ArtMethod the walker would use
+    uint64_t frame_size;     // size ART advances by, when derivable; else 0
+    uint64_t flags;          // bit0: readable, bit1: equals our baked slot
+    uint64_t reserved;
+};
 
 struct FrameProbeEntry {
     uint64_t seq;
@@ -3152,6 +3170,11 @@ struct FrameProbeEntry {
     // 384 bytes instead of our declared 368.
     uint64_t tail[8];
     uint64_t reserved;
+    // The walker's ManagedStack chain, captured at call time. This is the part
+    // that matters now: the probe already proved our own [sp+0] holds a valid
+    // ArtMethod, yet the crashes dereference a stack address as a method, so the
+    // bad frame is somewhere in this chain and not in our slot.
+    FrameChainHop chain[kMaxManagedStackFragments];
 };
 
 static_assert(sizeof(FrameProbeEntry) == kFrameProbeStride * sizeof(uint64_t),
@@ -3274,12 +3297,57 @@ void ProbeNativeThunkFrame(HookContext *ctx, bool native_entry_route) {
 
     // Capture the tail now: after the thunk returns the stack is reused, so a
     // post-mortem read records whatever took its place (verified on device).
-    for (size_t i = 0; i < 7; ++i) {
+    for (size_t i = 0; i < 8; ++i) {
         entry.tail[i] = *reinterpret_cast<volatile const uint64_t *>(
             frame + 352 + i * sizeof(uint64_t));
     }
-    // tail[7] repurposed: the method the walker would read at its own frame.
-    entry.tail[7] = top_method;
+
+    // ---------------------------------------------------------------------
+    // Walk the ManagedStack chain the stack walker will follow.
+    //
+    // Our own slot is already known to hold a valid ArtMethod, so the bogus
+    // method the crashes dereference has to come from another hop. Record, per
+    // fragment: the frame pointer, the ArtMethod stored there, and whether that
+    // method is one of ours. A hop whose method is a stack address is exactly
+    // the tombstone_10 shape (PrettyMethod on 0x77ff0a4790).
+    // ---------------------------------------------------------------------
+    for (auto &hop : entry.chain) hop = FrameChainHop{};
+    if (thread && g_thread_layout.valid) {
+        uintptr_t fragment = thread + g_thread_layout.managed_stack_offset;
+        for (size_t i = 0; i < kMaxManagedStackFragments; ++i) {
+            if (!fragment) break;
+            auto &hop = entry.chain[i];
+            hop.fragment = fragment;
+            const uintptr_t raw = *reinterpret_cast<volatile const uintptr_t *>(fragment);
+            hop.top_raw = raw;
+            const uintptr_t hop_frame = raw & ~uintptr_t{1};
+            hop.frame = hop_frame;
+            // Only dereference when it looks like this thread's stack, same rule
+            // as above: no IsReadable(), this path must not touch /proc.
+            const bool plausible =
+                hop_frame > 0x1000 &&
+                (hop_frame > frame ? (hop_frame - frame) < (8u * 1024u * 1024u)
+                                   : (frame - hop_frame) < (8u * 1024u * 1024u));
+            if (plausible) {
+                hop.frame_method = *reinterpret_cast<volatile const uintptr_t *>(hop_frame);
+                hop.flags = 1u;
+                if (!native_entry_route && slot &&
+                    (hop.frame_method == slot ||
+                     (hop.frame_method & kPacStripMask) == (slot & kPacStripMask))) {
+                    hop.flags |= 2u;
+                }
+            }
+            // Advance to the previous ManagedStack fragment.
+            const uintptr_t next =
+                *reinterpret_cast<volatile const uintptr_t *>(fragment +
+                                                              kManagedStackLinkOffset);
+            // link_ is a real pointer (not a frame pointer), but it can be
+            // tagged on some builds; keep the low 48 bits like every other read.
+            const uintptr_t next_clean = next & kPacStripMask;
+            if (!next_clean || next_clean == fragment) break;
+            fragment = next_clean;
+        }
+    }
 
     // Log the first few entries whether or not the geometry holds: an absent
     // warning would otherwise be ambiguous between "geometry is fine" and
@@ -3317,22 +3385,43 @@ void ProbeNativeThunkFrame(HookContext *ctx, bool native_entry_route) {
         }
     }
 
-    // The real finding: ART's own frame does not hold the ArtMethod we published.
-    // Dump the whole region so the writer can be identified from one log line.
-    if (!native_entry_route && slot && top && top_method != slot) {
-        static std::atomic<uint32_t> bad{0};
-        const uint32_t n = bad.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (n <= 8) {
-            LOGW("WxShadow ART frame probe METHOD LOST: slot={} top_method={} "
-                 "slot_masked={} masked_match={} frame={} top={} tid={} n={}",
-                 reinterpret_cast<void *>(slot), reinterpret_cast<void *>(top_method),
-                 reinterpret_cast<void *>(slot & kPacStripMask),
-                 (top_method == (slot & kPacStripMask)) ? "yes" : "no",
-                 reinterpret_cast<void *>(frame), reinterpret_cast<void *>(top),
-                 static_cast<long>(gettid()), n);
-            for (size_t i = 0; i < 8; ++i) {
-                LOGW("WxShadow ART frame probe   tail[{}] frame+0x{:x} = {}", i,
-                     352 + i * 8, reinterpret_cast<void *>(entry.tail[i]));
+    // Dump the ManagedStack chain. This replaces the earlier "METHOD LOST"
+    // alarm, which compared a top-byte-tagged slot value with the hardware-
+    // ignored read-back: under TBI (tagged_addr_ctrl=1) b4000079918d3d90 and
+    // 79918d3d90 are the same address, so that alarm fired on healthy frames.
+    // What actually matters is where in the chain the method stops being an
+    // ArtMethod.
+    {
+        static std::atomic<uint32_t> chain_logged{0};
+        const uint32_t n = chain_logged.fetch_add(1, std::memory_order_relaxed) + 1;
+        // Log the first few calls, then only calls whose chain contains a hop
+        // holding a non-ArtMethod-looking value (a stack address).
+        bool suspicious = false;
+        const uintptr_t lo = frame > (8u * 1024u * 1024u) ? frame - (8u * 1024u * 1024u) : 0;
+        const uintptr_t hi = frame + (8u * 1024u * 1024u);
+        for (const auto &hop : entry.chain) {
+            if (!hop.fragment || !(hop.flags & 1u)) continue;
+            if (hop.flags & 2u) continue;  // it is one of our own ArtMethods
+            const uintptr_t m = hop.frame_method & kPacStripMask;
+            // A "method" that lands in this thread's own stack is the direct
+            // signature of the tombstone_10 crash (PrettyMethod on a stack
+            // address), and is never legitimate.
+            if (m >= lo && m <= hi) suspicious = true;
+        }
+        if (n <= 4 || suspicious) {
+            LOGW("WxShadow ART frame probe CHAIN: tid={} our_frame={} slot={} hops={} susp={} n={}",
+                 static_cast<long>(gettid()), reinterpret_cast<void *>(frame),
+                 reinterpret_cast<void *>(slot), static_cast<int>(kMaxManagedStackFragments),
+                 suspicious ? "yes" : "no", n);
+            for (size_t i = 0; i < kMaxManagedStackFragments; ++i) {
+                const auto &hop = entry.chain[i];
+                if (!hop.fragment) break;
+                LOGW("WxShadow ART frame probe   hop[{}] frag={} top={} frame={} method={} ours={}",
+                     i, reinterpret_cast<void *>(hop.fragment),
+                     reinterpret_cast<void *>(hop.top_raw),
+                     reinterpret_cast<void *>(hop.frame),
+                     reinterpret_cast<void *>(hop.frame_method),
+                     (hop.flags & 2u) ? "yes" : "no");
             }
         }
     }
