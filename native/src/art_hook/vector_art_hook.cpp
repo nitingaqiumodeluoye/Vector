@@ -3264,8 +3264,12 @@ void ProbeNativeThunkFrame(HookContext *ctx, bool native_entry_route) {
     // flags bit2: registered-native-entry route (no method slot, 352 by design)
     // flags bit3: the walker's own frame holds our replacement method (i.e. ART
     //             is looking at THIS frame, not some other one)
-    entry.flags = (top == expected_jni_frame ? 1u : 0u) | (thread ? 2u : 0u) |
-                  (native_entry_route ? 4u : 0u) |
+    // flags bit0 compares the UNTAGGED frame pointer: TopQuickFrame carries a
+    // tag in bit0 (and, as measured, the raw value is odd), so comparing the raw
+    // pointer against an aligned expected address was always false and produced a
+    // spurious MISMATCH on every single call.
+    entry.flags = ((top & ~uintptr_t{1}) == expected_jni_frame ? 1u : 0u) |
+                  (thread ? 2u : 0u) | (native_entry_route ? 4u : 0u) |
                   (!native_entry_route && slot && top_method == slot ? 8u : 0u);
 
     // Capture the tail now: after the thunk returns the stack is reused, so a
@@ -3296,20 +3300,40 @@ void ProbeNativeThunkFrame(HookContext *ctx, bool native_entry_route) {
                  static_cast<long>(gettid()), n);
         }
     }
-    // A violation is the finding, not the noise: on a healthy device every entry
-    // satisfies top_quick_frame == frame + the size we declare.
-    if (thread && top && top != expected_jni_frame) {
+    // Geometry violation only: compare the untagged pointer, otherwise the tag
+    // bit makes this fire on every call.
+    if (thread && top && (top & ~uintptr_t{1}) != expected_jni_frame) {
         static std::atomic<uint32_t> reported{0};
         const uint32_t n = reported.fetch_add(1, std::memory_order_relaxed) + 1;
         if (n <= 8) {
-            LOGW("WxShadow ART frame probe MISMATCH: route={} top_quick_frame={} frame={} "
+            LOGW("WxShadow ART frame probe GEOMETRY: route={} top_quick_frame={} frame={} "
                  "declared={} expected={} delta={} slot={} tid={} n={}",
                  native_entry_route ? "native_entry" : "trampoline",
                  reinterpret_cast<void *>(top), reinterpret_cast<void *>(frame),
                  static_cast<unsigned long>(declared),
                  reinterpret_cast<void *>(expected_jni_frame),
-                 static_cast<long>(top - frame), reinterpret_cast<void *>(slot),
+                 static_cast<long>((top & ~uintptr_t{1}) - frame),
+                 reinterpret_cast<void *>(slot), static_cast<long>(gettid()), n);
+        }
+    }
+
+    // The real finding: ART's own frame does not hold the ArtMethod we published.
+    // Dump the whole region so the writer can be identified from one log line.
+    if (!native_entry_route && slot && top && top_method != slot) {
+        static std::atomic<uint32_t> bad{0};
+        const uint32_t n = bad.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 8) {
+            LOGW("WxShadow ART frame probe METHOD LOST: slot={} top_method={} "
+                 "slot_masked={} masked_match={} frame={} top={} tid={} n={}",
+                 reinterpret_cast<void *>(slot), reinterpret_cast<void *>(top_method),
+                 reinterpret_cast<void *>(slot & kPacStripMask),
+                 (top_method == (slot & kPacStripMask)) ? "yes" : "no",
+                 reinterpret_cast<void *>(frame), reinterpret_cast<void *>(top),
                  static_cast<long>(gettid()), n);
+            for (size_t i = 0; i < 8; ++i) {
+                LOGW("WxShadow ART frame probe   tail[{}] frame+0x{:x} = {}", i,
+                     352 + i * 8, reinterpret_cast<void *>(entry.tail[i]));
+            }
         }
     }
 #else
