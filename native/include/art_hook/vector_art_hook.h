@@ -134,8 +134,12 @@ bool Deoptimize(JNIEnv *env, const MethodState &state);
  * ART cannot advance from the JNI frame onto our frame and will read whatever
  * the wrong offset happens to contain instead of an ArtMethod.
  *
+ * native_entry_route selects between the two frame shapes: the native
+ * trampoline's 368-byte frame (16-byte method slot + 352-byte HookContext) and
+ * the registered-native-entry route's 352-byte frame with no method slot.
+ *
  * Does nothing (and costs one predictable branch) when the property is unset. */
-void ProbeNativeThunkFrame(HookContext *ctx);
+void ProbeNativeThunkFrame(HookContext *ctx, bool native_entry_route);
 
 /** Copies the probe ring out for post-mortem analysis. Returns the number of
  * entries written; safe to call at any time. */

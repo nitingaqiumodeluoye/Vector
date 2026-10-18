@@ -691,14 +691,15 @@ static uint64_t ReadNativeArgument(HookContext *ctx, const ValueKind kind, size_
 
 static void VectorArtHookCallback(HookContext *ctx, void *raw_user_data) {
     if (!ctx || !raw_user_data) return;
-    // Diagnostic: verifies the one geometric contract the ART stack walker relies
-    // on (JNI frame published as top_quick_frame_ == our 368-byte frame + 224).
-    // No-op unless debug.vector.art.frame_probe is set.
-    art::ProbeNativeThunkFrame(ctx);
     auto target = reinterpret_cast<jmethodID>(raw_user_data);
     HookItem *item = nullptr;
     hooked_methods.if_contains(target, [&item](const auto &entry) { item = entry.second.get(); });
     auto *state = item ? item->art_state_ptr.load(std::memory_order_acquire) : nullptr;
+    // Diagnostic: verify the frame geometry the ART stack walker relies on.
+    // Done after `state` is known because the two hook routes have different
+    // frame shapes (native trampoline 368 B with a method slot; registered
+    // native entry 352 B without one). No-op when the property is unset.
+    art::ProbeNativeThunkFrame(ctx, state != nullptr && state->native_entry_hook);
     if (!item || !state || !item->hooker_object || !item->hooker_callback) {
         // 回调只会为已注册 hook 的方法进入；走到这里说明路由命中了注册项但状态已失效，
         // 静默回退会掩盖 dispatch 问题（如 AppAttachHooker 不触发类问题），留痕。

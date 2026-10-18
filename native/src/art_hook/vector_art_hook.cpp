@@ -3136,7 +3136,7 @@ void SetManagerProcess(bool is_manager) {
 constexpr size_t kNativeThunkMethodSlotSize = 16;
 constexpr size_t kNativeThunkFrameSize = 368;
 constexpr size_t kFrameProbeEntries = 32;
-constexpr size_t kFrameProbeStride = 8;
+constexpr size_t kFrameProbeStride = 16;  // seq..flags(7) + tail[8] + pad
 
 struct FrameProbeEntry {
     uint64_t seq;
@@ -3146,6 +3146,11 @@ struct FrameProbeEntry {
     uint64_t jni_frame_expected;
     uint64_t tid;
     uint64_t flags;
+    // Frame tail captured AT CALL TIME. Reading these afterwards is useless:
+    // the stack is already unwound and reused (verified on device). These are
+    // frame+0x160..0x1a0, i.e. the region ART would land on if it advances by
+    // 384 bytes instead of our declared 368.
+    uint64_t tail[8];
     uint64_t reserved;
 };
 
@@ -3184,14 +3189,22 @@ bool FrameProbeEnabled() {
     return true;
 }
 
-void ProbeNativeThunkFrame(HookContext *ctx) {
+void ProbeNativeThunkFrame(HookContext *ctx, bool native_entry_route) {
 #if defined(__aarch64__)
     if (!ctx) return;
     if (!FrameProbeEnabled()) return;
 
-    const uintptr_t frame = reinterpret_cast<uintptr_t>(ctx) - kNativeThunkMethodSlotSize;
-    const uintptr_t expected_jni_frame = frame + kNativeThunkFrameSize;
-    const uintptr_t slot = *reinterpret_cast<volatile const uintptr_t *>(frame);
+    // The native trampoline frame starts 16 bytes before the HookContext
+    // (reserved method slot). The registered-native-entry route has no such
+    // slot, so the base and the declared size are both different: probing it
+    // with the trampoline numbers produced a false "slot == 0" alarm.
+    const uintptr_t frame = reinterpret_cast<uintptr_t>(ctx) -
+                            (native_entry_route ? 0 : kNativeThunkMethodSlotSize);
+    const uintptr_t declared = native_entry_route ? 352 : kNativeThunkFrameSize;
+    const uintptr_t expected_jni_frame = frame + declared;
+    const uintptr_t slot = native_entry_route
+                               ? 0
+                               : *reinterpret_cast<volatile const uintptr_t *>(frame);
 
     uintptr_t top = 0;
     const uintptr_t thread = CurrentArtThreadForProbe();
@@ -3209,34 +3222,47 @@ void ProbeNativeThunkFrame(HookContext *ctx) {
     entry.method_slot = slot;
     entry.jni_frame_expected = expected_jni_frame;
     entry.tid = static_cast<uint64_t>(gettid());
-    // flags bit0: top_quick_frame agrees with frame+368 (contract holds)
+    // flags bit0: top_quick_frame agrees with the frame size we declare
     // flags bit1: thread/ManagedStack readable
-    entry.flags = (top == expected_jni_frame ? 1u : 0u) | (thread ? 2u : 0u);
+    // flags bit2: registered-native-entry route (no method slot, 352 by design)
+    entry.flags = (top == expected_jni_frame ? 1u : 0u) | (thread ? 2u : 0u) |
+                  (native_entry_route ? 4u : 0u);
 
-    // Log the first few entries whether or not the contract holds: an absent
+    // Capture the tail now: after the thunk returns the stack is reused, so a
+    // post-mortem read records whatever took its place (verified on device).
+    for (size_t i = 0; i < 8; ++i) {
+        entry.tail[i] = *reinterpret_cast<volatile const uint64_t *>(
+            frame + 352 + i * sizeof(uint64_t));
+    }
+
+    // Log the first few entries whether or not the geometry holds: an absent
     // warning would otherwise be ambiguous between "geometry is fine" and
     // "probe never ran".
     {
         static std::atomic<uint32_t> sampled{0};
         const uint32_t n = sampled.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (n <= 4) {
-            LOGI("WxShadow ART frame probe: top_quick_frame={} frame={} expected={} "
-                 "delta={} slot={} tid={} n={}",
+        if (n <= 6) {
+            LOGI("WxShadow ART frame probe: route={} top_quick_frame={} frame={} "
+                 "declared={} expected={} delta={} slot={} tid={} n={}",
+                 native_entry_route ? "native_entry" : "trampoline",
                  reinterpret_cast<void *>(top), reinterpret_cast<void *>(frame),
+                 static_cast<unsigned long>(declared),
                  reinterpret_cast<void *>(expected_jni_frame),
                  static_cast<long>(top - frame), reinterpret_cast<void *>(slot),
                  static_cast<long>(gettid()), n);
         }
     }
     // A violation is the finding, not the noise: on a healthy device every entry
-    // satisfies top_quick_frame == frame + 368.
+    // satisfies top_quick_frame == frame + the size we declare.
     if (thread && top && top != expected_jni_frame) {
         static std::atomic<uint32_t> reported{0};
         const uint32_t n = reported.fetch_add(1, std::memory_order_relaxed) + 1;
         if (n <= 8) {
-            LOGW("WxShadow ART frame probe MISMATCH: top_quick_frame={} frame={} "
-                 "expected={} delta={} slot={} tid={} n={}",
+            LOGW("WxShadow ART frame probe MISMATCH: route={} top_quick_frame={} frame={} "
+                 "declared={} expected={} delta={} slot={} tid={} n={}",
+                 native_entry_route ? "native_entry" : "trampoline",
                  reinterpret_cast<void *>(top), reinterpret_cast<void *>(frame),
+                 static_cast<unsigned long>(declared),
                  reinterpret_cast<void *>(expected_jni_frame),
                  static_cast<long>(top - frame), reinterpret_cast<void *>(slot),
                  static_cast<long>(gettid()), n);
@@ -3244,6 +3270,7 @@ void ProbeNativeThunkFrame(HookContext *ctx) {
     }
 #else
     (void)ctx;
+    (void)native_entry_route;
 #endif
 }
 
