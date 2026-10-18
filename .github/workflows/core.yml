@@ -114,7 +114,23 @@ jobs:
         with:
           version: 1.13.2
 
-      - name: Setup ccache
+      # Installs nothing - actions/cache only restores and saves a directory. The step
+      # that used to be here was named "Setup ccache" but did exactly this, while the
+      # runner has no ccache installed: the previous run's own summary said
+      #   "ccache is not installed; native builds ran without it."
+      # so the directory it restored was always empty and every native file was
+      # recompiled on every run. Install first, then restore.
+      - name: Install ccache
+        run: |
+          if command -v ccache >/dev/null 2>&1; then
+            echo "ccache already present: $(ccache --version | head -n 1)"
+          else
+            sudo apt-get update -qq || true
+            sudo apt-get install -y -qq ccache
+            ccache --version | head -n 1
+          fi
+
+      - name: Restore ccache directory
         uses: actions/cache@v6
         with:
           path: |
