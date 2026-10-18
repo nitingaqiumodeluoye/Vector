@@ -93,8 +93,18 @@ static void emit_store_replacement_for_stackvisitor(Arm64Writer* w, uint64_t ori
     uint64_t lbl_found = arm64_writer_new_label_id(w);
     uint64_t lbl_done = arm64_writer_new_label_id(w);
 
-    /* Default to 0; normal path below overwrites with replacement ArtMethod*. */
-    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_XZR, ARM64_REG_SP, 0);
+    /* Default to the ArtMethod we were entered with (x0), never 0.
+     *
+     * Measured (tombstone_06, Hunter 2.1.21): a miss in this scan left SP+0 at
+     * 0, ART's WalkStack then did `ldr w20,[x24,#4]` on a NULL ArtMethod and
+     * faulted at 0x4; TryHandleNullOatHeader rewrote x24 to g_dummy_oat_header,
+     * so the rest of the walk ran on a fake method and ended in
+     * CHECK(existing_entry_point != nullptr) -> PrettyMethod(dummy) -> SEGV.
+     * A miss is reachable whenever the entry is gone from g_art_router_table
+     * (hook removed, table compacted concurrently, stale baked key), and the
+     * generic JNI trampoline always enters here with x0 = the replacement
+     * ArtMethod*, which is exactly what the hit path writes below. */
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_SP, 0);
 
     arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, (uint64_t)g_art_router_table);
     arm64_writer_put_label(w, lbl_loop);

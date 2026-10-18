@@ -2352,6 +2352,16 @@ alignas(16) std::array<uint8_t, 64> g_dummy_oat_header{};
 
 size_t g_decode_gc_masks_guard_ready = 0;
 
+/* Resolved (symbol- and module-validated) address of
+ * art::CodeInfo::DecodeGcMasksOnly. It is the only function on this device
+ * where a NULL OatQuickMethodHeader* is expected as an argument, so it is the
+ * only place TryHandleNullOatHeader may substitute g_dummy_oat_header.
+ * InitializeDecodeGcMasksGuard locates its header load inside the first
+ * kDecodeGcMasksLoadWindow bytes of the function; the signal fallback reuses
+ * exactly that window instead of guessing a function size. */
+std::atomic<uintptr_t> g_decode_gc_masks_symbol{0};
+constexpr uintptr_t kDecodeGcMasksLoadWindow = 0x80;
+
 /**
  * rustFrida parity —— **主动**版 NULL OatQuickMethodHeader 防护。
  *
@@ -2413,6 +2423,12 @@ size_t InitializeDecodeGcMasksGuard() {
 
     // 函数内第一条 `ldr w?, [x0]`（encoding 0xB9400000 | Rt，imm12 = 0，Rn = 0）。
     // 走到这里说明符号地址正确；再核对 prologue 头两字，避免符号表漂移导致乱挂。
+    //
+    // Publish the address as soon as it is symbol-validated: TryHandleNullOatHeader
+    // must recognise "this fault PC is inside DecodeGcMasksOnly" even when the
+    // prologue check below fails (measured on this device: p1=0xa9016ffc), which is
+    // precisely the case where no attach guard protects the NULL header.
+    g_decode_gc_masks_symbol.store(entry, std::memory_order_release);
     auto *const code = reinterpret_cast<const uint8_t *>(entry);
     const uint32_t p0 = *reinterpret_cast<const uint32_t *>(code);
     const uint32_t p1 = *reinterpret_cast<const uint32_t *>(code + 4);
@@ -2422,7 +2438,7 @@ size_t InitializeDecodeGcMasksGuard() {
     }
 
     uintptr_t target = 0;
-    for (size_t off = 8; off + 4 <= 0x80; off += 4) {
+    for (size_t off = 8; off + 4 <= kDecodeGcMasksLoadWindow; off += 4) {
         const uint32_t insn = *reinterpret_cast<const uint32_t *>(code + off);
         if ((insn & 0xffc00000u) == 0xb9400000u && ((insn >> 5) & 0x1fu) == 0u &&
             ((insn >> 0) & 0x1fu) <= 30u) {
@@ -2505,6 +2521,27 @@ bool TryHandleNullOatHeader(int signal, siginfo_t *info, void *raw_context) {
     auto *context = reinterpret_cast<ucontext_t *>(raw_context);
     auto &machine = context->uc_mcontext;
     const auto pc = static_cast<uintptr_t>(machine.pc) & kPacStripMask;
+
+    /* Ownership gate (measured regression, tombstone_06).
+     *
+     * Without it, ANY `ldr w?/h?/b?,[Xr]` with Xr==0 whose fault lands in the
+     * first 64 bytes was rewritten to the dummy header. ART's WalkStack has
+     * exactly that shape on a corrupt quick frame:
+     *   0x647a5c  ldr w20, [x24, #4]   // x24 = NULL ArtMethod* -> fault 0x4
+     * so the walker was handed g_dummy_oat_header as the method, and the
+     * resulting CHECK(existing_entry_point != nullptr) ran PrettyMethod on a
+     * fake method whose DexFile* is 0. That turned a (survivable, diagnosable)
+     * bad frame into a second, fatal crash inside ART's error path.
+     *
+     * Only art::CodeInfo::DecodeGcMasksOnly legitimately receives a NULL
+     * OatQuickMethodHeader*, so only faults inside that function's header-load
+     * window may be repaired. Everything else is left to the real handler. */
+    const auto decode_gc_masks = g_decode_gc_masks_symbol.load(std::memory_order_acquire);
+    if (!decode_gc_masks || pc < decode_gc_masks ||
+        pc >= decode_gc_masks + kDecodeGcMasksLoadWindow) {
+        return false;
+    }
+
     if (pc && (pc & 3u) == 0) {
         const auto instruction = *reinterpret_cast<volatile const uint32_t *>(pc);
         const int base = Arm64LoadUnsignedBaseRegister(instruction);
