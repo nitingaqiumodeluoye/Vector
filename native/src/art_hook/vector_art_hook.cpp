@@ -3172,11 +3172,15 @@ uintptr_t CurrentArtThreadForProbe() {
 bool FrameProbeEnabled() {
     const bool cached = g_frame_probe_state.load(std::memory_order_relaxed);
     if (cached) return true;
+    // Enabled by default because this build is a diagnostic drop: the whole point
+    // is that the geometry is recorded before a crash takes the process away.
+    // debug.vector.art.frame_probe=0 turns it off again.
     char value[PROP_VALUE_MAX] = {};
-    if (__system_property_get("debug.vector.art.frame_probe", value) <= 0) return false;
-    if (value[0] == '0' || value[0] == '\0') return false;
+    if (__system_property_get("debug.vector.art.frame_probe", value) > 0 && value[0] == '0') {
+        return false;
+    }
     g_frame_probe_state.store(true, std::memory_order_relaxed);
-    LOGI("WxShadow ART frame probe enabled (debug.vector.art.frame_probe)");
+    LOGI("WxShadow ART frame probe enabled (set debug.vector.art.frame_probe=0 to disable)");
     return true;
 }
 
