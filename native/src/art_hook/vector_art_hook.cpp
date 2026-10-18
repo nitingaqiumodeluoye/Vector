@@ -1330,12 +1330,55 @@ void MaybeLogStackMethodOatLookup(uintptr_t method, uintptr_t lr) {
          static_cast<long>(gettid()), n);
 }
 
+// A dex method index that large cannot belong to any real dex file. ART reaches
+// this state when it treats something that is not an ArtMethod as one: it reads
+// access_flags_ at +4 (finding "not native") and dex_method_index_ at +8
+// (finding garbage), then FindOatMethodFor aborts with
+//   Check failed: found_virtual Didn't find oat method index for virtual method
+//   <<invalid-method-idx-NNN>>
+// Observed values: 351803424, 349474360, 345416752. Valid indices in these apps
+// are in the low hundreds of thousands.
+constexpr uint32_t kImplausibleDexMethodIndex = 0x01000000u;
+
+void MaybeLogImplausibleMethodIndex(uintptr_t method, uintptr_t lr) {
+    if (!method) return;
+    // Every address an app can map on this device lives in this range, so the
+    // two reads below cannot fault on an unmapped hole in practice.
+    if (method < 0x7000000000ull || method >= 0x8000000000ull) return;
+    const auto flags = *reinterpret_cast<volatile const uint32_t *>(method + 4);
+    const auto index = *reinterpret_cast<volatile const uint32_t *>(method + 8);
+    if (index < kImplausibleDexMethodIndex) return;
+
+    static std::atomic<uint32_t> reported{0};
+    const uint32_t n = reported.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n > 16) return;
+
+    uintptr_t thread = 0;
+#if defined(__aarch64__)
+    uintptr_t tls = 0;
+    asm volatile("mrs %0, tpidr_el0" : "=r"(tls));
+    if (tls) {
+        thread = *reinterpret_cast<volatile const uintptr_t *>(tls + 7 * sizeof(uintptr_t)) &
+                 kPacStripMask;
+    }
+#endif
+    // Distinguish "the frame held art::Thread*" (seen before: tid at +0xC,
+    // jni_env at +0xD0) from "the frame held some other non-method value".
+    const bool looks_like_thread = thread && (method & kPacStripMask) == thread;
+    LOGW("WxShadow ART OAT lookup got a NON-ArtMethod: method={} flags=0x{:x} idx={} "
+         "is_thread={} lr={} thread={} tid={} n={}",
+         reinterpret_cast<void *>(method), flags, index,
+         looks_like_thread ? "yes" : "no", reinterpret_cast<void *>(lr),
+         reinterpret_cast<void *>(thread), static_cast<long>(gettid()), n);
+}
+
 void OnGetOatQuickMethodHeader(HookContext *ctx, void *) {
     if (!ctx) return;
     const auto method = ctx->x[0] & kPacStripMask;
     const auto pc = ctx->x[1] & kPacStripMask;
 
     MaybeLogStackMethodOatLookup(method, pc);
+    MaybeLogImplausibleMethodIndex(method, pc);
 
     // Source reference: rustFrida art_controller.rs::on_get_oat_quick_method_header.
     // Hook-pool PCs do not belong to ART-owned quick code, and malloc-backed
