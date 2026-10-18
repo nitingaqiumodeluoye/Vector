@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cctype>
 #include <fcntl.h>
+#include <pthread.h>
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
@@ -31,6 +32,11 @@
 #include "elf/symbol_cache.h"
 
 namespace vector::native::art {
+
+// Defined with the frame-probe helpers further down, but the OAT header layer
+// (defined earlier) uses it to decide whether app processes install the
+// logging-only variant of that hook.
+bool FrameProbeEnabled();
 
 // Defined outside the anonymous namespace below (and outside its __aarch64__ guard) because the
 // perf log sites in core/native_api.cpp and jni/native_api_bridge.cpp gate on it too. See the
@@ -1246,10 +1252,90 @@ bool IsReplacementMethod(uintptr_t method) {
                        });
 }
 
+// ---------------------------------------------------------------------------
+// App-process OAT lookup diagnostic
+//
+// Measured: our own thunk's [sp+0] always holds a valid ArtMethod, so the bogus
+// method the walker dies on comes from a different frame. Instead of sampling at
+// hook entry and hoping to catch that moment, listen where ART actually asks:
+// every stack walk ends up in GetOatQuickMethodHeader(method, lr), and the method
+// it passes is the frame's method slot.
+//
+// A method pointer that lands inside the calling thread's own stack is never
+// legitimate, and it is exactly the tombstone_10 shape (PrettyMethod on
+// 0x77ff0a8000, a page-aligned stack address). Only that case is logged, so the
+// hot path stays a couple of compares.
+// ---------------------------------------------------------------------------
+bool g_oat_header_diagnostic_only = false;
+
+struct ThreadStackBounds {
+    uintptr_t lo;
+    uintptr_t hi;
+    bool valid;
+};
+
+const ThreadStackBounds &CurrentThreadStackBounds() {
+    // One pthread_getattr_np per thread, cached in TLS. This runs on the GC
+    // thread's walk path, so it must not repeat per call.
+    static thread_local ThreadStackBounds bounds{0, 0, false};
+    if (!bounds.valid) {
+        pthread_attr_t attr;
+        if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+            void *base = nullptr;
+            size_t size = 0;
+            if (pthread_attr_getstack(&attr, &base, &size) == 0 && base && size) {
+                bounds.lo = reinterpret_cast<uintptr_t>(base);
+                bounds.hi = bounds.lo + size;
+                bounds.valid = true;
+            }
+            pthread_attr_destroy(&attr);
+        }
+    }
+    return bounds;
+}
+
+void MaybeLogStackMethodOatLookup(uintptr_t method, uintptr_t lr) {
+    if (!method) return;
+    const auto &bounds = CurrentThreadStackBounds();
+    if (!bounds.valid) return;
+    const uintptr_t m = method & kPacStripMask;
+    if (m < bounds.lo || m >= bounds.hi) return;   // not a stack address
+
+    static std::atomic<uint32_t> reported{0};
+    const uint32_t n = reported.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n > 16) return;
+
+    // The walker's own view of the current frame, recorded alongside so the bad
+    // frame can be located in the chain without a second build.
+    uintptr_t top = 0;
+    uintptr_t thread = 0;
+#if defined(__aarch64__)
+    uintptr_t tls = 0;
+    asm volatile("mrs %0, tpidr_el0" : "=r"(tls));
+    if (tls) {
+        thread = *reinterpret_cast<volatile const uintptr_t *>(tls + 7 * sizeof(uintptr_t)) &
+                 kPacStripMask;
+    }
+#endif
+    if (thread && g_thread_layout.valid) {
+        top = *reinterpret_cast<volatile const uintptr_t *>(
+            thread + g_thread_layout.managed_stack_offset);
+    }
+
+    LOGW("WxShadow ART OAT lookup got a STACK address as the method: method={} lr={} "
+         "stack={}..{} top_quick_frame={} thread={} tid={} n={}",
+         reinterpret_cast<void *>(m), reinterpret_cast<void *>(lr),
+         reinterpret_cast<void *>(bounds.lo), reinterpret_cast<void *>(bounds.hi),
+         reinterpret_cast<void *>(top), reinterpret_cast<void *>(thread),
+         static_cast<long>(gettid()), n);
+}
+
 void OnGetOatQuickMethodHeader(HookContext *ctx, void *) {
     if (!ctx) return;
     const auto method = ctx->x[0] & kPacStripMask;
     const auto pc = ctx->x[1] & kPacStripMask;
+
+    MaybeLogStackMethodOatLookup(method, pc);
 
     // Source reference: rustFrida art_controller.rs::on_get_oat_quick_method_header.
     // Hook-pool PCs do not belong to ART-owned quick code, and malloc-backed
@@ -1279,8 +1365,14 @@ void OnGetOatQuickMethodHeader(HookContext *ctx, void *) {
         }
     }
     if (in_pool || replacement) {
-        ctx->x[0] = 0;
-        return;
+        // system_server relies on this NULL to keep malloc-backed replacement
+        // methods out of the OAT lookup. App processes install this hook for
+        // diagnostics only, so they must keep the unhooked behaviour: fall
+        // through and call the real function instead of inventing a NULL.
+        if (!g_oat_header_diagnostic_only) {
+            ctx->x[0] = 0;
+            return;
+        }
     }
     if (oat_trace) {
         // 透传（真正调 ART）也限频记录，用于发现「本该判为我们的帧却走了透传」。
@@ -2973,7 +3065,14 @@ bool CompleteInitializationImpl(JNIEnv *env) {
     // startup watchdog may request a heap snapshot. Keep app startup on the
     // per-method router; install the heavier guard only in system_server.
     stage_start = perf_start != 0 ? ArtPerfNowNs() : 0;
-    const bool oat_header_ready = g_is_system_process && InitializeOatHeaderLayer();
+    // system_server installs this to keep malloc-backed replacement methods out of
+    // the OAT lookup. App processes install the same hook for diagnostics only
+    // when the frame probe is on: OnGetOatQuickMethodHeader then logs a method
+    // pointer that landed inside the calling thread's stack, and otherwise passes
+    // straight through, so app behaviour equals "not hooked".
+    g_oat_header_diagnostic_only = !g_is_system_process;
+    const bool oat_header_ready =
+        (g_is_system_process || FrameProbeEnabled()) && InitializeOatHeaderLayer();
     if (stage_start != 0) {
         LOGI("[perf] art_controller component=oat_header ready={} elapsedUs={}",
              oat_header_ready, ArtPerfElapsedUs(stage_start));
