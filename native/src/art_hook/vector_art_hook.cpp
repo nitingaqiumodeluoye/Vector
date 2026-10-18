@@ -1411,7 +1411,10 @@ void MaybeLogImplausibleMethodIndex(uintptr_t method, uintptr_t lr) {
     //          (<<invalid-method-idx-NNN>>, seen 351803424 / 349474360 / 345416752)
     //   entry: ART read entry_ == 0 and aborted in CHECK(existing_entry_point)
     uintptr_t entry = 0;
-    if (g_layout.valid && g_layout.entry_offset + sizeof(uintptr_t) <= 64) {
+    // entry_offset is only meaningful once the layout probe has run; method_size 0
+    // means it has not, and reading a wrong offset would report a false finding.
+    if (g_layout.method_size != 0 &&
+        g_layout.entry_offset + sizeof(uintptr_t) <= g_layout.method_size) {
         entry = *reinterpret_cast<volatile const uintptr_t *>(m + g_layout.entry_offset);
     }
     const bool bad_index = index >= kImplausibleDexMethodIndex;
