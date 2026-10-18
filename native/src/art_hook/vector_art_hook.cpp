@@ -3226,6 +3226,30 @@ void ProbeNativeThunkFrame(HookContext *ctx, bool native_entry_route) {
             thread + g_thread_layout.managed_stack_offset);
     }
 
+    // Capture what ART would call the next quick frame: dereference the frame
+    // pointer the walker publishes. This is the decisive bit -- it says whether
+    // ART is looking at OUR frame at all. If *(top) is not the replacement
+    // ArtMethod we baked into [frame+0], then the bogus method the walker
+    // reports comes from somewhere else entirely (a different frame, or a frame
+    // ART advanced onto), and no amount of fixing our own slot can help.
+    //
+    // Must NOT call IsReadable() here: it fopen()s /proc/self/maps, and this runs
+    // on the GC-thread stack-walk path. Only dereference when the pointer is
+    // inside the same region family as our own frame (i.e. the thread's stack),
+    // which is where a quick frame can legitimately be.
+    uintptr_t top_method = 0;
+    if (top) {
+        const uintptr_t top_frame = top & ~uintptr_t{1};
+        // Same thread stack, within a sane distance above our own frame. That is
+        // the only place a quick frame pointing at us can live, and it is mapped
+        // by construction because we are running on that stack right now.
+        const bool plausible_frame =
+            top_frame > frame && (top_frame - frame) < (64u * 1024u);
+        if (plausible_frame) {
+            top_method = *reinterpret_cast<volatile const uintptr_t *>(top_frame);
+        }
+    }
+
     const size_t index = g_native_thunk_frame_probe_count.fetch_add(
                              1, std::memory_order_relaxed) % kFrameProbeEntries;
     auto &entry = g_native_thunk_frame_probe[index];
@@ -3238,15 +3262,20 @@ void ProbeNativeThunkFrame(HookContext *ctx, bool native_entry_route) {
     // flags bit0: top_quick_frame agrees with the frame size we declare
     // flags bit1: thread/ManagedStack readable
     // flags bit2: registered-native-entry route (no method slot, 352 by design)
+    // flags bit3: the walker's own frame holds our replacement method (i.e. ART
+    //             is looking at THIS frame, not some other one)
     entry.flags = (top == expected_jni_frame ? 1u : 0u) | (thread ? 2u : 0u) |
-                  (native_entry_route ? 4u : 0u);
+                  (native_entry_route ? 4u : 0u) |
+                  (!native_entry_route && slot && top_method == slot ? 8u : 0u);
 
     // Capture the tail now: after the thunk returns the stack is reused, so a
     // post-mortem read records whatever took its place (verified on device).
-    for (size_t i = 0; i < 8; ++i) {
+    for (size_t i = 0; i < 7; ++i) {
         entry.tail[i] = *reinterpret_cast<volatile const uint64_t *>(
             frame + 352 + i * sizeof(uint64_t));
     }
+    // tail[7] repurposed: the method the walker would read at its own frame.
+    entry.tail[7] = top_method;
 
     // Log the first few entries whether or not the geometry holds: an absent
     // warning would otherwise be ambiguous between "geometry is fine" and
@@ -3256,12 +3285,14 @@ void ProbeNativeThunkFrame(HookContext *ctx, bool native_entry_route) {
         const uint32_t n = sampled.fetch_add(1, std::memory_order_relaxed) + 1;
         if (n <= 6) {
             LOGI("WxShadow ART frame probe: route={} top_quick_frame={} frame={} "
-                 "declared={} expected={} delta={} slot={} tid={} n={}",
+                 "declared={} expected={} delta={} slot={} top_method={} same={} tid={} n={}",
                  native_entry_route ? "native_entry" : "trampoline",
                  reinterpret_cast<void *>(top), reinterpret_cast<void *>(frame),
                  static_cast<unsigned long>(declared),
                  reinterpret_cast<void *>(expected_jni_frame),
                  static_cast<long>(top - frame), reinterpret_cast<void *>(slot),
+                 reinterpret_cast<void *>(top_method),
+                 (top_method && top_method == slot) ? "yes" : "NO",
                  static_cast<long>(gettid()), n);
         }
     }
