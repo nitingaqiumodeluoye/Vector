@@ -3134,12 +3134,7 @@ void SetManagerProcess(bool is_manager) {
 // It is off unless the property is set, and it never allocates or takes locks.
 // ---------------------------------------------------------------------------
 constexpr size_t kNativeThunkMethodSlotSize = 16;
-// Measured on device (3274/3275 drops, 8 trampoline-route samples): the caller's
-// generic-JNI frame sits 0x180 above our frame base, i.e. this thunk's frame is
-// 384 bytes, not the 368 that "16-byte method slot + 352-byte HookContext" adds
-// up to. The missing 16 is the trailing slot hook_engine_redir.c now owns and
-// zeroes. Keep this in lockstep with NATIVE_TOTAL_FRAME_SIZE there.
-constexpr size_t kNativeThunkFrameSize = 384;
+constexpr size_t kNativeThunkFrameSize = 368;
 constexpr size_t kFrameProbeEntries = 32;
 constexpr size_t kFrameProbeStride = 16;  // seq..flags(7) + tail[8] + pad
 
@@ -3154,7 +3149,7 @@ struct FrameProbeEntry {
     // Frame tail captured AT CALL TIME. Reading these afterwards is useless:
     // the stack is already unwound and reused (verified on device). These are
     // frame+0x160..0x1a0, i.e. the region ART would land on if it advances by
-    // 384 bytes, which is why the frame is now 384 and the tail is zeroed.
+    // 384 bytes instead of our declared 368.
     uint64_t tail[8];
     uint64_t reserved;
 };
@@ -3201,12 +3196,25 @@ void ProbeNativeThunkFrame(HookContext *ctx, bool native_entry_route) {
 
     // The native trampoline frame starts 16 bytes before the HookContext
     // (reserved method slot). The registered-native-entry route has no such
-    // slot, so the base and the declared size are both different: probing it
-    // with the trampoline numbers produced a false "slot == 0" alarm.
+    // slot, so the base is different: probing it with the trampoline numbers
+    // produced a false "slot == 0" alarm.
+    //
+    // Expected top_quick_frame, MEASURED rather than derived. Two independent
+    // drops agree on the same relation, which is why it is trustworthy:
+    //     declared 368 -> untagged delta 384 = 368 + 16
+    //     declared 384 -> untagged delta 400 = 384 + 16
+    // i.e. the caller publishes a frame base 16 bytes above the sp it calls us
+    // with (its JNI arg scratch), so the distance includes that 16 on top of
+    // our own frame. The first revision omitted it and therefore reported a
+    // constant +16 "MISMATCH" that looked like a frame-size bug; it was a
+    // probe bug and led to an unnecessary 368->384 change (now reverted).
+    // The registered-native-entry route has no JNI trampoline above it, so it
+    // carries no extra 16.
     const uintptr_t frame = reinterpret_cast<uintptr_t>(ctx) -
                             (native_entry_route ? 0 : kNativeThunkMethodSlotSize);
     const uintptr_t declared = native_entry_route ? 352 : kNativeThunkFrameSize;
-    const uintptr_t expected_jni_frame = frame + declared;
+    const uintptr_t caller_gap = native_entry_route ? 0 : 16;
+    const uintptr_t expected_jni_frame = frame + declared + caller_gap;
     const uintptr_t slot = native_entry_route
                                ? 0
                                : *reinterpret_cast<volatile const uintptr_t *>(frame);
@@ -3235,8 +3243,6 @@ void ProbeNativeThunkFrame(HookContext *ctx, bool native_entry_route) {
 
     // Capture the tail now: after the thunk returns the stack is reused, so a
     // post-mortem read records whatever took its place (verified on device).
-    // Sample frame+0x160..0x1a0 so the row brackets the 368/384 boundary and the
-    // caller's first slot either way.
     for (size_t i = 0; i < 8; ++i) {
         entry.tail[i] = *reinterpret_cast<volatile const uint64_t *>(
             frame + 352 + i * sizeof(uint64_t));
