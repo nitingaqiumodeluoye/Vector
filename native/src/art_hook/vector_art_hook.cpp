@@ -3134,7 +3134,12 @@ void SetManagerProcess(bool is_manager) {
 // It is off unless the property is set, and it never allocates or takes locks.
 // ---------------------------------------------------------------------------
 constexpr size_t kNativeThunkMethodSlotSize = 16;
-constexpr size_t kNativeThunkFrameSize = 368;
+// Measured on device (3274/3275 drops, 8 trampoline-route samples): the caller's
+// generic-JNI frame sits 0x180 above our frame base, i.e. this thunk's frame is
+// 384 bytes, not the 368 that "16-byte method slot + 352-byte HookContext" adds
+// up to. The missing 16 is the trailing slot hook_engine_redir.c now owns and
+// zeroes. Keep this in lockstep with NATIVE_TOTAL_FRAME_SIZE there.
+constexpr size_t kNativeThunkFrameSize = 384;
 constexpr size_t kFrameProbeEntries = 32;
 constexpr size_t kFrameProbeStride = 16;  // seq..flags(7) + tail[8] + pad
 
@@ -3149,7 +3154,7 @@ struct FrameProbeEntry {
     // Frame tail captured AT CALL TIME. Reading these afterwards is useless:
     // the stack is already unwound and reused (verified on device). These are
     // frame+0x160..0x1a0, i.e. the region ART would land on if it advances by
-    // 384 bytes instead of our declared 368.
+    // 384 bytes, which is why the frame is now 384 and the tail is zeroed.
     uint64_t tail[8];
     uint64_t reserved;
 };
@@ -3230,6 +3235,8 @@ void ProbeNativeThunkFrame(HookContext *ctx, bool native_entry_route) {
 
     // Capture the tail now: after the thunk returns the stack is reused, so a
     // post-mortem read records whatever took its place (verified on device).
+    // Sample frame+0x160..0x1a0 so the row brackets the 368/384 boundary and the
+    // caller's first slot either way.
     for (size_t i = 0; i < 8; ++i) {
         entry.tail[i] = *reinterpret_cast<volatile const uint64_t *>(
             frame + 352 + i * sizeof(uint64_t));

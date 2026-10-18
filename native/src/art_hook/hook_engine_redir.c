@@ -12,22 +12,32 @@
 #define NATIVE_FAKE_OAT_PREFIX_SIZE (NATIVE_FAKE_CODEINFO_BYTES + 4)
 #define NATIVE_HOOK_CONTEXT_FRAME_SIZE 352
 #define NATIVE_STACK_METHOD_SLOT_SIZE 16
-#define NATIVE_HOOK_CONTEXT_FRAME_SIZE 352
-#define NATIVE_TOTAL_FRAME_SIZE (NATIVE_STACK_METHOD_SLOT_SIZE + NATIVE_HOOK_CONTEXT_FRAME_SIZE)
 /*
  * ART 的约定：方法槽算在帧内。实测 libart 自己的 JNI 帧构建代码
  *   art_quick_generic_jni_trampoline: sub sp,sp,#0xe0 ; str x0,[sp]
  * 即 224 字节帧里 [sp+0] 就是 ArtMethod，packed_frame_size = 224/16 = 14。
  *
- * 本 thunk 的帧同样是「[SP+0] = 替换 ArtMethod，随后是 HookContext」，总共 368 字节，
- * 所以必须声明 368/16 = 23。之前写成 352/16 = 22（把方法槽排除在外），ART 走栈时
- * 从本帧只前进 352，比真实帧顶少 16 字节，于是把错位处的数据当成 ArtMethod* 解引用：
- *   #00 art::ArtMethod::PrettyMethod+80
- *   #01 art::ArtMethod::GetOatQuickMethodHeader+792
- *   #02 art::StackVisitor::WalkStack<1>
- *   #03 art::Thread::VisitRoots   ← ConcurrentCopying ThreadFlipVisitor
- * 即 hunter 里反复出现的 SI_USER SIGSEGV。
+ * 本 thunk 的帧是「[SP+0] = 替换 ArtMethod，随后是 HookContext」，但帧的总长度
+ * 不能只按这两段相加，必须等于 ART 从本帧推进到上一帧的实际距离。这个距离是
+ * 实测出来的，不是推导出来的（见 vector_art_hook.cpp 的 ProbeNativeThunkFrame）：
+ *
+ *   设备实测（3274/3275 诊断包，8 次 trampoline 路由采样，无一例外）：
+ *     top_quick_frame(= 调用者 JNI 帧基址) - 本帧基址 = 0x181
+ *     剥掉 TaggedQuickFrame 的 bit0              = 0x180 = 384
+ *   而旧实现只压栈/声明 16+352 = 368；两者的 16 字节差值正是「本帧顶端」与
+ *   「调用者 JNI 帧基址」之间那个 16 字节槽。声明 368 时 ART 从这里推进只走
+ *   368，落进那个空槽，把它当 ArtMethod* → 观察到 NULL / Thread* / 主栈地址 /
+ *   dex_method_index_ 是垃圾的伪方法四种形态；REFERENCE 扫描时则把保存的
+ *   寄存器当 Java 引用做 bitmap 标记（TestAndSetMarkBitForRef 越界到
+ *   0x168724215f638 那一类地址）。
+ *
+ * 因此帧尺寸必须是 384 = 24*16，并且本 thunk 真的要把这 384 字节全部压栈、
+ * 末尾 16 字节显式写 0，否则 ART 推进后仍会读到残留值。
+ * 历史：曾写 22（352，漏掉方法槽）→ 23（368，漏掉尾部 16 字节槽）→ 24。
  */
+#define NATIVE_TRAILING_SLOT_SIZE 16
+#define NATIVE_TOTAL_FRAME_SIZE \
+    (NATIVE_STACK_METHOD_SLOT_SIZE + NATIVE_HOOK_CONTEXT_FRAME_SIZE + NATIVE_TRAILING_SLOT_SIZE)
 #define NATIVE_FAKE_PACKED_FRAME_SIZE (NATIVE_TOTAL_FRAME_SIZE / 16)
 
 static void encode_native_fake_codeinfo(uint8_t buf[NATIVE_FAKE_CODEINFO_BYTES],
@@ -86,6 +96,20 @@ static void emit_save_native_hook_context(Arm64Writer* w, uint64_t target_pc) {
     arm64_writer_put_mov_reg_imm(w, ARM64_REG_X16, 1);
     arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_SP,
                                         NATIVE_STACK_METHOD_SLOT_SIZE + 344);
+
+    /* Zero the trailing 16-byte slot (SP+368..SP+384).
+     *
+     * ART advances from this frame by NATIVE_TOTAL_FRAME_SIZE (see the comment on
+     * that constant: measured as 0x180 on device), so this region is inside the
+     * frame. Leaving it uninitialised meant the walker could read a leftover from
+     * whatever previously used this stack; the reference scan then treated it as a
+     * marker/ArtMethod. Zeroing it keeps "inside our frame" equal to "defined". */
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_XZR, ARM64_REG_SP,
+                                        NATIVE_STACK_METHOD_SLOT_SIZE +
+                                            NATIVE_HOOK_CONTEXT_FRAME_SIZE);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_XZR, ARM64_REG_SP,
+                                        NATIVE_STACK_METHOD_SLOT_SIZE +
+                                            NATIVE_HOOK_CONTEXT_FRAME_SIZE + 8);
 }
 
 static void emit_store_replacement_for_stackvisitor(Arm64Writer* w, uint64_t replacement_method) {

@@ -697,7 +697,7 @@ static void VectorArtHookCallback(HookContext *ctx, void *raw_user_data) {
     auto *state = item ? item->art_state_ptr.load(std::memory_order_acquire) : nullptr;
     // Diagnostic: verify the frame geometry the ART stack walker relies on.
     // Done after `state` is known because the two hook routes have different
-    // frame shapes (native trampoline 368 B with a method slot; registered
+    // frame shapes (native trampoline 384 B with a method slot; registered
     // native entry 352 B without one). No-op when the property is unset.
     art::ProbeNativeThunkFrame(ctx, state != nullptr && state->native_entry_hook);
     if (!item || !state || !item->hooker_object || !item->hooker_callback) {
