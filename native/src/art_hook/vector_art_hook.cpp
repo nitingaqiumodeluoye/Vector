@@ -1352,13 +1352,27 @@ constexpr uint32_t kImplausibleDexMethodIndex = 0x01000000u;
 // silently rejected every real method (0x7025ba98 < 0x7000000000) and made this
 // diagnostic report nothing at all. Validate against the process's own maps
 // instead, parsed once so the GC walk path never touches /proc.
-constexpr size_t kCachedRangeMax = 1024;
+//
+// SIZE MATTERS, and getting it wrong fails SILENTLY in the worst possible way.
+// /proc/self/maps is in ascending address order, so a cap that is too small does
+// not drop an arbitrary sample -- it drops the HIGH end, which is exactly where
+// the interesting objects live (ART heap 0x7f..., thread stacks 0x7ff...).
+// Measured on the hunter process at build 3285: 3847 VMAs total, 3193 readable.
+// With the old cap of 1024 the cache ended at 0x77e1e75000, so IsCachedReadable()
+// answered "no" for every heap object and every stack address. That made the
+// frame probe's classification always report 0x0, and made the WalkStack
+// forensic probe return at its very first check without ever logging. Two
+// separate instruments produced confident-looking nothing because of this.
+constexpr size_t kCachedRangeMax = 8192;
 struct MappedRange {
     uintptr_t lo;
     uintptr_t hi;
 };
 MappedRange g_cached_ranges[kCachedRangeMax];
 size_t g_cached_range_count = 0;
+// Set when maps had more readable ranges than the cache could hold: every query
+// above the last stored range is then a false negative, so say so out loud.
+std::atomic<bool> g_cached_ranges_truncated{false};
 std::once_flag g_cached_ranges_once;
 
 void LoadReadableRanges() {
@@ -1366,18 +1380,32 @@ void LoadReadableRanges() {
     if (!maps) return;
     char line[512];
     size_t n = 0;
-    while (n < kCachedRangeMax && fgets(line, sizeof(line), maps)) {
+    bool truncated = false;
+    while (fgets(line, sizeof(line), maps)) {
         unsigned long start = 0;
         unsigned long end = 0;
         char perms[5] = {};
         if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) != 3) continue;
         if (perms[0] != 'r') continue;
+        if (n >= kCachedRangeMax) {
+            truncated = true;
+            break;
+        }
         g_cached_ranges[n].lo = start;
         g_cached_ranges[n].hi = end;
         ++n;
     }
     fclose(maps);
     g_cached_range_count = n;
+    g_cached_ranges_truncated.store(truncated, std::memory_order_release);
+    if (truncated) {
+        // Above this address every readability answer is a false negative.
+        LOGW("WxShadow ART readable-range cache TRUNCATED: kept={} last_end={} -- queries "
+             "above this address will be reported unreadable (raise kCachedRangeMax)",
+             n, reinterpret_cast<void *>(n ? g_cached_ranges[n - 1].hi : 0));
+    } else {
+        LOGI("WxShadow ART readable-range cache ready: ranges={}", n);
+    }
 }
 
 // libart's own range, resolved once. IsInArtModule() calls FindModuleRange() which
@@ -1405,14 +1433,29 @@ const CachedArtRange &CachedArtModuleRange() {
 }
 
 
-bool IsCachedReadable(uintptr_t address) {
+// Readability answer with the reason kept separate from the verdict.
+//
+// A bare `false` conflates two very different facts:
+//   * the address really is not in a readable mapping, and
+//   * the cache simply does not cover it (truncation, or a mapping created after
+//     the cache was built -- thread stacks appear later, and so does anything
+//     mmap'd during startup).
+// Earlier revisions returned `false` for both, which is how two instruments came
+// to report confident-looking negatives. Callers that only want "can I safely
+// dereference" use IsCachedReadable(); the forensic paths use this so a log line
+// can say "out of cache" instead of implying a real finding.
+enum class ReadableVerdict { Yes, No, OutOfCache };
+
+ReadableVerdict ProbeReadability(uintptr_t address) {
     std::call_once(g_cached_ranges_once, LoadReadableRanges);
     const uintptr_t addr = address & kPacStripMask;
+    const size_t count = g_cached_range_count;
+    if (count == 0) return ReadableVerdict::OutOfCache;
     // Ranges from /proc/self/maps are in ascending order, and this sits on
     // GetOatQuickMethodHeader which ART calls on the order of 100k/s, so a
-    // linear scan over up to 1024 entries would cost far too much.
+    // linear scan would cost far too much.
     size_t lo = 0;
-    size_t hi = g_cached_range_count;
+    size_t hi = count;
     while (lo < hi) {
         const size_t mid = lo + (hi - lo) / 2;
         if (addr < g_cached_ranges[mid].lo) {
@@ -1420,10 +1463,16 @@ bool IsCachedReadable(uintptr_t address) {
         } else if (addr >= g_cached_ranges[mid].hi) {
             lo = mid + 1;
         } else {
-            return true;
+            return ReadableVerdict::Yes;
         }
     }
-    return false;
+    // Past the last cached range: the cache cannot speak for this address.
+    if (addr >= g_cached_ranges[count - 1].hi) return ReadableVerdict::OutOfCache;
+    return ReadableVerdict::No;
+}
+
+bool IsCachedReadable(uintptr_t address) {
+    return ProbeReadability(address) == ReadableVerdict::Yes;
 }
 
 void MaybeLogImplausibleMethodIndex(uintptr_t method, uintptr_t lr) {
@@ -3547,12 +3596,25 @@ constexpr uint64_t kProbeMethodInPool = 1u << 2;
 constexpr uint64_t kProbeMethodNullEntry = 1u << 3;
 constexpr uint64_t kProbeMethodInArt = 1u << 4;
 constexpr uint64_t kProbeMethodStackLike = 1u << 5;
+// The cache could not answer for this address (truncated maps, or a mapping made
+// after the cache was built). Distinct from "not readable" on purpose: a value
+// classified with this bit set tells us nothing about whether ART could use it.
+constexpr uint64_t kProbeMethodOutOfCache = 1u << 6;
 
 uint64_t ClassifyProbeMethod(uintptr_t value, uintptr_t anchor) {
     if (value == 0) return kProbeMethodZero;
     const uintptr_t v = value & kPacStripMask;
     uint64_t bits = 0;
-    if (IsCachedReadable(v)) bits |= kProbeMethodReadable;
+    switch (ProbeReadability(v)) {
+    case ReadableVerdict::Yes:
+        bits |= kProbeMethodReadable;
+        break;
+    case ReadableVerdict::OutOfCache:
+        bits |= kProbeMethodOutOfCache;
+        break;
+    case ReadableVerdict::No:
+        break;
+    }
     if (hook_is_in_exec_pool(v)) bits |= kProbeMethodInPool;
     const auto &art = CachedArtModuleRange();
     if (art.valid && v >= art.lo && v < art.hi) bits |= kProbeMethodInArt;
@@ -3604,6 +3666,7 @@ std::atomic<uint32_t> g_walkstack_probe_count{0};
 const char *DescribeProbeMethod(uintptr_t value, uintptr_t anchor) {
     const uint64_t bits = ClassifyProbeMethod(value, anchor);
     if (bits & kProbeMethodZero) return "zero";
+    if (bits & kProbeMethodOutOfCache) return "out-of-cache";
     if (!(bits & kProbeMethodReadable)) return "UNREADABLE";
     if (bits & kProbeMethodInPool) return "vector-pool";
     if (bits & kProbeMethodNullEntry) return "null-entry";
@@ -3614,17 +3677,39 @@ const char *DescribeProbeMethod(uintptr_t value, uintptr_t anchor) {
 
 void OnWalkStackEnter(HookContext *ctx, void *) {
 #if defined(__aarch64__)
-    if (!ctx) return;
+    // Count every entry BEFORE any guard. A probe that can return at five
+    // different places without leaving a trace is indistinguishable from a
+    // probe that never ran -- that ambiguity cost a whole device round: the
+    // truncated maps cache made this function return at the first check, and the
+    // resulting silence looked exactly like "the hook is not installed".
+    const uint32_t entered = g_walkstack_probe_count.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    // One line per distinct early-return reason, once each.
+    auto bail = [entered, ctx](int reason) {
+        static std::atomic<uint32_t> seen{0};
+        const uint32_t mask = 1u << reason;
+        uint32_t cur = seen.load(std::memory_order_relaxed);
+        while (!(cur & mask) &&
+               !seen.compare_exchange_weak(cur, cur | mask, std::memory_order_relaxed)) {
+        }
+        if (cur & mask) return;
+        LOGW("WxShadow ART WalkStack probe BAIL reason={} n={} ctx={} x0={} tid={}",
+             reason, entered, reinterpret_cast<void *>(ctx),
+             reinterpret_cast<void *>(ctx ? ctx->x[0] : 0), static_cast<long>(gettid()));
+    };
+
+    if (!ctx) { bail(1); return; }
     const uintptr_t self = ctx->x[0];
-    if (!self) return;
+    if (!self) { bail(2); return; }
 
     // StackVisitor::thread_ is at +0x8 (WalkStack itself reads it that way), and
     // ManagedStack lives at thread + managed_stack_offset (measured 0xb0).
-    if (!IsCachedReadable(self + 0x10)) return;
+    if (!IsCachedReadable(self + 0x10)) { bail(3); return; }
     const uintptr_t thread = *reinterpret_cast<volatile const uintptr_t *>(self + 0x8);
-    if (!thread || !g_thread_layout.valid) return;
+    if (!thread) { bail(4); return; }
+    if (!g_thread_layout.valid) { bail(5); return; }
     uintptr_t fragment = thread + g_thread_layout.managed_stack_offset;
-    if (!IsCachedReadable(fragment + 0x18)) return;
+    if (!IsCachedReadable(fragment + 0x18)) { bail(6); return; }
 
     // Collect first, then decide whether to log: logging during a GC checkpoint
     // is a syscall on the GC thread, so only do it when something is wrong.
@@ -3660,7 +3745,8 @@ void OnWalkStackEnter(HookContext *ctx, void *) {
         fragment = next_clean;
     }
 
-    const uint32_t n = g_walkstack_probe_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    // entered is this entry's number, already taken before the guards.
+    const uint32_t n = entered;
     if (!suspicious) {
         if (n <= 3) {
             LOGI("WxShadow ART WalkStack probe: healthy walk n={} tid={} hops={} frame0={} "
