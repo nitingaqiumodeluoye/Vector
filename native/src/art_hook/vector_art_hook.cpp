@@ -1519,9 +1519,10 @@ ReadableVerdict ProbeReadability(uintptr_t address) {
     return ReadableVerdict::No;
 }
 
-bool IsCachedReadable(uintptr_t address) {
-    return ProbeReadability(address) == ReadableVerdict::Yes;
-}
+// Deliberately no "IsCachedReadable" wrapper any more. Every caller that used it
+// to decide whether it was safe to dereference has been moved to SafeReadU64(),
+// which reads and therefore cannot be stale. Keeping a convenient-looking
+// wrapper invites the same bug a fourth time.
 
 // Label of the mapping that owns `address`, or "" when unmapped / not cached.
 // Used by forensic logs so an address can be read as "which mapping" without a
@@ -1568,9 +1569,11 @@ const char *MappedNameFor(uintptr_t address) {
 void MaybeLogImplausibleMethodIndex(uintptr_t method, uintptr_t lr) {
     if (!method) return;
     const uintptr_t m = method & kPacStripMask;
-    // Needs the method header to be readable; ask the cached maps rather than
-    // assuming an address range.
-    if (!IsCachedReadable(m + 12)) return;
+    // Needs the method header to be readable. Read it rather than consulting the
+    // maps snapshot: the snapshot goes stale for anything mapped after it was
+    // built, and this diagnostic also runs on GC threads created later.
+    uintptr_t word = 0;
+    if (!SafeReadU64(m + 8, &word)) return;
     const auto flags = *reinterpret_cast<volatile const uint32_t *>(m + 4);
     const auto index = *reinterpret_cast<volatile const uint32_t *>(m + 8);
 
@@ -3018,7 +3021,9 @@ void MaybeSnapshotCrashWalkStack(const ucontext_t *uc, int si_code) {
     // mismatch is visible rather than hidden.
     const uintptr_t visitor = static_cast<uintptr_t>(uc->uc_mcontext.regs[0]) & kPacStripMask;
     uintptr_t shadow = 0, quick = 0, quick_pc = 0, thread = 0;
-    if (visitor && ProbeReadability(visitor + 0x30) == ReadableVerdict::Yes) {
+    uintptr_t visitor_word = 0;
+    if (visitor && SafeReadU64(visitor + 0x18, &visitor_word) &&
+        SafeReadU64(visitor + 0x30, &visitor_word)) {
         shadow = *reinterpret_cast<volatile const uintptr_t *>(visitor + 0x18) & kPacStripMask;
         quick = *reinterpret_cast<volatile const uintptr_t *>(visitor + 0x20) & kPacStripMask;
         quick_pc = *reinterpret_cast<volatile const uintptr_t *>(visitor + 0x28) & kPacStripMask;
@@ -3792,15 +3797,19 @@ uint64_t ClassifyProbeMethod(uintptr_t value, uintptr_t anchor) {
     if (value == 0) return kProbeMethodZero;
     const uintptr_t v = value & kPacStripMask;
     uint64_t bits = 0;
-    switch (ProbeReadability(v)) {
-    case ReadableVerdict::Yes:
+    // Readability is decided by ACTUALLY READING, never by the maps snapshot.
+    // The snapshot is taken once, so any mapping created afterwards -- thread
+    // stacks, libc_malloc arenas -- is missing from it, and asking it produced
+    // three separate false conclusions in this investigation (slot_class=0x0,
+    // BAIL reason=3 on 20 of 20 probes, and 158 bogus "UNMAPPED FRAME" lines).
+    // A read through process_vm_readv cannot go stale: it either yields the word
+    // or fails.
+    uintptr_t probe_word = 0;
+    if (SafeReadU64(v, &probe_word)) {
         bits |= kProbeMethodReadable;
-        break;
-    case ReadableVerdict::OutOfCache:
-        bits |= kProbeMethodOutOfCache;
-        break;
-    case ReadableVerdict::No:
-        break;
+        // The snapshot may still know a name; where it does not, that is a gap in
+        // the snapshot, not evidence about the address.
+        if (ProbeReadability(v) == ReadableVerdict::OutOfCache) bits |= kProbeMethodOutOfCache;
     }
     if (hook_is_in_exec_pool(v)) bits |= kProbeMethodInPool;
     const auto &art = CachedArtModuleRange();
@@ -3815,10 +3824,11 @@ uint64_t ClassifyProbeMethod(uintptr_t value, uintptr_t anchor) {
     // address being read, not just `v`: a method at the end of a mapping would
     // otherwise fault here, and this runs on the GC thread's stack-walk path.
     const size_t entry_offset = g_layout.entry_offset;
-    if (entry_offset != 0 && entry_offset + sizeof(uintptr_t) <= 64 &&
-        IsCachedReadable(v + entry_offset)) {
-        const auto entry = *reinterpret_cast<volatile const uintptr_t *>(v + entry_offset);
-        if (entry == 0) bits |= kProbeMethodNullEntry;
+    if (entry_offset != 0 && entry_offset + sizeof(uintptr_t) <= 64) {
+        uintptr_t entry = 0;
+        if (SafeReadU64(v + entry_offset, &entry) && entry == 0) {
+            bits |= kProbeMethodNullEntry;
+        }
     }
     return bits;
 }
@@ -3985,7 +3995,8 @@ void OnWalkStackEnter(HookContext *ctx, void *) {
         // ART is holding something that was never a quick frame. Record those
         // separately -- a frame that is merely corrupt is a different bug from a
         // slot that points outside mapped memory entirely.
-        if (ProbeReadability(frame) == ReadableVerdict::No) bad_frame_unmapped = true;
+        uintptr_t frame_word = 0;
+        if (!SafeReadU64(frame, &frame_word)) bad_frame_unmapped = true;
         const uintptr_t next_clean = next & kPacStripMask;
         if (!next_clean || next_clean == fragment) break;
         fragment = next_clean;
@@ -4071,7 +4082,8 @@ void OnWalkStackEnter(HookContext *ctx, void *) {
     if (bad_frame_unmapped) {
         for (size_t i = 0; i < hops; ++i) {
             if (frames[i] == 0) continue;
-            if (ProbeReadability(frames[i]) != ReadableVerdict::No) continue;
+            uintptr_t probe_frame_word = 0;
+            if (SafeReadU64(frames[i], &probe_frame_word)) continue;
             char line[768] = {};
             size_t used = 0;
             for (int w = -4; w < 12; ++w) {
