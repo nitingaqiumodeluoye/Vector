@@ -1,6 +1,7 @@
 #include "art_hook/vector_art_hook.h"
 
 #include <dlfcn.h>
+#include <inttypes.h>
 #include <cerrno>
 #include <cctype>
 #include <fcntl.h>
@@ -1364,16 +1365,53 @@ constexpr uint32_t kImplausibleDexMethodIndex = 0x01000000u;
 // forensic probe return at its very first check without ever logging. Two
 // separate instruments produced confident-looking nothing because of this.
 constexpr size_t kCachedRangeMax = 8192;
+// Every range also carries a short label, because a forensic log full of raw
+// addresses is unusable: "0x72969a3c" says nothing, "0x72969a3c[boot.oat]" says
+// which mapping ART was pointing into. Labels are interned (maps repeats the same
+// path for many VMAs), so the cost is one small table rather than a path per VMA.
+constexpr size_t kMappedNameLen = 40;
+constexpr size_t kMappedNameMax = 96;
 struct MappedRange {
     uintptr_t lo;
     uintptr_t hi;
+    uint16_t name_idx;   // index into g_mapped_names, 0 = "[anon]"
 };
 MappedRange g_cached_ranges[kCachedRangeMax];
 size_t g_cached_range_count = 0;
+char g_mapped_names[kMappedNameMax][kMappedNameLen];
+size_t g_mapped_name_count = 0;
 // Set when maps had more readable ranges than the cache could hold: every query
 // above the last stored range is then a false negative, so say so out loud.
 std::atomic<bool> g_cached_ranges_truncated{false};
 std::once_flag g_cached_ranges_once;
+
+// Short, stable label for a maps path. "/apex/com.android.art/lib64/libart.so"
+// becomes "libart.so"; "anon:dalvik-/apex/.../boot.art" becomes "boot.art";
+// "[anon:libc_malloc]" becomes "libc_malloc"; a bare mapping becomes "[anon]".
+size_t InternMappedName(const char *raw) {
+    char label[kMappedNameLen] = {};
+    if (raw == nullptr || raw[0] == '\0') {
+        // unnamed mapping
+    } else if (strcmp(raw, "[stack]") == 0 || strstr(raw, "[stack]")) {
+        snprintf(label, sizeof(label), "stack");
+    } else {
+        const char *path = raw;
+        if (const char *a = strstr(raw, "anon:")) path = a + 5;
+        if (const char *slash = strrchr(path, '/')) path = slash + 1;
+        if (path[0] == '[') {
+            snprintf(label, sizeof(label), "%s", path);
+            if (char *bracket = strchr(label, ']')) *bracket = '\0';
+        } else {
+            snprintf(label, sizeof(label), "%s", path);
+        }
+    }
+    for (size_t i = 0; i < g_mapped_name_count; ++i) {
+        if (strcmp(g_mapped_names[i], label) == 0) return i;
+    }
+    if (g_mapped_name_count >= kMappedNameMax) return 0;
+    snprintf(g_mapped_names[g_mapped_name_count], kMappedNameLen, "%s", label);
+    return g_mapped_name_count++;
+}
 
 void LoadReadableRanges() {
     FILE *maps = fopen("/proc/self/maps", "r");
@@ -1391,8 +1429,17 @@ void LoadReadableRanges() {
             truncated = true;
             break;
         }
+        // Sixth field onwards is the path/name; it may be absent.
+        char *path = strchr(line, '/');
+        char *anon = strstr(line, "[anon");
+        char *name = path ? path : anon;
+        if (name) {
+            char *nl = strchr(name, '\n');
+            if (nl) *nl = '\0';
+        }
         g_cached_ranges[n].lo = start;
         g_cached_ranges[n].hi = end;
+        g_cached_ranges[n].name_idx = (uint16_t)InternMappedName(name);
         ++n;
     }
     fclose(maps);
@@ -1473,6 +1520,28 @@ ReadableVerdict ProbeReadability(uintptr_t address) {
 
 bool IsCachedReadable(uintptr_t address) {
     return ProbeReadability(address) == ReadableVerdict::Yes;
+}
+
+// Label of the mapping that owns `address`, or "" when unmapped / not cached.
+// Used by forensic logs so an address can be read as "which mapping" without a
+// second pass over /proc.
+const char *MappedNameFor(uintptr_t address) {
+    std::call_once(g_cached_ranges_once, LoadReadableRanges);
+    const uintptr_t addr = address & kPacStripMask;
+    size_t lo = 0;
+    size_t hi = g_cached_range_count;
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo) / 2;
+        if (addr < g_cached_ranges[mid].lo) {
+            hi = mid;
+        } else if (addr >= g_cached_ranges[mid].hi) {
+            lo = mid + 1;
+        } else {
+            const uint16_t idx = g_cached_ranges[mid].name_idx;
+            return idx < g_mapped_name_count ? g_mapped_names[idx] : "";
+        }
+    }
+    return "";
 }
 
 void MaybeLogImplausibleMethodIndex(uintptr_t method, uintptr_t lr) {
@@ -2896,6 +2965,71 @@ static void LogDeliveredSigsegvEvidence(const siginfo_t *info, void *context) {
          static_cast<long>(gettid()));
 }
 
+// ---------------------------------------------------------------------------
+// Crash-time snapshot: what was the stack walker doing when it died?
+//
+// The WalkStack probe shows the chain BEFORE the walk; the crashes happen later,
+// inside it. When the faulting PC is WalkStack itself and the register holding the
+// frame's method slot is zero, the visitor's own fields say which frame it had
+// reached -- information no entry-time probe can have.
+//
+// StackVisitor layout used here (device libart 0x647af0 reads +0x18):
+//   +0x18 cur_shadow_frame_
+//   +0x20 cur_quick_frame_
+//   +0x28 cur_quick_frame_pc_
+// Pure reads, no allocation: this runs in a signal handler.
+// ---------------------------------------------------------------------------
+std::atomic<uintptr_t> g_walkstack_fn{0};
+
+void MaybeSnapshotCrashWalkStack(const ucontext_t *uc, int si_code) {
+#if defined(__aarch64__)
+    if (!uc) return;
+    const uintptr_t fn = g_walkstack_fn.load(std::memory_order_relaxed);
+    if (!fn) return;
+    const uintptr_t pc = static_cast<uintptr_t>(uc->uc_mcontext.pc) & kPacStripMask;
+    // WalkStack is a few hundred bytes; a 4 KiB window keeps this comparison
+    // cheap while still covering the whole function body.
+    if (pc < fn || pc >= fn + 0x1000) return;
+
+    // x0 is the StackVisitor* at entry; inside the loop the visitor is still in
+    // x0 (WalkStack reloads it as `mov x0, x26` before walking), and the crashing
+    // frames we have seen keep it there. Record raw registers either way so a
+    // mismatch is visible rather than hidden.
+    const uintptr_t visitor = static_cast<uintptr_t>(uc->uc_mcontext.regs[0]) & kPacStripMask;
+    uintptr_t shadow = 0, quick = 0, quick_pc = 0, thread = 0;
+    if (visitor && ProbeReadability(visitor + 0x30) == ReadableVerdict::Yes) {
+        shadow = *reinterpret_cast<volatile const uintptr_t *>(visitor + 0x18) & kPacStripMask;
+        quick = *reinterpret_cast<volatile const uintptr_t *>(visitor + 0x20) & kPacStripMask;
+        quick_pc = *reinterpret_cast<volatile const uintptr_t *>(visitor + 0x28) & kPacStripMask;
+        thread = *reinterpret_cast<volatile const uintptr_t *>(visitor + 0x8) & kPacStripMask;
+    }
+    const uintptr_t x24 = static_cast<uintptr_t>(uc->uc_mcontext.regs[24]) & kPacStripMask;
+    LOGW("WxShadow ART WalkStack CRASH SNAPSHOT: pc={} code={} tid={} visitor={} thread={} "
+         "cur_shadow={} cur_quick={} cur_quick_pc={} x24(method)={} x8={} x10={} "
+         "pc_in_art={}",
+         reinterpret_cast<void *>(pc), si_code, static_cast<long>(gettid()),
+         reinterpret_cast<void *>(visitor), reinterpret_cast<void *>(thread),
+         reinterpret_cast<void *>(shadow), reinterpret_cast<void *>(quick),
+         reinterpret_cast<void *>(quick_pc), reinterpret_cast<void *>(x24),
+         reinterpret_cast<void *>(static_cast<uintptr_t>(uc->uc_mcontext.regs[8]) & kPacStripMask),
+         reinterpret_cast<void *>(static_cast<uintptr_t>(uc->uc_mcontext.regs[10]) & kPacStripMask),
+         IsInArtModule(pc) ? "yes" : "no");
+    if (quick && ProbeReadability(quick + 0x40) == ReadableVerdict::Yes) {
+        char line[512] = {};
+        size_t used = 0;
+        for (size_t w = 0; w < 8; ++w) {
+            const uintptr_t v = *reinterpret_cast<volatile const uintptr_t *>(quick + w * 8);
+            const char *map = MappedNameFor(v);
+            const int wrote = snprintf(line + used, sizeof(line) - used, "%s0x%" PRIxPTR "%s",
+                                       w ? " " : "", v, map[0] ? map : "-");
+            if (wrote <= 0 || used + (size_t)wrote >= sizeof(line)) break;
+            used += (size_t)wrote;
+        }
+        LOGW("WxShadow ART WalkStack CRASH SNAPSHOT   cur_quick[0..7]={}", line);
+    }
+#endif
+}
+
 extern "C" bool ArtSigchainHandler(int signal, siginfo_t *info, void *context) {
     if (TryHandleImplicitSuspend(signal, info, context) ||
         TryHandleNullOatHeader(signal, info, context)) {
@@ -2906,6 +3040,15 @@ extern "C" bool ArtSigchainHandler(int signal, siginfo_t *info, void *context) {
     // 实测 hunter 冷启 3 次里 2 次要死在 Heap::WaitForGcToCompleteLocked 停车处、
     // 以 code 0 (SI_USER) SIGSEGV 收场，且因为走的是 raise 而不是 debuggerd 正常
     // 崩溃路径，经常连 tombstone 都不落盘。
+    // Non-behavioural evidence: recorded before any handler decision, so it also
+    // covers the delivered-SIGSEGV case that never reaches debuggerd.
+    if (signal == SIGSEGV && context) {
+        static std::atomic<uint32_t> snap{0};
+        if (snap.fetch_add(1, std::memory_order_relaxed) < 8) {
+            MaybeSnapshotCrashWalkStack(reinterpret_cast<const ucontext_t *>(context),
+                                        info ? info->si_code : -1);
+        }
+    }
     if (signal == SIGSEGV && IsDeliveredSigsegv(info)) {
         const unsigned long n =
             g_delivered_sigsegv_count.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -3713,37 +3856,68 @@ void OnWalkStackEnter(HookContext *ctx, void *) {
 
     // Collect first, then decide whether to log: logging during a GC checkpoint
     // is a syscall on the GC thread, so only do it when something is wrong.
+    uintptr_t frags[kMaxManagedStackFragments] = {};
     uintptr_t frames[kMaxManagedStackFragments] = {};
     uintptr_t methods[kMaxManagedStackFragments] = {};
     uintptr_t raw_tops[kMaxManagedStackFragments] = {};
+    uintptr_t shadows[kMaxManagedStackFragments] = {};
+    uintptr_t nexts[kMaxManagedStackFragments] = {};
     size_t hops = 0;
-    bool suspicious = false;
-
+    // A hop is only BAD when it is a real quick frame whose method slot holds
+    // something ART cannot use. Two cases that look alarming but are NOT bad,
+    // both now confirmed against the device disassembly, and both of which used
+    // to consume the 16-entry rate-limit budget without cause:
+    //   * top_quick_frame_ == 0: WalkStack does `ands x10,x8,#~1` then `b.eq
+    //     0x647aa0`, i.e. it deliberately falls through to the transitions /
+    //     shadow-frame case. That is a legal state, not corruption.
+    //   * a method whose entry_ == 0 but which is otherwise a readable ArtMethod
+    //     in a boot image (measured 0x70e06c60: declaring=0, flags=0, idx=-1,
+    //     entry=0). Such placeholders exist; they are worth reporting as their own
+    //     class, not as the crash signature.
+    bool bad = false;
+    bool saw_zero_frame = false;
     for (size_t i = 0; i < kMaxManagedStackFragments; ++i) {
         if (!fragment || !IsCachedReadable(fragment + 0x18)) break;
         const uintptr_t raw = *reinterpret_cast<volatile const uintptr_t *>(fragment);
         const uintptr_t frame = raw & ~uintptr_t{1};
+        const uintptr_t next =
+            *reinterpret_cast<volatile const uintptr_t *>(fragment + kManagedStackLinkOffset);
+        frags[hops] = fragment;
         raw_tops[hops] = raw;
         frames[hops] = frame;
+        // top_shadow_frame_ sits right after top_quick_frame_ in ManagedStack.
+        shadows[hops] = *reinterpret_cast<volatile const uintptr_t *>(fragment + 8) &
+                        kPacStripMask;
+        nexts[hops] = next & kPacStripMask;
         uintptr_t method = 0;
         if (frame && IsCachedReadable(frame + sizeof(uintptr_t))) {
             method = *reinterpret_cast<volatile const uintptr_t *>(frame);
         }
         methods[hops] = method;
         ++hops;
-        // "Not a usable ArtMethod" is exactly what the two crash camps show:
-        // unreadable, zero, or a libart pointer that is not a method.
-        if (frame == 0) { suspicious = true; break; }
-        const uint64_t bits = ClassifyProbeMethod(method, frame);
-        if (method == 0 || !(bits & kProbeMethodReadable) || (bits & kProbeMethodNullEntry)) {
-            suspicious = true;
+
+        if (frame == 0) {
+            // Legal: only shadow frames, or a transition frame. Not corruption.
+            saw_zero_frame = true;
+            const uintptr_t next_clean = next & kPacStripMask;
+            if (!next_clean || next_clean == fragment) break;
+            fragment = next_clean;
+            continue;
         }
-        const uintptr_t next =
-            *reinterpret_cast<volatile const uintptr_t *>(fragment + kManagedStackLinkOffset);
+        const uint64_t bits = ClassifyProbeMethod(method, frame);
+        // A quick frame must name a readable ArtMethod. Anything else -- slot 0,
+        // unreadable, or outside every known mapping -- is the crash signature.
+        const bool unusable = method == 0 || !(bits & kProbeMethodReadable);
+        if (unusable) bad = true;
         const uintptr_t next_clean = next & kPacStripMask;
         if (!next_clean || next_clean == fragment) break;
         fragment = next_clean;
     }
+    if (!bad && saw_zero_frame) {
+        // Everything else was fine and only the legal zero-frame case appeared.
+        bad = false;
+    }
+    const bool suspicious = bad;
 
     // entered is this entry's number, already taken before the guards.
     const uint32_t n = entered;
@@ -3763,28 +3937,43 @@ void OnWalkStackEnter(HookContext *ctx, void *) {
     static std::atomic<uint32_t> reported{0};
     const uint32_t r = reported.fetch_add(1, std::memory_order_relaxed) + 1;
     if (r > 16) return;
-    LOGW("WxShadow ART WalkStack probe BAD CHAIN: n={} r={} tid={} hops={} thread={} walk_n={}",
+    LOGW("WxShadow ART WalkStack probe BAD CHAIN: n={} r={} tid={} hops={} thread={} "
+         "thread_frag={}",
          n, r, static_cast<long>(gettid()), static_cast<int>(hops),
-         reinterpret_cast<void *>(thread), n);
+         reinterpret_cast<void *>(thread),
+         reinterpret_cast<void *>(thread + g_thread_layout.managed_stack_offset));
     uintptr_t prev_frame = 0;
     for (size_t i = 0; i < hops; ++i) {
-        LOGW("WxShadow ART WalkStack probe   hop[{}] top_raw={} frame={} adv={} method={} class={}",
-             i, reinterpret_cast<void *>(raw_tops[i]),
+        // frag / next are what the previous revision lacked: without them it was
+        // impossible to say whether the bad frame belonged to a fragment ART was
+        // handed, or was one it advanced onto from a good fragment.
+        LOGW("WxShadow ART WalkStack probe   hop[{}] frag={} top_raw={} frame={} adv={} "
+             "shadow={} link={} method={} class={} at_top={}",
+             i, reinterpret_cast<void *>(frags[i]),
+             reinterpret_cast<void *>(raw_tops[i]),
              reinterpret_cast<void *>(frames[i]),
              i ? reinterpret_cast<void *>(frames[i] - prev_frame) : nullptr,
+             reinterpret_cast<void *>(shadows[i]),
+             reinterpret_cast<void *>(nexts[i]),
              reinterpret_cast<void *>(methods[i]),
-             DescribeProbeMethod(methods[i], frames[i]));
-        // Dump the frame image itself: if ART advanced onto one of our saved
-        // registers, the neighbours make that visible immediately.
-        if (frames[i] && IsCachedReadable(frames[i] + 32)) {
-            LOGW("WxShadow ART WalkStack probe     frame[0..3]={} {} {} {}",
-                 reinterpret_cast<void *>(*reinterpret_cast<volatile const uintptr_t *>(frames[i])),
-                 reinterpret_cast<void *>(
-                     *reinterpret_cast<volatile const uintptr_t *>(frames[i] + 8)),
-                 reinterpret_cast<void *>(
-                     *reinterpret_cast<volatile const uintptr_t *>(frames[i] + 16)),
-                 reinterpret_cast<void *>(
-                     *reinterpret_cast<volatile const uintptr_t *>(frames[i] + 24)));
+             DescribeProbeMethod(methods[i], frames[i]),
+             (frames[i] && frames[i] == (raw_tops[i] & ~uintptr_t{1})) ? "yes" : "no");
+        // 16 words instead of 4, every word labelled with the mapping that owns
+        // it. The earlier version printed "0x72969a3c" with no way to tell an OAT
+        // entry point from a stack slot or a heap pointer.
+        if (frames[i] && IsCachedReadable(frames[i] + 16 * sizeof(uintptr_t))) {
+            char line[512] = {};
+            size_t used = 0;
+            for (size_t w = 0; w < 16; ++w) {
+                const uintptr_t v =
+                    *reinterpret_cast<volatile const uintptr_t *>(frames[i] + w * 8);
+                const char *map = MappedNameFor(v);
+                const int wrote = snprintf(line + used, sizeof(line) - used, "%s0x%" PRIxPTR "%s",
+                                           w ? " " : "", v, map[0] ? map : "-");
+                if (wrote <= 0 || used + (size_t)wrote >= sizeof(line)) break;
+                used += (size_t)wrote;
+            }
+            LOGW("WxShadow ART WalkStack probe     frame+0..15={}", line);
         }
         prev_frame = frames[i];
     }
@@ -3825,6 +4014,7 @@ size_t InitializeWalkStackProbe() {
              reinterpret_cast<void *>(target));
         return 0;
     }
+    g_walkstack_fn.store(target, std::memory_order_relaxed);
     LOGI("WxShadow ART WalkStack probe ready target={} managed_stack_off={}",
          reinterpret_cast<void *>(target), g_thread_layout.managed_stack_offset);
     return 1;
