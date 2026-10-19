@@ -9,6 +9,7 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/uio.h>
 #include <sys/system_properties.h>
 #include <ucontext.h>
 #include <unistd.h>
@@ -3806,6 +3807,43 @@ uint64_t ClassifyProbeMethod(uintptr_t value, uintptr_t anchor) {
 // ============================================================================
 std::atomic<uint32_t> g_walkstack_probe_count{0};
 
+// ---------------------------------------------------------------------------
+// Safe read for the forensic probe.
+//
+// The probe used to gate every dereference on the cached /proc/self/maps
+// snapshot. That cache is taken ONCE, but hunter creates threads throughout its
+// lifetime and every new thread adds a stack mapping afterwards -- measured 197
+// stack mappings in one of these processes. A stack that appeared after the
+// snapshot is absent from it, so ProbeReadability() answered "no" and the probe
+// bailed at its first guard. Result: 20 of 20 logged probes were
+// "BAIL reason=3" and not a single healthy walk was ever recorded, i.e. the
+// instrument was blind to most real walks.
+//
+// process_vm_readv on ourselves is the correct primitive here: on an unmapped
+// source it returns -1/EFAULT instead of raising SIGSEGV, so it needs no map
+// bookkeeping at all and cannot go stale. It costs a syscall per word, which is
+// fine for a probe that already logs.
+// ---------------------------------------------------------------------------
+bool SafeReadU64(uintptr_t address, uintptr_t *out) {
+#if defined(__aarch64__)
+    if (out == nullptr) return false;
+    const uintptr_t addr = address & kPacStripMask;
+    if (addr == 0) return false;
+    uint64_t value = 0;
+    struct iovec local = {&value, sizeof(value)};
+    // iovec::iov_base is void*; process_vm_readv only reads through it.
+    struct iovec remote = {reinterpret_cast<void *>(addr), sizeof(value)};
+    const ssize_t n = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+    if (n != static_cast<ssize_t>(sizeof(value))) return false;
+    *out = static_cast<uintptr_t>(value);
+    return true;
+#else
+    (void)address;
+    (void)out;
+    return false;
+#endif
+}
+
 const char *DescribeProbeMethod(uintptr_t value, uintptr_t anchor) {
     const uint64_t bits = ClassifyProbeMethod(value, anchor);
     if (bits & kProbeMethodZero) return "zero";
@@ -3845,14 +3883,21 @@ void OnWalkStackEnter(HookContext *ctx, void *) {
     const uintptr_t self = ctx->x[0];
     if (!self) { bail(2); return; }
 
-    // StackVisitor::thread_ is at +0x8 (WalkStack itself reads it that way), and
-    // ManagedStack lives at thread + managed_stack_offset (measured 0xb0).
-    if (!IsCachedReadable(self + 0x10)) { bail(3); return; }
-    const uintptr_t thread = *reinterpret_cast<volatile const uintptr_t *>(self + 0x8);
+    // All dereferences below go through SafeReadU64 rather than the maps
+    // snapshot: the snapshot cannot know about stacks created after it was
+    // taken, and that is where most visitors live (see SafeReadU64 comment).
+    uintptr_t thread = 0;
+    if (!SafeReadU64(self + 0x8, &thread)) { bail(3); return; }
     if (!thread) { bail(4); return; }
     if (!g_thread_layout.valid) { bail(5); return; }
-    uintptr_t fragment = thread + g_thread_layout.managed_stack_offset;
-    if (!IsCachedReadable(fragment + 0x18)) { bail(6); return; }
+    const uintptr_t thread_frag = thread + g_thread_layout.managed_stack_offset;
+    uintptr_t probe_word = 0;
+    if (!SafeReadU64(thread_frag, &probe_word) ||
+        !SafeReadU64(thread_frag + kManagedStackLinkOffset, &probe_word)) {
+        bail(6);
+        return;
+    }
+    uintptr_t fragment = thread_frag;
 
     // Collect first, then decide whether to log: logging during a GC checkpoint
     // is a syscall on the GC thread, so only do it when something is wrong.
@@ -3877,22 +3922,24 @@ void OnWalkStackEnter(HookContext *ctx, void *) {
     bool bad = false;
     bool saw_zero_frame = false;
     for (size_t i = 0; i < kMaxManagedStackFragments; ++i) {
-        if (!fragment || !IsCachedReadable(fragment + 0x18)) break;
-        const uintptr_t raw = *reinterpret_cast<volatile const uintptr_t *>(fragment);
+        if (!fragment) break;
+        uintptr_t raw = 0;
+        uintptr_t next = 0;
+        uintptr_t shadow = 0;
+        if (!SafeReadU64(fragment, &raw) ||
+            !SafeReadU64(fragment + kManagedStackLinkOffset, &next) ||
+            !SafeReadU64(fragment + 8, &shadow)) {
+            break;
+        }
         const uintptr_t frame = raw & ~uintptr_t{1};
-        const uintptr_t next =
-            *reinterpret_cast<volatile const uintptr_t *>(fragment + kManagedStackLinkOffset);
         frags[hops] = fragment;
         raw_tops[hops] = raw;
         frames[hops] = frame;
         // top_shadow_frame_ sits right after top_quick_frame_ in ManagedStack.
-        shadows[hops] = *reinterpret_cast<volatile const uintptr_t *>(fragment + 8) &
-                        kPacStripMask;
+        shadows[hops] = shadow & kPacStripMask;
         nexts[hops] = next & kPacStripMask;
         uintptr_t method = 0;
-        if (frame && IsCachedReadable(frame + sizeof(uintptr_t))) {
-            method = *reinterpret_cast<volatile const uintptr_t *>(frame);
-        }
+        if (frame) SafeReadU64(frame, &method);
         methods[hops] = method;
         ++hops;
 
@@ -3922,12 +3969,20 @@ void OnWalkStackEnter(HookContext *ctx, void *) {
     // entered is this entry's number, already taken before the guards.
     const uint32_t n = entered;
     if (!suspicious) {
-        if (n <= 3) {
-            LOGI("WxShadow ART WalkStack probe: healthy walk n={} tid={} hops={} frame0={} "
-                 "method0={} class0={}",
-                 n, static_cast<long>(gettid()), static_cast<int>(hops),
+        // Count healthy walks on their own. Using the entry counter here was a
+        // mistake: n keeps growing for the life of the process, so `n <= 3` is
+        // only ever true in the first microseconds and the healthy path stayed
+        // silent forever -- indistinguishable from "the probe never sees a good
+        // walk", which is exactly the wrong conclusion to draw from silence.
+        static std::atomic<uint32_t> healthy{0};
+        const uint32_t h = healthy.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (h <= 3 || (h % 4096u) == 0) {
+            LOGI("WxShadow ART WalkStack probe: healthy walk h={} n={} tid={} hops={} "
+                 "frame0={} method0={} class0={} zero_frames={}",
+                 h, n, static_cast<long>(gettid()), static_cast<int>(hops),
                  reinterpret_cast<void *>(frames[0]), reinterpret_cast<void *>(methods[0]),
-                 DescribeProbeMethod(methods[0], frames[0]));
+                 DescribeProbeMethod(methods[0], frames[0]),
+                 saw_zero_frame ? "yes" : "no");
         }
         return;
     }
@@ -3961,12 +4016,12 @@ void OnWalkStackEnter(HookContext *ctx, void *) {
         // 16 words instead of 4, every word labelled with the mapping that owns
         // it. The earlier version printed "0x72969a3c" with no way to tell an OAT
         // entry point from a stack slot or a heap pointer.
-        if (frames[i] && IsCachedReadable(frames[i] + 16 * sizeof(uintptr_t))) {
+        if (frames[i]) {
             char line[512] = {};
             size_t used = 0;
             for (size_t w = 0; w < 16; ++w) {
-                const uintptr_t v =
-                    *reinterpret_cast<volatile const uintptr_t *>(frames[i] + w * 8);
+                uintptr_t v = 0;
+                if (!SafeReadU64(frames[i] + w * 8, &v)) break;
                 const char *map = MappedNameFor(v);
                 const int wrote = snprintf(line + used, sizeof(line) - used, "%s0x%" PRIxPTR "%s",
                                            w ? " " : "", v, map[0] ? map : "-");
