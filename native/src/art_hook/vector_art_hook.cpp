@@ -69,6 +69,10 @@ bool ArtPerfEnabled() {
     return false;
 }
 
+// Forward declaration for the WalkStack forensic probe, defined below at namespace
+// scope. Declared here because the controller installs it before the GC layer.
+size_t InitializeWalkStackProbe();
+
 namespace {
 
 #if defined(__aarch64__)
@@ -2635,8 +2639,7 @@ static void OnDecodeGcMasksOnlyEnter(HookContext *ctx, void *) {
 }
 
 size_t InitializeDecodeGcMasksGuard() {
-    static bool attempted = false;
-    if (attempted) return g_decode_gc_masks_guard_ready;
+    static bool attempted = false;    if (attempted) return g_decode_gc_masks_guard_ready;
     attempted = true;
 
     if (const char *env = getenv("VECTOR_ART_DECODE_GUARD")) {
@@ -3164,6 +3167,7 @@ bool EnsureInterpreterRouter(JNIEnv *env) {
     return g_interpreter_router_initialized;
 }
 
+
 bool CompleteInitializationImpl(JNIEnv *env) {
     const uint64_t perf_start = ArtPerfEnabled() ? ArtPerfNowNs() : 0;
     if (g_initialized) return true;
@@ -3235,6 +3239,12 @@ bool CompleteInitializationImpl(JNIEnv *env) {
     if (stage_start != 0) {
         LOGI("[perf] art_controller component=decode_gc_masks_guard ready={} elapsedUs={}",
              decode_guard_ready, ArtPerfElapsedUs(stage_start));
+    }
+    stage_start = perf_start != 0 ? ArtPerfNowNs() : 0;
+    const size_t walkstack_probe_ready = InitializeWalkStackProbe();
+    if (stage_start != 0) {
+        LOGI("[perf] art_controller component=walkstack_probe ready={} elapsedUs={}",
+             walkstack_probe_ready, ArtPerfElapsedUs(stage_start));
     }
     stage_start = perf_start != 0 ? ArtPerfNowNs() : 0;
     const size_t gc_hook_count = InitializeGcSyncLayer();
@@ -3562,6 +3572,179 @@ uint64_t ClassifyProbeMethod(uintptr_t value, uintptr_t anchor) {
         if (entry == 0) bits |= kProbeMethodNullEntry;
     }
     return bits;
+}
+
+// ============================================================================
+// Forensic: what does ART's OWN stack walk see, at the moment it walks?
+//
+// The crashes converge on one sequence inside art::StackVisitor::WalkStack
+// (device libart, no symbols needed -- the instructions are enough):
+//
+//   0x647a48  ldr  x8,  [x25]          ; ManagedStack fragment->top_quick_frame_
+//   0x647a4c  ands x10, x8, #~1        ; drop TaggedQuickFrame bit 0 -> frame
+//   0x647a50  stp  x10, xzr, [x19,#0x20] ; cur_quick_frame_ = frame
+//   0x647a58  ldr  x24, [x10]          ; *(frame) = the frame's ArtMethod*
+//   0x647a5c  ldr  w20, [x24, #0x4]    ; access_flags_   <-- fault addr 0x4
+//
+// Measured camps (same build, same app):
+//   0x647a5c with x24 = 0x7fe0000000000090  (reproduced twice, identical pc+x0)
+//   0x284240 (PrettyMethod) with x24 = art::Thread* of this very thread
+//
+// So the value ART reads out of a frame's method slot is not an ArtMethod. The
+// open question is WHICH ManagedStack fragment supplies that frame -- ours, or
+// one ART advanced onto. Hooking WalkStack and dumping the chain at entry answers
+// that directly, because the chain at entry is the chain the loop then walks.
+//
+// Safety: attach with on_enter only, so the hook tail-jumps to the original and
+// no extra frame exists while ART walks. The callback only reads memory through
+// the already-cached maps (never fopen) and never calls back into ART.
+// ============================================================================
+std::atomic<uint32_t> g_walkstack_probe_count{0};
+
+const char *DescribeProbeMethod(uintptr_t value, uintptr_t anchor) {
+    const uint64_t bits = ClassifyProbeMethod(value, anchor);
+    if (bits & kProbeMethodZero) return "zero";
+    if (!(bits & kProbeMethodReadable)) return "UNREADABLE";
+    if (bits & kProbeMethodInPool) return "vector-pool";
+    if (bits & kProbeMethodNullEntry) return "null-entry";
+    if (bits & kProbeMethodInArt) return "libart-data";
+    if (bits & kProbeMethodStackLike) return "STACK";
+    return "ok";
+}
+
+void OnWalkStackEnter(HookContext *ctx, void *) {
+#if defined(__aarch64__)
+    if (!ctx) return;
+    const uintptr_t self = ctx->x[0];
+    if (!self) return;
+
+    // StackVisitor::thread_ is at +0x8 (WalkStack itself reads it that way), and
+    // ManagedStack lives at thread + managed_stack_offset (measured 0xb0).
+    if (!IsCachedReadable(self + 0x10)) return;
+    const uintptr_t thread = *reinterpret_cast<volatile const uintptr_t *>(self + 0x8);
+    if (!thread || !g_thread_layout.valid) return;
+    uintptr_t fragment = thread + g_thread_layout.managed_stack_offset;
+    if (!IsCachedReadable(fragment + 0x18)) return;
+
+    // Collect first, then decide whether to log: logging during a GC checkpoint
+    // is a syscall on the GC thread, so only do it when something is wrong.
+    uintptr_t frames[kMaxManagedStackFragments] = {};
+    uintptr_t methods[kMaxManagedStackFragments] = {};
+    uintptr_t raw_tops[kMaxManagedStackFragments] = {};
+    size_t hops = 0;
+    bool suspicious = false;
+
+    for (size_t i = 0; i < kMaxManagedStackFragments; ++i) {
+        if (!fragment || !IsCachedReadable(fragment + 0x18)) break;
+        const uintptr_t raw = *reinterpret_cast<volatile const uintptr_t *>(fragment);
+        const uintptr_t frame = raw & ~uintptr_t{1};
+        raw_tops[hops] = raw;
+        frames[hops] = frame;
+        uintptr_t method = 0;
+        if (frame && IsCachedReadable(frame + sizeof(uintptr_t))) {
+            method = *reinterpret_cast<volatile const uintptr_t *>(frame);
+        }
+        methods[hops] = method;
+        ++hops;
+        // "Not a usable ArtMethod" is exactly what the two crash camps show:
+        // unreadable, zero, or a libart pointer that is not a method.
+        if (frame == 0) { suspicious = true; break; }
+        const uint64_t bits = ClassifyProbeMethod(method, frame);
+        if (method == 0 || !(bits & kProbeMethodReadable) || (bits & kProbeMethodNullEntry)) {
+            suspicious = true;
+        }
+        const uintptr_t next =
+            *reinterpret_cast<volatile const uintptr_t *>(fragment + kManagedStackLinkOffset);
+        const uintptr_t next_clean = next & kPacStripMask;
+        if (!next_clean || next_clean == fragment) break;
+        fragment = next_clean;
+    }
+
+    const uint32_t n = g_walkstack_probe_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!suspicious) {
+        if (n <= 3) {
+            LOGI("WxShadow ART WalkStack probe: healthy walk n={} tid={} hops={} frame0={} "
+                 "method0={} class0={}",
+                 n, static_cast<long>(gettid()), static_cast<int>(hops),
+                 reinterpret_cast<void *>(frames[0]), reinterpret_cast<void *>(methods[0]),
+                 DescribeProbeMethod(methods[0], frames[0]));
+        }
+        return;
+    }
+
+    // Suspicious: this walk is about to hand ART a non-ArtMethod. Rate limited,
+    // because a corrupted chain is walked once per GC checkpoint.
+    static std::atomic<uint32_t> reported{0};
+    const uint32_t r = reported.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (r > 16) return;
+    LOGW("WxShadow ART WalkStack probe BAD CHAIN: n={} r={} tid={} hops={} thread={} walk_n={}",
+         n, r, static_cast<long>(gettid()), static_cast<int>(hops),
+         reinterpret_cast<void *>(thread), n);
+    uintptr_t prev_frame = 0;
+    for (size_t i = 0; i < hops; ++i) {
+        LOGW("WxShadow ART WalkStack probe   hop[{}] top_raw={} frame={} adv={} method={} class={}",
+             i, reinterpret_cast<void *>(raw_tops[i]),
+             reinterpret_cast<void *>(frames[i]),
+             i ? reinterpret_cast<void *>(frames[i] - prev_frame) : nullptr,
+             reinterpret_cast<void *>(methods[i]),
+             DescribeProbeMethod(methods[i], frames[i]));
+        // Dump the frame image itself: if ART advanced onto one of our saved
+        // registers, the neighbours make that visible immediately.
+        if (frames[i] && IsCachedReadable(frames[i] + 32)) {
+            LOGW("WxShadow ART WalkStack probe     frame[0..3]={} {} {} {}",
+                 reinterpret_cast<void *>(*reinterpret_cast<volatile const uintptr_t *>(frames[i])),
+                 reinterpret_cast<void *>(
+                     *reinterpret_cast<volatile const uintptr_t *>(frames[i] + 8)),
+                 reinterpret_cast<void *>(
+                     *reinterpret_cast<volatile const uintptr_t *>(frames[i] + 16)),
+                 reinterpret_cast<void *>(
+                     *reinterpret_cast<volatile const uintptr_t *>(frames[i] + 24)));
+        }
+        prev_frame = frames[i];
+    }
+#else
+    (void)ctx;
+#endif
+}
+
+size_t InitializeWalkStackProbe() {
+#if defined(__aarch64__)
+    static int attempted = 0;
+    if (attempted) return g_walkstack_probe_count.load() ? 1 : 0;
+    attempted = 1;
+
+    // Off unless asked for: this sits on every stack walk, including GC
+    // checkpoints, so it is a targeted instrument rather than a default-on probe.
+    char prop[PROP_VALUE_MAX] = {};
+    if (__system_property_get("debug.vector.art.walkstack_probe", prop) <= 0 ||
+        prop[0] != '1') {
+        LOGI("WxShadow ART WalkStack probe: off (setprop debug.vector.art.walkstack_probe 1)");
+        return 0;
+    }
+
+    constexpr const char *kSymbol =
+        "_ZN3art12StackVisitor9WalkStackILNS0_16CountTransitionsE1EEEvb";
+    const auto target = reinterpret_cast<uintptr_t>(ResolveArtSymbol(kSymbol)) & kPacStripMask;
+    if (!target || !IsMappedExecutable(target) || !IsInArtModule(target)) {
+        LOGW("WxShadow ART WalkStack probe: symbol unresolved target={}",
+             reinterpret_cast<void *>(target));
+        return 0;
+    }
+    // on_enter only: the thunk tail-jumps to the original, so ART walks a stack
+    // that does not contain this hook. Wrap mode would add a frame below SP and
+    // make the observation describe the observer.
+    if (hook_attach(reinterpret_cast<void *>(target), OnWalkStackEnter, nullptr, nullptr,
+                    ArtStealthFlag()) != HOOK_OK) {
+        LOGW("WxShadow ART WalkStack probe: hook_attach failed target={}",
+             reinterpret_cast<void *>(target));
+        return 0;
+    }
+    LOGI("WxShadow ART WalkStack probe ready target={} managed_stack_off={}",
+         reinterpret_cast<void *>(target), g_thread_layout.managed_stack_offset);
+    return 1;
+#else
+    return 0;
+#endif
 }
 
 // Which hook route produced this probe entry. The three shapes differ in frame

@@ -38,6 +38,16 @@ jobs:
       # is stored and transferred; it never causes a miss that correctness depends on.
       CCACHE_MAXSIZE: "1G"
 
+      # ccache 4.x defaults to $XDG_CACHE_HOME/ccache (i.e. ~/.cache/ccache), NOT
+      # ~/.ccache. The cached paths below used to list only ~/.ccache, so although
+      # ccache was installed and did serve hits within a single run, the post-job
+      # save step reported
+      #   "Path Validation Error: Path(s) specified ... do(es) not exist"
+      # and the next run started from a cold cache every single time. Pin CCACHE_DIR
+      # to a path this workflow actually caches, so the location can never drift with
+      # the distro's XDG defaults again.
+      CCACHE_DIR: "${{ github.workspace }}/.ccache"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -134,8 +144,9 @@ jobs:
         uses: actions/cache@v6
         with:
           path: |
+            ${{ env.CCACHE_DIR }}
             ~/.ccache
-            ${{ github.workspace }}/.ccache
+            ~/.cache/ccache
           # Rolling key over the inputs ccache actually hashes. It has to change when
           # those change, otherwise actions/cache keeps the entry it saved first and
           # never stores newer objects: a cache keyed on a file that does not exist in
@@ -165,6 +176,8 @@ jobs:
         if: always()
         run: |
           if command -v ccache >/dev/null 2>&1; then
+            echo "cache dir: $CCACHE_DIR"
+            du -sh "$CCACHE_DIR" 2>/dev/null || echo "cache dir does not exist"
             ccache --show-stats --verbose || true
           else
             echo 'ccache is not installed; native builds ran without it.'
