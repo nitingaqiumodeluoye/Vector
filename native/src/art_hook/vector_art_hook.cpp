@@ -2553,6 +2553,87 @@ jvalue ReadArgument(JNIEnv *env, jobject value, ValueKind kind, bool *ok) {
     return result;
 }
 
+
+// ---------------------------------------------------------------------------
+// Minimal BoxReturn locality probe (debug.vector.art.boxprobe=1).
+//
+// Crash family C put the fault inside art_quick_test_suspend, reached from
+// java.lang.Long.valueOf -- i.e. the exact path BoxReturn drives with
+// CallStaticObjectMethodA, while our own native frame sits just below it:
+//
+//   #10 JNI CallStaticObjectMethodA
+//   #11 pc 0x1b14ac [anon:.bss]      <- our exec pool
+//   #06 java.lang.Long.valueOf+168   <- quick code with an inlined suspend check
+//   #05 art_quick_test_suspend+156
+//   #00 WalkStack+156   x24 = 0      <- frame method slot was zero
+//
+// What matters locally is the geometry: our frame's address, the stack pointer at
+// the call, and the Thread's current quick frame. Recording those before and
+// after the call costs four loads -- no walking, no per-word syscalls -- so
+// unlike the earlier instrument it cannot perturb the GC checkpoint it observes.
+// ---------------------------------------------------------------------------
+std::atomic<uint32_t> g_boxprobe_enabled{0xffffffffu};  // 0xffffffff = not checked
+
+bool BoxProbeEnabled() {
+    uint32_t state = g_boxprobe_enabled.load(std::memory_order_relaxed);
+    if (state != 0xffffffffu) return state != 0;
+    char prop[PROP_VALUE_MAX] = {};
+    const bool on = __system_property_get("debug.vector.art.boxprobe", prop) > 0 &&
+                    prop[0] == '1';
+    g_boxprobe_enabled.store(on ? 1u : 0u, std::memory_order_relaxed);
+    if (on) LOGI("WxShadow ART BoxReturn locality probe enabled");
+    return on;
+}
+
+struct BoxProbeSample {
+    uintptr_t sp;
+    uintptr_t frame_guess;
+    uintptr_t top_quick;
+    uintptr_t thread;
+    long tid;
+};
+
+void BoxProbeTake(BoxProbeSample *out) {
+    if (!out) return;
+    out->sp = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
+#if defined(__aarch64__)
+    uintptr_t tls = 0;
+    asm volatile("mrs %0, tpidr_el0" : "=r"(tls));
+    out->thread = tls ? (*reinterpret_cast<volatile const uintptr_t *>(
+                             tls + 7 * sizeof(uintptr_t)) & kPacStripMask)
+                      : 0;
+#else
+    out->thread = 0;
+#endif
+    out->top_quick = 0;
+    if (out->thread && g_thread_layout.valid) {
+        SafeReadU64(out->thread + g_thread_layout.managed_stack_offset, &out->top_quick);
+    }
+    // The frame our thunk saved: ctx is reachable from the caller, but a cheap and
+    // stable proxy is "the quick frame ART will be walking when we suspend".
+    out->frame_guess = out->top_quick & ~uintptr_t{1};
+    out->tid = static_cast<long>(gettid());
+}
+
+void BoxProbeLog(const char *stage, const BoxProbeSample &s) {
+    static std::atomic<uint32_t> n{0};
+    const uint32_t c = n.fetch_add(1, std::memory_order_relaxed) + 1;
+    // Only the first few and then a slow sample: this path is hot (every boxed
+    // return), and logging during a GC checkpoint is what stalled hunter before.
+    if (c > 8 && (c % 8192u) != 0) return;
+    // Self-contained label: this must not depend on the WalkStack classifier,
+    // which lives later in the file and pulls in its bits and helpers.
+    uintptr_t frame_word = 0;
+    const bool frame_readable = SafeReadU64(s.frame_guess, &frame_word);
+    LOGW("WxShadow ART boxprobe{} n={} tid={} sp={} thread={} top_quick={} frame={} "
+         "frame_readable={} frame_word={} frame_map={}",
+         stage, c, s.tid, reinterpret_cast<void *>(s.sp),
+         reinterpret_cast<void *>(s.thread), reinterpret_cast<void *>(s.top_quick),
+         reinterpret_cast<void *>(s.frame_guess), frame_readable ? "yes" : "no",
+         reinterpret_cast<void *>(frame_word),
+         MappedNameFor(s.frame_guess)[0] ? MappedNameFor(s.frame_guess) : "-");
+}
+
 jobject BoxReturn(JNIEnv *env, ValueKind kind, const jvalue &value) {
     const char *clazz_name = nullptr;
     const char *sig = nullptr;
@@ -2572,6 +2653,9 @@ jobject BoxReturn(JNIEnv *env, ValueKind kind, const jvalue &value) {
     if (!clazz) return nullptr;
     auto value_of = env->GetStaticMethodID(clazz, "valueOf", sig);
     jobject result = nullptr;
+    const bool box_probe = BoxProbeEnabled();
+    BoxProbeSample box_before{};
+    if (box_probe) BoxProbeTake(&box_before);
     if (value_of) {
         jvalue argument{};
         switch (kind) {
@@ -2586,6 +2670,16 @@ jobject BoxReturn(JNIEnv *env, ValueKind kind, const jvalue &value) {
         default: break;
         }
         result = env->CallStaticObjectMethodA(clazz, value_of, &argument);
+    }
+    if (box_probe) {
+        BoxProbeSample after{};
+        BoxProbeTake(&after);
+        BoxProbeLog("", after);
+        if (after.top_quick != box_before.top_quick) {
+            LOGW("WxShadow ART boxprobe DRIFT tid={} top_quick {} -> {} (kind={})",
+                 after.tid, reinterpret_cast<void *>(box_before.top_quick),
+                 reinterpret_cast<void *>(after.top_quick), static_cast<int>(kind));
+        }
     }
     env->DeleteLocalRef(clazz);
     return result;
@@ -3860,6 +3954,19 @@ uint64_t ClassifyProbeMethod(uintptr_t value, uintptr_t anchor) {
 // ============================================================================
 std::atomic<uint32_t> g_walkstack_probe_count{0};
 
+const char *DescribeProbeMethod(uintptr_t value, uintptr_t anchor) {
+    const uint64_t bits = ClassifyProbeMethod(value, anchor);
+    if (bits & kProbeMethodZero) return "zero";
+    if (bits & kProbeMethodOutOfCache) return "out-of-cache";
+    if (!(bits & kProbeMethodReadable)) return "UNREADABLE";
+    if (bits & kProbeMethodInPool) return "vector-pool";
+    if (bits & kProbeMethodNullEntry) return "null-entry";
+    if (bits & kProbeMethodInArt) return "libart-data";
+    if (bits & kProbeMethodStackLike) return "STACK";
+    return "ok";
+}
+
+
 // ---------------------------------------------------------------------------
 // Safe read for the forensic probe.
 //
@@ -3877,17 +3984,6 @@ std::atomic<uint32_t> g_walkstack_probe_count{0};
 // bookkeeping at all and cannot go stale. It costs a syscall per word, which is
 // fine for a probe that already logs.
 // ---------------------------------------------------------------------------
-const char *DescribeProbeMethod(uintptr_t value, uintptr_t anchor) {
-    const uint64_t bits = ClassifyProbeMethod(value, anchor);
-    if (bits & kProbeMethodZero) return "zero";
-    if (bits & kProbeMethodOutOfCache) return "out-of-cache";
-    if (!(bits & kProbeMethodReadable)) return "UNREADABLE";
-    if (bits & kProbeMethodInPool) return "vector-pool";
-    if (bits & kProbeMethodNullEntry) return "null-entry";
-    if (bits & kProbeMethodInArt) return "libart-data";
-    if (bits & kProbeMethodStackLike) return "STACK";
-    return "ok";
-}
 
 void OnWalkStackEnter(HookContext *ctx, void *) {
 #if defined(__aarch64__)
