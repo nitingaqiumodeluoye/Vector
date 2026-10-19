@@ -3944,6 +3944,7 @@ void OnWalkStackEnter(HookContext *ctx, void *) {
     //     class, not as the crash signature.
     bool bad = false;
     bool saw_zero_frame = false;
+    bool bad_frame_unmapped = false;
     for (size_t i = 0; i < kMaxManagedStackFragments; ++i) {
         if (!fragment) break;
         uintptr_t raw = 0;
@@ -3979,6 +3980,12 @@ void OnWalkStackEnter(HookContext *ctx, void *) {
         // unreadable, or outside every known mapping -- is the crash signature.
         const bool unusable = method == 0 || !(bits & kProbeMethodReadable);
         if (unusable) bad = true;
+        // The crash signature seen on 3289 is stronger than "bad method": the
+        // frame pointer ITSELF is not in any readable mapping (frame_map=-), so
+        // ART is holding something that was never a quick frame. Record those
+        // separately -- a frame that is merely corrupt is a different bug from a
+        // slot that points outside mapped memory entirely.
+        if (ProbeReadability(frame) == ReadableVerdict::No) bad_frame_unmapped = true;
         const uintptr_t next_clean = next & kPacStripMask;
         if (!next_clean || next_clean == fragment) break;
         fragment = next_clean;
@@ -4016,10 +4023,11 @@ void OnWalkStackEnter(HookContext *ctx, void *) {
     const uint32_t r = reported.fetch_add(1, std::memory_order_relaxed) + 1;
     if (r > 16) return;
     LOGW("WxShadow ART WalkStack probe BAD CHAIN: n={} r={} tid={} hops={} thread={} "
-         "thread_frag={}",
+         "thread_frag={} frame_unmapped={}",
          n, r, static_cast<long>(gettid()), static_cast<int>(hops),
          reinterpret_cast<void *>(thread),
-         reinterpret_cast<void *>(thread + g_thread_layout.managed_stack_offset));
+         reinterpret_cast<void *>(thread + g_thread_layout.managed_stack_offset),
+         bad_frame_unmapped ? "YES" : "no");
     uintptr_t prev_frame = 0;
     for (size_t i = 0; i < hops; ++i) {
         // frag / next are what the previous revision lacked: without them it was
@@ -4054,6 +4062,34 @@ void OnWalkStackEnter(HookContext *ctx, void *) {
             LOGW("WxShadow ART WalkStack probe     frame+0..15={}", line);
         }
         prev_frame = frames[i];
+    }
+    // When the frame pointer is not in any mapping, the fragment that carries it
+    // is the only place the writer left a trace. Dump the fragment itself: its
+    // top_quick_frame_/top_shadow_frame_/link_ plus the words before and after,
+    // which reveal whether this is a ManagedStack that was partially rewritten
+    // (a torn update) rather than a fragment that was never valid.
+    if (bad_frame_unmapped) {
+        for (size_t i = 0; i < hops; ++i) {
+            if (frames[i] == 0) continue;
+            if (ProbeReadability(frames[i]) != ReadableVerdict::No) continue;
+            char line[768] = {};
+            size_t used = 0;
+            for (int w = -4; w < 12; ++w) {
+                uintptr_t v = 0;
+                if (!SafeReadU64(frags[i] + (intptr_t)w * 8, &v)) continue;
+                const char *map = MappedNameFor(v);
+                const int wrote = snprintf(line + used, sizeof(line) - used,
+                                           "%s%+d:0x%" PRIxPTR "%s", used ? " " : "", w, v,
+                                           map[0] ? map : "-");
+                if (wrote <= 0 || used + (size_t)wrote >= sizeof(line)) break;
+                used += (size_t)wrote;
+            }
+            LOGW("WxShadow ART WalkStack probe UNMAPPED FRAME: hop={} frag={} frag_map={} "
+                 "bad_frame={} frag[{}..{}]={}",
+                 i, reinterpret_cast<void *>(frags[i]),
+                 MappedNameFor(frags[i])[0] ? MappedNameFor(frags[i]) : "-",
+                 reinterpret_cast<void *>(frames[i]), -4, 11, line);
+        }
     }
 #else
     (void)ctx;
