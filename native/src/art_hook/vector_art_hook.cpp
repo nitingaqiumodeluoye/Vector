@@ -1526,6 +1526,26 @@ bool IsCachedReadable(uintptr_t address) {
 // Label of the mapping that owns `address`, or "" when unmapped / not cached.
 // Used by forensic logs so an address can be read as "which mapping" without a
 // second pass over /proc.
+bool SafeReadU64(uintptr_t address, uintptr_t *out) {
+#if defined(__aarch64__)
+    if (out == nullptr) return false;
+    const uintptr_t addr = address & kPacStripMask;
+    if (addr == 0) return false;
+    uint64_t value = 0;
+    struct iovec local = {&value, sizeof(value)};
+    // iovec::iov_base is void*; process_vm_readv only reads through it.
+    struct iovec remote = {reinterpret_cast<void *>(addr), sizeof(value)};
+    const ssize_t n = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+    if (n != static_cast<ssize_t>(sizeof(value))) return false;
+    *out = static_cast<uintptr_t>(value);
+    return true;
+#else
+    (void)address;
+    (void)out;
+    return false;
+#endif
+}
+
 const char *MappedNameFor(uintptr_t address) {
     std::call_once(g_cached_ranges_once, LoadReadableRanges);
     const uintptr_t addr = address & kPacStripMask;
@@ -3015,18 +3035,41 @@ void MaybeSnapshotCrashWalkStack(const ucontext_t *uc, int si_code) {
          reinterpret_cast<void *>(static_cast<uintptr_t>(uc->uc_mcontext.regs[8]) & kPacStripMask),
          reinterpret_cast<void *>(static_cast<uintptr_t>(uc->uc_mcontext.regs[10]) & kPacStripMask),
          IsInArtModule(pc) ? "yes" : "no");
-    if (quick && ProbeReadability(quick + 0x40) == ReadableVerdict::Yes) {
-        char line[512] = {};
+    // Dump around the frame ART was actually reading, not around cur_quick_frame_:
+    // in every observed crash x0 (and therefore the visitor this handler can read)
+    // is a garbage tagged value like 0x7fe0000000000090, while x8/x10 hold the
+    // frame whose method slot is zero. x8 is the useful anchor.
+    const uintptr_t frame = static_cast<uintptr_t>(uc->uc_mcontext.regs[8]) & kPacStripMask;
+    if (frame) {
+        // -0x40 .. +0x80 in 8-byte steps: the method slot plus enough of the
+        // SaveRefsAndArgs shape around it to see whether this really is a quick
+        // frame or something ART was handed by mistake.
+        char line[1024] = {};
         size_t used = 0;
-        for (size_t w = 0; w < 8; ++w) {
-            const uintptr_t v = *reinterpret_cast<volatile const uintptr_t *>(quick + w * 8);
+        for (int w = -8; w < 16; ++w) {
+            uintptr_t v = 0;
+            if (!SafeReadU64(frame + (intptr_t)w * 8, &v)) continue;
             const char *map = MappedNameFor(v);
-            const int wrote = snprintf(line + used, sizeof(line) - used, "%s0x%" PRIxPTR "%s",
-                                       w ? " " : "", v, map[0] ? map : "-");
+            const int wrote = snprintf(line + used, sizeof(line) - used,
+                                       "%s%+d:0x%" PRIxPTR "%s", used ? " " : "", w, v,
+                                       map[0] ? map : "-");
             if (wrote <= 0 || used + (size_t)wrote >= sizeof(line)) break;
             used += (size_t)wrote;
         }
-        LOGW("WxShadow ART WalkStack CRASH SNAPSHOT   cur_quick[0..7]={}", line);
+        LOGW("WxShadow ART WalkStack CRASH SNAPSHOT   around frame[{}]: {}",
+             reinterpret_cast<void *>(frame), line);
+        LOGW("WxShadow ART WalkStack CRASH SNAPSHOT   frame_map={} x9={} x11={} x19={} "
+             "x20={} x21={} x22={} x23={} x25={} x28={}",
+             MappedNameFor(frame)[0] ? MappedNameFor(frame) : "-",
+             reinterpret_cast<void *>(static_cast<uintptr_t>(uc->uc_mcontext.regs[9]) & kPacStripMask),
+             reinterpret_cast<void *>(static_cast<uintptr_t>(uc->uc_mcontext.regs[11]) & kPacStripMask),
+             reinterpret_cast<void *>(static_cast<uintptr_t>(uc->uc_mcontext.regs[19]) & kPacStripMask),
+             reinterpret_cast<void *>(static_cast<uintptr_t>(uc->uc_mcontext.regs[20]) & kPacStripMask),
+             reinterpret_cast<void *>(static_cast<uintptr_t>(uc->uc_mcontext.regs[21]) & kPacStripMask),
+             reinterpret_cast<void *>(static_cast<uintptr_t>(uc->uc_mcontext.regs[22]) & kPacStripMask),
+             reinterpret_cast<void *>(static_cast<uintptr_t>(uc->uc_mcontext.regs[23]) & kPacStripMask),
+             reinterpret_cast<void *>(static_cast<uintptr_t>(uc->uc_mcontext.regs[25]) & kPacStripMask),
+             reinterpret_cast<void *>(static_cast<uintptr_t>(uc->uc_mcontext.regs[28]) & kPacStripMask));
     }
 #endif
 }
@@ -3824,26 +3867,6 @@ std::atomic<uint32_t> g_walkstack_probe_count{0};
 // bookkeeping at all and cannot go stale. It costs a syscall per word, which is
 // fine for a probe that already logs.
 // ---------------------------------------------------------------------------
-bool SafeReadU64(uintptr_t address, uintptr_t *out) {
-#if defined(__aarch64__)
-    if (out == nullptr) return false;
-    const uintptr_t addr = address & kPacStripMask;
-    if (addr == 0) return false;
-    uint64_t value = 0;
-    struct iovec local = {&value, sizeof(value)};
-    // iovec::iov_base is void*; process_vm_readv only reads through it.
-    struct iovec remote = {reinterpret_cast<void *>(addr), sizeof(value)};
-    const ssize_t n = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
-    if (n != static_cast<ssize_t>(sizeof(value))) return false;
-    *out = static_cast<uintptr_t>(value);
-    return true;
-#else
-    (void)address;
-    (void)out;
-    return false;
-#endif
-}
-
 const char *DescribeProbeMethod(uintptr_t value, uintptr_t anchor) {
     const uint64_t bits = ClassifyProbeMethod(value, anchor);
     if (bits & kProbeMethodZero) return "zero";
