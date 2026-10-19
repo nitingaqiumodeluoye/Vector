@@ -3503,6 +3503,35 @@ bool EnsureInterpreterRouter(JNIEnv *env) {
 }
 
 
+// ---------------------------------------------------------------------------
+// Per-layer kill switches, for bisecting which ART hook layer a crash needs.
+//
+// Everything tried so far to explain the hunter crashes has been ruled out one at
+// a time -- spill masks, the OAT hook, the forensic probes, their syscall cost,
+// the BoxReturn path -- and a 10-round control with the OAT hook provably not
+// installed still crashed 3 times. What remains is the rest of the hook set, so
+// each layer gets an independent switch. All default to ON: this adds the ability
+// to bisect, it does not change behaviour.
+//
+//   debug.vector.art.layer.do_call=0            DoCall/DoCallBack trampolines
+//   debug.vector.art.layer.shared_interpreter=0 quick_to_interpreter_bridge
+//   debug.vector.art.layer.shared_resolution=0  quick_resolution_trampoline
+//   debug.vector.art.layer.decode_guard=0       DecodeGcMasksOnly NULL guard
+//   debug.vector.art.layer.signal_guard=0       SIGSEGV sigchain (also env)
+//
+// Properties are read once at init, so set them before the target process starts.
+// ---------------------------------------------------------------------------
+bool LayerEnabled(const char *property) {
+    char value[PROP_VALUE_MAX] = {};
+    if (__system_property_get(property, value) > 0) {
+        if (value[0] == '0' && value[1] == '\0') {
+            LOGI("WxShadow ART layer DISABLED by {} = 0", property);
+            return false;
+        }
+    }
+    return true;
+}
+
 bool CompleteInitializationImpl(JNIEnv *env) {
     const uint64_t perf_start = ArtPerfEnabled() ? ArtPerfNowNs() : 0;
     if (g_initialized) return true;
@@ -3550,27 +3579,32 @@ bool CompleteInitializationImpl(JNIEnv *env) {
              g_art_stealth_source.c_str(), g_art_stealth_value.c_str());
     }
     stage_start = perf_start != 0 ? ArtPerfNowNs() : 0;
-    const bool shared_interpreter_ready = EnsureInterpreterRouter(env);
+    const bool shared_interpreter_ready =
+        LayerEnabled("debug.vector.art.layer.shared_interpreter") && EnsureInterpreterRouter(env);
     if (stage_start != 0) {
         LOGI("[perf] art_controller component=shared_interpreter ready={} elapsedUs={}",
              shared_interpreter_ready, ArtPerfElapsedUs(stage_start));
     }
     stage_start = perf_start != 0 ? ArtPerfNowNs() : 0;
-    const bool shared_resolution_ready = InitializeSharedLibartRouter(
-        "quick_resolution_trampoline", "art_quick_resolution_trampoline", env,
-        &g_resolution_router);
+    const bool shared_resolution_ready =
+        LayerEnabled("debug.vector.art.layer.shared_resolution") &&
+        InitializeSharedLibartRouter("quick_resolution_trampoline",
+                                     "art_quick_resolution_trampoline", env,
+                                     &g_resolution_router);
     if (stage_start != 0) {
         LOGI("[perf] art_controller component=shared_resolution ready={} elapsedUs={}",
              shared_resolution_ready, ArtPerfElapsedUs(stage_start));
     }
     stage_start = perf_start != 0 ? ArtPerfNowNs() : 0;
-    const size_t do_call_count = InitializeDoCallLayer();
+    const size_t do_call_count =
+        LayerEnabled("debug.vector.art.layer.do_call") ? InitializeDoCallLayer() : 0;
     if (stage_start != 0) {
         LOGI("[perf] art_controller component=do_call count={} elapsedUs={}",
              do_call_count, ArtPerfElapsedUs(stage_start));
     }
     stage_start = perf_start != 0 ? ArtPerfNowNs() : 0;
-    const size_t decode_guard_ready = InitializeDecodeGcMasksGuard();
+    const size_t decode_guard_ready =
+        LayerEnabled("debug.vector.art.layer.decode_guard") ? InitializeDecodeGcMasksGuard() : 0;
     if (stage_start != 0) {
         LOGI("[perf] art_controller component=decode_gc_masks_guard ready={} elapsedUs={}",
              decode_guard_ready, ArtPerfElapsedUs(stage_start));
@@ -3657,7 +3691,8 @@ bool CompleteInitializationImpl(JNIEnv *env) {
     //   - 我方伪造帧触发的 NULL OatQuickMethodHeader 故障不再被 TryHandleNullOatHeader 修回。
     // 本函数本身只在 ART hook 层真正初始化的进程里跑，所以不会波及无关进程；
     // VECTOR_NO_SIGNAL_GUARD=1 可关闭。
-    const bool signal_guard_ready = InitializeSignalGuards();
+    const bool signal_guard_ready =
+        LayerEnabled("debug.vector.art.layer.signal_guard") && InitializeSignalGuards();
     if (stage_start != 0) {
         LOGI("[perf] art_controller component=signal_guard ready={} elapsedUs={}",
              signal_guard_ready, ArtPerfElapsedUs(stage_start));
